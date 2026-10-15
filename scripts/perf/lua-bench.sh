@@ -51,7 +51,7 @@ for tag in "$@"; do
     docker run -d --name kperf-server --network $NET --cpuset-cpus "$SERVER_CPUS" ${PERF:+--privileged} \
       --security-opt seccomp=unconfined -v kividb-ci-target:/target:ro -v "$(native "$OUT"):/out" \
       -v "$(native "$HERE"):/perf:ro" -w /data \
-      "$image" bash -c "mkdir -p /data && cd /data && exec $wrap /target/perf-$tag/release/kividb --port 6379 --protected-mode no ${KIVIDB_AOF---aof} --dir /data --threads $THREADS --update-check no --loglevel warning ${KIVIDB_ARGS:-}" >/dev/null
+      "$image" bash -c "mkdir -p /data && cd /data && exec $wrap /target/perf-$tag/release/kividb --port 6379 --bind 0.0.0.0 ${KIVIDB_AOF---aof} --dir /data --threads $THREADS --update-check no --loglevel warning ${KIVIDB_ARGS:-}" >/dev/null
   fi
   for _ in $(seq 200); do cli ping 2>/dev/null | grep -q PONG && break; sleep 0.3; done
   if [ -n "${PERF:-}" ] && [ "$tag" != redis ]; then
