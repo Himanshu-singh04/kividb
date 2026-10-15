@@ -339,6 +339,15 @@ people upgrading, are in
   a second either way, as with `appendfsync everysec` in Redis. Redis
   itself loses nothing to a process kill. Closing this means every write
   waits for the file; it is left for a release after 1.1.0.
+- **Many clients writing to one key are slower while anything follows the
+  write stream** (a replica; the replication backlog, kept for an hour after
+  a restart or after the last replica left; a backup in progress). Writes to
+  a key are then put on the stream in the order they were made, one at a
+  time, and each hands its record to the replication thread. Measured with
+  50 clients, pipelining, one key, 8 CPUs: about 210,000 writes a second
+  against 1.1 million with nothing following the stream. Writes spread over
+  many keys are not affected. A fix that keeps the order without the
+  hand-off is planned for a later release.
 - **Cluster: `FT.SPELLCHECK`, `FT.PROFILE`, `FT.HYBRID` and `FT.SYNDUMP`
   answer from the node they are sent to.**
 - **Cluster: without `tls-cluster`, what nodes send each other is in the
