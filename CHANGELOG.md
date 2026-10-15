@@ -63,6 +63,14 @@ people upgrading, are in
   - A panic in a command a script calls left the connection with a command
     pointing at freed memory; and a panic in a search coordinated across the
     cluster left the thread answering every later search as a shard.
+- **A script that turns slow no longer stops a server on Tokio** (the I/O
+  model on macOS and Windows, and on Linux where io_uring is blocked, as
+  under Docker's default seccomp profile). A script that had run quickly
+  before runs on the worker that read it; if it then ran long, and that
+  worker had been the one listening on the sockets, no connection was
+  answered or accepted until it ended — `SCRIPT KILL` and `FUNCTION KILL`
+  could not reach it. Another worker now takes over while it runs. Found by
+  Redis's own `scripting` and `functions` tests, which hung on Tokio.
 - `BACKUP CLEANUP` removes only the backup's own files from `backupdirname`,
   not everything in it.
 

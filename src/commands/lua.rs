@@ -676,7 +676,9 @@ where
     let _clear_exec = ClearExecLua;
 
     let started = std::time::Instant::now();
+    VM_RUN_STARTED.with(|c| c.set(Some(started)));
     let out = f(lua);
+    VM_RUN_STARTED.with(|c| c.set(None));
     LAST_VM_RUN_US.with(|c| c.set(started.elapsed().as_micros() as u64));
     Ok(out)
 }
@@ -722,7 +724,9 @@ where
         let _clear_exec = ClearExecLua;
 
         let started = std::time::Instant::now();
+        VM_RUN_STARTED.with(|c| c.set(Some(started)));
         let out = f(lua);
+        VM_RUN_STARTED.with(|c| c.set(None));
         LAST_VM_RUN_US.with(|c| c.set(started.elapsed().as_micros() as u64));
         out
     })
@@ -731,6 +735,49 @@ where
 thread_local! {
     /// How long the last script this thread ran spent in the VM, in µs.
     static LAST_VM_RUN_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// When the script this thread is running started, while it runs.
+    static VM_RUN_STARTED: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    /// When [`keep_the_runtime_listening`] may next wake a worker.
+    static NEXT_NUDGE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A script that has run this long on a tokio worker has other connections
+/// waiting on it (see [`keep_the_runtime_listening`]).
+const NUDGE_AFTER: std::time::Duration = std::time::Duration::from_millis(5);
+/// How often, after that, another worker is woken.
+const NUDGE_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Called from the script hook. A script that has shown itself quick runs on
+/// the tokio worker that read it (`lua_vm_blocking`), and one that turns out
+/// not to be holds that worker. If the worker had last been the one waiting
+/// on the sockets, nobody is any more: the other workers sleep until they are
+/// woken, and every connection goes unanswered — not told `BUSY`, not able to
+/// `SCRIPT KILL` the script — until it ends, however long that is. So while
+/// a script runs long, another worker is woken now and then, by a task sent
+/// from outside the workers (sent from here, it would wait behind the script
+/// on this worker's own queue); woken, it takes over the sockets. io_uring
+/// workers each run on their own and have nothing to hand over.
+fn keep_the_runtime_listening() {
+    let Some(started) = VM_RUN_STARTED.with(|c| c.get()) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if now.duration_since(started) < NUDGE_AFTER
+        || NEXT_NUDGE.with(|c| c.get()).is_some_and(|next| now < next)
+    {
+        return;
+    }
+    NEXT_NUDGE.with(|c| c.set(Some(now + NUDGE_EVERY)));
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        let remote = handle.clone();
+        handle.spawn_blocking(move || {
+            remote.spawn(async {});
+        });
+    }
 }
 
 /// How long the script this thread has just run spent running — not waiting
@@ -3333,6 +3380,7 @@ fn install_eval_timeout_hook(lua: &Lua) -> Result<(), String> {
                     return Err(LuaError::RuntimeError("Script killed by user".into()));
                 }
             }
+            keep_the_runtime_listening();
             // Redis: exceeding lua-time-limit makes the server BUSY for other clients; the script
             // keeps running until SCRIPT KILL (read-only) — do not abort here on time alone.
             Ok(VmState::Continue)

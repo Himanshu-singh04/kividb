@@ -1099,3 +1099,49 @@ fn a_script_cannot_reach_outside_the_sandbox() {
         bytecode.as_str()
     );
 }
+
+/// A function that has shown itself quick runs on the worker that read it.
+/// Redefined to run for ever, it held that worker; and when that worker had
+/// last been the one listening on the sockets, nobody listened any more:
+/// a new connection was not even accepted, and the function could not be
+/// killed. Other connections must be answered, `BUSY`, and `FUNCTION KILL`
+/// must end it.
+#[test]
+fn a_quick_function_that_turns_endless_does_not_stop_the_server() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let quick = "#!lua name=turnslib\nredis.register_function('turns', function() return 1 end)";
+    assert!(!c.cmds(&["FUNCTION", "LOAD", "REPLACE", quick]).is_error());
+    for _ in 0..3 {
+        assert_eq!(c.cmds(&["FCALL", "turns", "0"]).as_int(), 1);
+    }
+    let endless =
+        "#!lua name=turnslib\nredis.register_function('turns', function() while true do end end)";
+    assert!(!c.cmds(&["FUNCTION", "LOAD", "REPLACE", endless]).is_error());
+    c.cmds(&["CONFIG", "SET", "lua-time-limit", "10"]);
+
+    let mut runner = Conn::connect(port);
+    runner
+        .stream
+        .write_all(b"*3\r\n$5\r\nFCALL\r\n$5\r\nturns\r\n$1\r\n0\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+
+    // Several new connections, so that some land on other workers and some
+    // on the one running the function.
+    for _ in 0..6 {
+        let mut other = Conn::connect(port);
+        let reply = other.cmds(&["PING"]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e.starts_with("BUSY")),
+            "{reply:?}"
+        );
+    }
+    assert_eq!(c.cmds(&["FUNCTION", "KILL"]).as_str(), "OK");
+    assert!(runner.read_value().is_error());
+    assert_eq!(Conn::connect(port).cmds(&["PING"]).as_str(), "PONG");
+    c.cmds(&["CONFIG", "SET", "lua-time-limit", "5000"]);
+    c.cmds(&["FUNCTION", "DELETE", "turnslib"]);
+}
