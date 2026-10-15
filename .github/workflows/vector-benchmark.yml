@@ -501,8 +501,9 @@ jobs:
           fi
 
           cd /home/ubuntu/kividb
-          # kividb binds 0.0.0.0 by default.
-          nohup ./kividb --port 6380 --loglevel error > /tmp/kividb.log 2>&1 &
+          # An explicit bind: the client is on another host, and with no bind
+          # and no password protected mode would turn it away.
+          nohup ./kividb --bind 0.0.0.0 --port 6380 --loglevel error > /tmp/kividb.log 2>&1 &
           echo $! > /tmp/kividb.pid
 
           for i in $(seq 1 30); do
