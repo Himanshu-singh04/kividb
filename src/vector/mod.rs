@@ -1687,8 +1687,10 @@ pub fn knn_flat(
 /// `candidates` — (dist_to_q, node_id), sorted ascending by dist_to_q.
 /// `keep_pruned` — if true, fill remaining slots with the discarded set so
 ///                 we always return exactly m_max neighbors when possible.
+/// Choose up to `m_max` of `candidates` as a node's neighbours. Like the
+/// search, it offers its read lock to a waiting insert every few candidates.
 fn select_neighbors_heuristic(
-    nodes: &[HnswNode],
+    nodes: &mut parking_lot::RwLockReadGuard<'_, Vec<HnswNode>>,
     candidates: &[(f32, usize)],
     m_max: usize,
     metric: &DistanceMetric,
@@ -1697,9 +1699,12 @@ fn select_neighbors_heuristic(
     let mut result: Vec<(f32, usize)> = Vec::with_capacity(m_max);
     let mut discarded: Vec<(f32, usize)> = Vec::new();
 
-    'cand: for &(d_to_q, cand_id) in candidates {
+    'cand: for (i, &(d_to_q, cand_id)) in candidates.iter().enumerate() {
         if result.len() >= m_max {
             break;
+        }
+        if i > 0 && i.is_multiple_of(EXPANSIONS_PER_YIELD) {
+            parking_lot::RwLockReadGuard::bump(nodes);
         }
         let cand_vec = &nodes[cand_id].vector;
         if cand_vec.is_empty() {
@@ -1782,7 +1787,12 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
     // new_id into that sorted list and runs a bounded heuristic (K=4) — only
     // O(M×K) pairwise distance calls under the write lock instead of O(M²).
     // Tuple: (nb_id, layer, nb_vec_owned, pre_scored_sorted, snapshot_len).
-    type PrecomputedBacklink = (usize, usize, Vec<f32>, Vec<(f32, usize)>, usize);
+    // A forward neighbour that will overflow when it receives its back-link,
+    // pruned during the search: (neighbour id, layer, its neighbours as the
+    // search saw them, the list to replace them with). The new node is not in
+    // the graph yet, so the list names it NEW_NODE.
+    type PrecomputedBacklink = (usize, usize, Vec<usize>, Vec<usize>);
+    const NEW_NODE: usize = usize::MAX;
     let mut precomputed_backlinks: Vec<PrecomputedBacklink> = Vec::new();
 
     let (neighbors_per_layer, _curr_ep_final) = if let Some(mut ep) = ep_snapshot {
@@ -1827,9 +1837,10 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
         let mut curr_ep = ep;
         let mut per_layer: Vec<Vec<usize>> = Vec::with_capacity(level + 1);
         {
-            let nodes = index.nodes.read();
+            let mut nodes = index.nodes.read();
             for lc in (level + 1..=ep_level).rev() {
-                let results = hnsw_search_layer_concurrent(&nodes, &vector, curr_ep, 1, lc, metric);
+                let results =
+                    hnsw_search_layer_concurrent(&mut nodes, &vector, curr_ep, 1, lc, metric);
                 if let Some(&(_, best)) = results.first() {
                     curr_ep = best;
                 }
@@ -1839,7 +1850,7 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
             for lc in (0..=level.min(ep_level)).rev() {
                 let m_max = if lc == 0 { index.m0 } else { index.m };
                 let candidates = hnsw_search_layer_concurrent(
-                    &nodes,
+                    &mut nodes,
                     &vector,
                     curr_ep,
                     index.ef_construction,
@@ -1849,7 +1860,8 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
                 if let Some(&(_, best)) = candidates.first() {
                     curr_ep = best;
                 }
-                let selected = select_neighbors_heuristic(&nodes, &candidates, m_max, metric, true);
+                let selected =
+                    select_neighbors_heuristic(&mut nodes, &candidates, m_max, metric, true);
                 per_layer.push(selected);
             }
 
@@ -1861,10 +1873,12 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
                 per_layer.push(vec![]);
             }
 
-            // Pre-computation: for each forward neighbor predicted to overflow,
-            // score its current neighbors against its own vector (O(M) distances).
-            // This is the ONLY work done here — no heuristic, no O(M²) loop.
-            // Keeps the read-lock hold time proportional to M, not M².
+            // Prune here every forward neighbour that the back-link will
+            // overflow, so that the write lock only has to swap the lists in.
+            // Pruning reads up to M x 4 vectors from all over the graph; done
+            // under the write lock, for some 32 neighbours an insert, it held
+            // every other insert and search back (6,000 inserts a second on 64
+            // cores).
             for (lc, forward_neighbors) in per_layer.iter().enumerate() {
                 let m_max = if lc == 0 { index.m0 } else { index.m };
                 for &nb_id in forward_neighbors {
@@ -1876,23 +1890,57 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
                         Some(n) => n,
                         None => continue,
                     };
-                    let snapshot_len = lc_neighbors.len();
-                    if snapshot_len < m_max {
+                    if lc_neighbors.len() < m_max {
                         continue; // won't overflow
                     }
-                    let nb_vec = nb_node.vector.clone();
-                    let mut pre_scored: Vec<(f32, usize)> = lc_neighbors
+                    let nb_vec = &nb_node.vector;
+                    let vector_of = |id: usize| {
+                        if id == NEW_NODE {
+                            &vector[..]
+                        } else {
+                            &nodes[id].vector[..]
+                        }
+                    };
+                    let mut scored: Vec<(f32, usize)> = lc_neighbors
                         .iter()
                         .filter_map(|&id| {
                             let n = &nodes[id];
                             if n.vector.is_empty() {
                                 return None;
                             }
-                            Some((distance_prenorm(metric, &nb_vec, &n.vector), id))
+                            Some((distance_prenorm(metric, nb_vec, &n.vector), id))
                         })
                         .collect();
-                    pre_scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-                    precomputed_backlinks.push((nb_id, lc, nb_vec, pre_scored, snapshot_len));
+                    scored.push((distance_prenorm(metric, nb_vec, &vector), NEW_NODE));
+                    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+
+                    // Bounded Algorithm-4 heuristic: check each candidate
+                    // against at most K=4 already-accepted neighbours.
+                    for i in 0..scored.len() {
+                        let (d_i, id_i) = scored[i];
+                        let vec_i = vector_of(id_i);
+                        let mut checks = 0usize;
+                        for j in 0..i {
+                            let (d_j, id_j) = scored[j];
+                            if d_j.is_infinite() {
+                                continue;
+                            }
+                            if distance_prenorm(metric, vec_i, vector_of(id_j)) < d_i {
+                                scored[i].0 = f32::INFINITY;
+                                break;
+                            }
+                            checks += 1;
+                            if checks >= 4 {
+                                break;
+                            }
+                        }
+                    }
+                    let mut pruned = Vec::with_capacity(m_max);
+                    let kept = scored.iter().filter(|(d, _)| !d.is_infinite());
+                    let dropped = scored.iter().filter(|(d, _)| d.is_infinite());
+                    pruned.extend(kept.chain(dropped).take(m_max).map(|&(_, id)| id));
+                    precomputed_backlinks.push((nb_id, lc, lc_neighbors.clone(), pruned));
+                    parking_lot::RwLockReadGuard::bump(&mut nodes);
                 }
             }
         } // read lock drops here
@@ -1956,75 +2004,21 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
                 nodes[nb_id].neighbors[lc].push(new_id);
 
                 if nodes[nb_id].neighbors[lc].len() > m_max {
-                    // Fast path: use the pre-scored list from Phase 2.
-                    // Freshness check: if no concurrent insert modified nb_id's
-                    // neighbor list between Phase 2 and now, current len is
-                    // exactly snapshot_len + 1 (we just pushed new_id above).
-                    let precomputed = precomputed_backlinks
-                        .iter()
-                        .find(|(pid, plc, _, _, _)| *pid == nb_id && *plc == lc);
-
-                    if let Some((_, _, nb_vec_pre, pre_scored, snapshot_len)) = precomputed
-                        && nodes[nb_id].neighbors[lc].len() == snapshot_len + 1
-                    {
-                        // Fresh: merge pre_scored + new_id and run bounded K=4
-                        // heuristic. Only O(M×4) pairwise distance calls under
-                        // the write lock — no full O(M²) sweep.
-                        let d_new = distance_prenorm(metric, nb_vec_pre, &nodes[new_id].vector);
-                        let ins = pre_scored.partition_point(|&(d, _)| d <= d_new);
-
-                        BACKLINK_SCRATCH.with(|cell| {
-                            let mut scored = cell.borrow_mut();
-                            scored.clear();
-                            scored.extend_from_slice(&pre_scored[..ins]);
-                            scored.push((d_new, new_id));
-                            scored.extend_from_slice(&pre_scored[ins..]);
-
-                            // Bounded Algorithm-4 heuristic: check each candidate
-                            // against at most K=4 already-accepted neighbors.
-                            let len = scored.len();
-                            for i in 0..len {
-                                if scored[i].0.is_infinite() {
-                                    continue;
-                                }
-                                let (d_i, id_i) = scored[i];
-                                let vec_i = &nodes[id_i].vector;
-                                let mut checks = 0usize;
-                                for j in 0..i {
-                                    let (d_j, id_j) = scored[j];
-                                    if d_j.is_infinite() {
-                                        continue;
-                                    }
-                                    if distance_prenorm(metric, vec_i, &nodes[id_j].vector) < d_i {
-                                        scored[i].0 = f32::INFINITY;
-                                        break;
-                                    }
-                                    checks += 1;
-                                    if checks >= 4 {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            nodes[nb_id].neighbors[lc].clear();
-                            nodes[nb_id].neighbors[lc].reserve(m_max);
-                            for &(d, id) in scored.iter() {
-                                if nodes[nb_id].neighbors[lc].len() >= m_max {
-                                    break;
-                                }
-                                if !d.is_infinite() {
-                                    nodes[nb_id].neighbors[lc].push(id);
-                                }
-                            }
-                            for &(d, id) in scored.iter() {
-                                if nodes[nb_id].neighbors[lc].len() >= m_max {
-                                    break;
-                                }
-                                if d.is_infinite() {
-                                    nodes[nb_id].neighbors[lc].push(id);
-                                }
-                            }
-                        });
+                    // Fast path: the list pruned during the search, if the
+                    // neighbour's list is still the one it pruned (with new_id
+                    // just pushed on the end).
+                    let current = &nodes[nb_id].neighbors[lc];
+                    let fresh = precomputed_backlinks.iter().find(|(pid, plc, seen, _)| {
+                        *pid == nb_id && *plc == lc && current[..current.len() - 1] == seen[..]
+                    });
+                    if let Some((_, _, _, pruned)) = fresh {
+                        let list = &mut nodes[nb_id].neighbors[lc];
+                        list.clear();
+                        list.extend(
+                            pruned
+                                .iter()
+                                .map(|&id| if id == NEW_NODE { new_id } else { id }),
+                        );
                         continue; // skip greedy fallback
                     }
                     // Stale (concurrent insert raced us) — fall through to greedy.
@@ -2096,8 +2090,21 @@ thread_local! {
 
 /// Greedy beam search within one layer.
 /// Returns up to `ef` candidates as (distance, node_id), sorted ascending.
+/// How many candidates a search expands between offers of its read lock to a
+/// waiting insert (see [`hnsw_search_layer_concurrent`]).
+const EXPANSIONS_PER_YIELD: usize = 4;
+
+/// Search one layer of the graph from `ep`, the graph held for reading.
+///
+/// Every few candidates the read lock is handed to an insert waiting for the
+/// write lock, if there is one, and taken back. An insert takes the write lock
+/// once, briefly, but a writer that waits holds back every reader that comes
+/// after it, so before this an ingest made one insert for about every search
+/// that ran: 6,000 inserts a second on 64 cores, the rest of them waiting.
+/// Ids stay valid across the yield: nodes are only appended, and deleted ones
+/// are tombstoned in place.
 fn hnsw_search_layer_concurrent(
-    nodes: &[HnswNode],
+    nodes: &mut parking_lot::RwLockReadGuard<'_, Vec<HnswNode>>,
     query: &[f32],
     ep: usize,
     ef: usize,
@@ -2121,10 +2128,15 @@ fn hnsw_search_layer_concurrent(
         bufs.candidates.push(std::cmp::Reverse((of_ep, ep)));
         bufs.dynamic.push((of_ep, ep));
 
+        let mut expanded = 0usize;
         while let Some(std::cmp::Reverse((c_dist, c_id))) = bufs.candidates.pop() {
             let worst = bufs.dynamic.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
             if bufs.dynamic.len() >= ef && c_dist.0 > worst {
                 break;
+            }
+            expanded += 1;
+            if expanded.is_multiple_of(EXPANSIONS_PER_YIELD) {
+                parking_lot::RwLockReadGuard::bump(nodes);
             }
 
             // Copy neighbors into the thread-local scratch buffer.
@@ -2194,7 +2206,7 @@ pub fn knn_hnsw(
         None => return vec![],
     };
 
-    let nodes = index.nodes.read();
+    let mut nodes = index.nodes.read();
 
     // Handle tombstoned entry point
     if nodes
@@ -2239,17 +2251,17 @@ pub fn knn_hnsw(
     let mut curr_ep = ep_id;
 
     for lc in (1..=ep_level).rev() {
-        let candidates = hnsw_search_layer_concurrent(&nodes, query, curr_ep, 1, lc, metric);
+        let candidates = hnsw_search_layer_concurrent(&mut nodes, query, curr_ep, 1, lc, metric);
         if let Some(&(_, best)) = candidates.first() {
             curr_ep = best;
         }
     }
 
-    let mut results = hnsw_search_layer_concurrent(&nodes, query, curr_ep, ef, 0, metric);
+    let mut results = hnsw_search_layer_concurrent(&mut nodes, query, curr_ep, ef, 0, metric);
 
     // Fallback search from original entry point if we got too few results
     if results.len() < k && curr_ep != ep_id {
-        let mut more = hnsw_search_layer_concurrent(&nodes, query, ep_id, ef, 0, metric);
+        let mut more = hnsw_search_layer_concurrent(&mut nodes, query, ep_id, ef, 0, metric);
         results.append(&mut more);
         let mut seen: AHashMap<usize, f32> = AHashMap::new();
         for (dist, id) in results {
