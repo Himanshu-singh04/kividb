@@ -540,7 +540,7 @@ fn collect(args: &[String], members: &[&Row]) -> String {
             "FIELDS" if args.get(i + 1).is_some_and(|a| a == "*") => i += 2,
             "FIELDS" => {
                 let n = number(i + 1).unwrap_or(0);
-                let end = (i + 2 + n).min(args.len());
+                let end = (i + 2).saturating_add(n).min(args.len());
                 fields = Some(
                     args[(i + 2).min(end)..end]
                         .iter()
@@ -551,7 +551,7 @@ fn collect(args: &[String], members: &[&Row]) -> String {
             }
             "SORTBY" => {
                 let n = number(i + 1).unwrap_or(0);
-                let end = (i + 2 + n).min(args.len());
+                let end = (i + 2).saturating_add(n).min(args.len());
                 order = parse_sort_keys(&args[(i + 2).min(end)..end]);
                 i = end;
             }

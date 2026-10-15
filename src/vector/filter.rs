@@ -188,6 +188,8 @@ pub fn parse_query(query: &str, params: &Params, def: &IndexDef) -> Result<Query
         pos: 0,
         params,
         def,
+        clauses: 0,
+        depth: 0,
     };
     parser.skip_ws();
     let filter = if parser.at_end() {
@@ -223,7 +225,19 @@ struct Parser<'a> {
     pos: usize,
     params: &'a Params,
     def: &'a IndexDef,
+    /// How many clauses have been read.
+    clauses: usize,
+    /// How deep in parentheses, `-` and `~` the parse is.
+    depth: u32,
 }
+
+/// The most clauses a query may have, and the deepest it may nest. A query is
+/// parsed, matched and freed by calls that go as deep as its tree, and `a b c`
+/// or `a|b|c` is a tree as deep as it is long: without a limit, a long query
+/// from a client would run the thread out of stack, which takes the server
+/// down.
+const CLAUSES_MAX: usize = 1024;
+const DEPTH_MAX: u32 = 64;
 
 /// Characters that end a bare word.
 fn is_word_end(c: char) -> bool {
@@ -333,6 +347,17 @@ impl<'a> Parser<'a> {
     /// `-x`, `~x`, or a clause, with any `=>{…}` attributes after it.
     /// `None` is a stopword: a word that restricts nothing.
     fn unary(&mut self, scope: Option<&[String]>) -> Result<Option<Filter>, String> {
+        self.clauses += 1;
+        if self.clauses > CLAUSES_MAX || self.depth >= DEPTH_MAX {
+            return Err("Syntax error: the query is too long or nests too deep".into());
+        }
+        self.depth += 1;
+        let clause = self.unary_clause(scope);
+        self.depth -= 1;
+        clause
+    }
+
+    fn unary_clause(&mut self, scope: Option<&[String]>) -> Result<Option<Filter>, String> {
         if self.eat('-') {
             self.skip_ws();
             return Ok(Some(match self.unary(scope)? {
@@ -1425,6 +1450,14 @@ mod tests {
             );
         }
         assert!(rejected("@nosuch:hello").contains("near nosuch"));
+    }
+
+    #[test]
+    fn a_query_too_long_or_too_deep_is_an_error() {
+        assert!(rejected(&"(".repeat(100_000)).contains("too deep"));
+        assert!(rejected(&"-".repeat(100_000)).contains("too deep"));
+        assert!(rejected(&vec!["hello"; 100_000].join(" ")).contains("too long"));
+        assert!(rejected(&vec!["hello"; 100_000].join("|")).contains("too long"));
     }
 
     #[test]

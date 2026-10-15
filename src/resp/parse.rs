@@ -27,7 +27,7 @@ pub fn parse_resp_command(buf: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
         let bulk_len = parse_number(len_line)?;
         idx = next;
 
-        if idx + bulk_len + 2 > buf.len() {
+        if buf.len() - idx < bulk_len.saturating_add(2) {
             return None;
         }
 
@@ -65,6 +65,13 @@ pub fn parse_resp_command(buf: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
 const LINE_MAX: usize = 64 * 1024;
 /// The longest argument (Redis's `proto-max-bulk-len`).
 const BULK_MAX: i64 = 512 * 1024 * 1024;
+/// The most one request may come to (Redis's `client-query-buffer-limit`).
+const REQUEST_MAX: usize = 1024 * 1024 * 1024;
+/// What a client that has not authenticated may send, as in Redis: a request
+/// of at most this many arguments...
+const UNAUTHENTICATED_ARGS_MAX: i64 = 10;
+/// ...each of at most this many bytes.
+const UNAUTHENTICATED_BULK_MAX: i64 = 16 * 1024;
 
 /// What is wrong with what the client sent.
 pub type ProtocolError = String;
@@ -251,6 +258,102 @@ fn split_quoted(line: &[u8]) -> Option<Vec<Vec<u8>>> {
             i += 1;
         }
         args.push(arg);
+    }
+}
+
+/// How far the request that has begun arriving, and has not all arrived, has
+/// been read: where its next argument begins, and how many are still to come.
+///
+/// A request of many arguments arrives in many reads. Read from its beginning
+/// after each, it would be read again and again, which comes to the square of
+/// its size: a client could keep the thread busy for hours with one request.
+/// So it is read from where the last look at it stopped, and as a whole only
+/// once it has all arrived.
+///
+/// One for each connection, handed to [`Progress::next_request`] each time.
+/// A request that arrives in one read (most do) is read once, as before.
+#[derive(Default)]
+pub struct Progress {
+    /// The last look found the request had not all arrived.
+    waiting: bool,
+    /// Where, from the request's beginning, its next argument begins; 0
+    /// before the count that begins it has been read.
+    at: usize,
+    /// How many arguments are still to come.
+    left: i64,
+}
+
+impl Progress {
+    /// [`next_request`], from where the last look at this request stopped.
+    /// A client that has not `authenticated` is held to Redis's limits for one.
+    pub fn next_request<'a>(
+        &mut self,
+        buf: &'a mut Vec<u8>,
+        at: usize,
+        authenticated: bool,
+    ) -> Result<Option<Request<'a>>, ProtocolError> {
+        if buf.get(at) == Some(&b'*') && (self.waiting || !authenticated) {
+            if !self.whole(&buf[at..], authenticated)? {
+                if buf.len() - at > REQUEST_MAX {
+                    return Err("query buffer limit exceeded".into());
+                }
+                self.waiting = true;
+                return Ok(None);
+            }
+            *self = Progress::default();
+        }
+        let request = next_request(buf, at);
+        self.waiting = matches!(request, Ok(None));
+        request
+    }
+
+    /// Whether `request` may have all arrived. `true` also when something in
+    /// it is not as it should be: [`parse_request`] then says what.
+    fn whole(&mut self, request: &[u8], authenticated: bool) -> Result<bool, ProtocolError> {
+        if self.at == 0 {
+            let Some(cr) = memchr::memchr(b'\r', request) else {
+                return Ok(request.len() > LINE_MAX);
+            };
+            if cr + 1 >= request.len() {
+                return Ok(false);
+            }
+            let Some(count) = parse_integer(&request[1..cr]) else {
+                return Ok(true);
+            };
+            if !authenticated && count > UNAUTHENTICATED_ARGS_MAX {
+                return Err("unauthenticated multibulk length".into());
+            }
+            self.at = cr + 2;
+            self.left = count;
+        }
+        while self.left > 0 {
+            let Some(rest) = request.get(self.at..).filter(|rest| !rest.is_empty()) else {
+                return Ok(false);
+            };
+            if rest[0] != b'$' {
+                return Ok(true);
+            }
+            let Some(cr) = memchr::memchr(b'\r', rest) else {
+                return Ok(rest.len() > LINE_MAX);
+            };
+            if cr + 1 >= rest.len() {
+                return Ok(false);
+            }
+            let Some(len) = parse_integer(&rest[1..cr]).filter(|len| (0..=BULK_MAX).contains(len))
+            else {
+                return Ok(true);
+            };
+            if !authenticated && len > UNAUTHENTICATED_BULK_MAX {
+                return Err("unauthenticated bulk length".into());
+            }
+            let end = self.at + cr + 2 + len as usize + 2;
+            if end > request.len() {
+                return Ok(false);
+            }
+            self.at = end;
+            self.left -= 1;
+        }
+        Ok(true)
     }
 }
 
@@ -479,5 +582,56 @@ mod inline_line_ending_tests {
                 vec![b"ECHO".to_vec(), b"hi".to_vec()],
             ]
         );
+    }
+
+    /// A request read a piece at a time comes out whole, and the same as at
+    /// once, however it is cut.
+    #[test]
+    fn a_request_that_arrives_in_pieces_is_read_from_where_it_stopped() {
+        let request = b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$11\r\nhello world\r\n*1\r\n$4\r\nPING\r\n";
+        for piece in 1..request.len() {
+            let mut progress = Progress::default();
+            let mut buf = Vec::new();
+            let mut got = Vec::new();
+            let mut at = 0;
+            for chunk in request.chunks(piece) {
+                buf.extend_from_slice(chunk);
+                while let Some((consumed, args)) =
+                    progress.next_request(&mut buf, at, true).unwrap()
+                {
+                    got.push(args.iter().map(|a| a.to_vec()).collect::<Vec<_>>());
+                    at += consumed;
+                }
+            }
+            assert_eq!(
+                got,
+                vec![
+                    vec![b"SET".to_vec(), b"key".to_vec(), b"hello world".to_vec()],
+                    vec![b"PING".to_vec()],
+                ],
+                "in pieces of {piece}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_that_has_not_authenticated_is_held_to_redis_limits() {
+        let mut progress = Progress::default();
+        let mut buf = b"*11\r\n".to_vec();
+        let err = progress.next_request(&mut buf, 0, false).unwrap_err();
+        assert!(err.contains("unauthenticated multibulk length"), "{err}");
+
+        let mut progress = Progress::default();
+        let mut buf = b"*2\r\n$4\r\nAUTH\r\n$16385\r\n".to_vec();
+        let err = progress.next_request(&mut buf, 0, false).unwrap_err();
+        assert!(err.contains("unauthenticated bulk length"), "{err}");
+
+        // Once authenticated, neither is a limit.
+        let mut progress = Progress::default();
+        let mut buf = b"*11\r\n".to_vec();
+        assert!(progress.next_request(&mut buf, 0, true).unwrap().is_none());
+        let mut buf = b"*2\r\n$4\r\nAUTH\r\n$3\r\npwd\r\n".to_vec();
+        let mut progress = Progress::default();
+        assert!(progress.next_request(&mut buf, 0, false).unwrap().is_some());
     }
 }

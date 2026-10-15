@@ -388,11 +388,41 @@ pub enum Expr {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// How deep in parentheses, calls and unary operators the parse is.
+    depth: u32,
+    /// The expression nests too deep, and the rest of it was skipped.
+    too_deep: bool,
 }
+
+/// The most tokens an expression may have, and the deepest it may nest. The
+/// tree is parsed, evaluated and freed by calls that go as deep as it does:
+/// without a limit, `((((…` or `1+1+1…` from a client would run the thread
+/// out of stack, which takes the server down.
+const TOKENS_MAX: usize = 1024;
+const DEPTH_MAX: u32 = 64;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+            too_deep: false,
+        }
+    }
+
+    /// `parse` one level deeper; past [`DEPTH_MAX`] the rest of the
+    /// expression is skipped, and [`parse`] answers `None`.
+    fn deeper(&mut self, parse: impl FnOnce(&mut Self) -> Expr) -> Expr {
+        if self.depth >= DEPTH_MAX {
+            self.too_deep = true;
+            self.pos = self.tokens.len();
+            return Expr::Literal(Value::Nil);
+        }
+        self.depth += 1;
+        let expr = parse(self);
+        self.depth -= 1;
+        expr
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -415,7 +445,7 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Expr {
-        self.parse_or()
+        self.deeper(Self::parse_or)
     }
 
     fn parse_or(&mut self) -> Expr {
@@ -537,11 +567,11 @@ impl Parser {
         match self.peek() {
             Some(Token::Minus) => {
                 self.advance();
-                Expr::Neg(Box::new(self.parse_unary()))
+                Expr::Neg(Box::new(self.deeper(Self::parse_unary)))
             }
             Some(Token::Bang) => {
                 self.advance();
-                Expr::Not(Box::new(self.parse_unary()))
+                Expr::Not(Box::new(self.deeper(Self::parse_unary)))
             }
             _ => self.parse_primary(),
         }
@@ -606,10 +636,12 @@ pub fn parse(expr: &str) -> Option<Expr> {
         return None;
     }
     let tokens = Tokenizer::new(expr).tokenize();
-    if tokens.is_empty() {
+    if tokens.is_empty() || tokens.len() > TOKENS_MAX {
         return None;
     }
-    Some(Parser::new(tokens).parse_expr())
+    let mut parser = Parser::new(tokens);
+    let expr = parser.parse_expr();
+    (!parser.too_deep).then_some(expr)
 }
 
 // ── Evaluator ─────────────────────────────────────────────────────────────────
@@ -958,5 +990,20 @@ fn eval_fn(name: &str, args: &[Expr], row: &AHashMap<String, String>) -> Value {
 
         // Anything unknown → Nil (safe default, won't crash)
         _ => Value::Nil,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_expression_that_nests_too_deep_or_runs_too_long_is_refused() {
+        assert!(parse("((1+2))*-3").is_some());
+        let deep = format!("{}1{}", "(".repeat(100_000), ")".repeat(100_000));
+        assert!(parse(&deep).is_none());
+        assert!(parse(&"-".repeat(100_000)).is_none());
+        let long = vec!["1"; 100_000].join("+");
+        assert!(parse(&long).is_none());
     }
 }

@@ -1225,6 +1225,9 @@ async fn send_command(
     writer.write_all(buf.as_bytes()).await
 }
 
+/// The most a replica may have sent that is not yet a whole `REPLCONF ACK`.
+pub(crate) const ACK_PENDING_MAX: usize = 64 * 1024;
+
 /// `REPLCONF ACK <offset>`, bounded: a peer that has stopped reading must not
 /// be able to park this task in a write forever.
 async fn send_ack(
@@ -1684,6 +1687,14 @@ where
                     }
                     if pos > 0 {
                         buf.drain(0..pos);
+                    }
+                    // An ACK is a few dozen bytes: a replica that sends this
+                    // much that is not one is not a replica.
+                    if buf.len() > ACK_PENDING_MAX {
+                        log_warn!(
+                            "Replication: replica {replica_id} sent what is not REPLCONF ACK; disconnecting it"
+                        );
+                        break;
                     }
                 }
             }

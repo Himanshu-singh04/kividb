@@ -3420,7 +3420,7 @@ pub fn xnack(ctx: &mut Ctx) -> Vec<u8> {
     if numids == 0 {
         return resp_error("ERR numids must be greater than 0");
     }
-    if cmd.len() < 6 + numids {
+    if numids > cmd.len().saturating_sub(6) {
         return resp_error("ERR syntax error, numids does not match the number of IDs given");
     }
 

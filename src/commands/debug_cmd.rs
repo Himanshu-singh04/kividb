@@ -24,7 +24,11 @@ pub fn handle(ctx: &mut Ctx) -> Option<Vec<u8>> {
             let Some(secs) = parse_sleep_seconds(ctx) else {
                 return Some(resp_error("ERR wrong number of arguments for DEBUG sleep"));
             };
-            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+            // Negative, infinite or not a number: not a length of time.
+            let Ok(duration) = std::time::Duration::try_from_secs_f64(secs) else {
+                return Some(resp_error("ERR value is out of range"));
+            };
+            std::thread::sleep(duration);
             Some(resp_simple("OK"))
         }
         "protocol" => {

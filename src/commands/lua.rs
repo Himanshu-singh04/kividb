@@ -1026,9 +1026,17 @@ fn msgpack_encode_table(t: &LuaTable, buf: &mut Vec<u8>, depth: u32) {
     }
 }
 
+/// How deep a MessagePack value may nest to be decoded.
+const MSGPACK_DECODE_DEPTH_MAX: u32 = 256;
+
 /// Decode one MessagePack value from `buf` starting at index 0.
 /// Returns `(LuaValue, bytes_consumed)`.
 fn msgpack_decode(lua: &Lua, buf: &[u8], depth: u32) -> LuaResult<(LuaValue, usize)> {
+    // Each level is a call: without a limit, a string of nested one-element
+    // arrays runs the thread out of stack, which takes the server down.
+    if depth >= MSGPACK_DECODE_DEPTH_MAX {
+        return Err(LuaError::RuntimeError("msgpack: nested too deeply".into()));
+    }
     if buf.is_empty() {
         return Err(LuaError::RuntimeError(
             "msgpack: unexpected end of data".into(),
@@ -4110,13 +4118,14 @@ fn decode_function_dump_payload(data: &[u8]) -> Result<Vec<FunctionLibrary>, ()>
     }
 
     let n = read_u32_le(data, &mut pos).ok_or(())? as usize;
-    let mut out = Vec::with_capacity(n);
+    // `n` is the payload's word: each library takes some of its bytes.
+    let mut out = Vec::with_capacity(n.min(data.len()));
     for _ in 0..n {
         let name = read_blob_string(data, &mut pos).ok_or(())?;
         let engine = read_blob_string(data, &mut pos).ok_or(())?;
         let body = read_blob_string(data, &mut pos).ok_or(())?;
         let nf = read_u32_le(data, &mut pos).ok_or(())? as usize;
-        let mut functions = Vec::with_capacity(nf);
+        let mut functions = Vec::with_capacity(nf.min(data.len()));
         for _ in 0..nf {
             functions.push(read_blob_string(data, &mut pos).ok_or(())?);
         }

@@ -773,18 +773,23 @@ fn cmd_bitfield(ctx: &mut Ctx, readonly: bool) -> Vec<u8> {
 // encoding: "u8", "i16", "u32", etc. — u = unsigned, i = signed
 
 /// `#N` means bit offset `N * encoding_bits` (Redis-compatible successive field layout).
+/// A bit offset, as SETBIT's: below 2^32, so that a string is never made
+/// bigger than 512 MB (Redis's `proto-max-bulk-len`).
 fn parse_bitfield_offset(arg: &[u8], encoding_bits: u8) -> Result<usize, ()> {
     let s = std::str::from_utf8(arg).map_err(|_| ())?;
-    if let Some(rest) = s.strip_prefix('#') {
+    let offset = if let Some(rest) = s.strip_prefix('#') {
         if rest.is_empty() {
             return Err(());
         }
         let idx: u64 = rest.parse().map_err(|_| ())?;
-        let prod = (idx as u128).checked_mul(encoding_bits as u128).ok_or(())?;
-        usize::try_from(prod).map_err(|_| ())
+        (idx as u128).checked_mul(encoding_bits as u128).ok_or(())?
     } else {
-        s.parse::<usize>().map_err(|_| ())
+        s.parse::<u64>().map_err(|_| ())? as u128
+    };
+    if offset >= 1 << 32 {
+        return Err(());
     }
+    usize::try_from(offset).map_err(|_| ())
 }
 
 fn parse_encoding(enc: &str) -> Option<(bool, u8)> {

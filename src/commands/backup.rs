@@ -438,13 +438,19 @@ fn abort(ctx: &Ctx) -> Vec<u8> {
     resp_simple("OK")
 }
 
-/// Delete the backup's files and return to idle.
+/// Delete the backup's files and return to idle. Only files a backup writes
+/// (BASE, INCR, the manifest, and their partial and temporary forms): anything
+/// else someone put in the directory since `BACKUP START` is left alone.
 fn remove_files(backup: &mut Backup) {
     if !backup.dir.as_os_str().is_empty()
         && let Ok(entries) = std::fs::read_dir(&backup.dir)
     {
         for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("appendonly.aof.") || name.starts_with(".appendonly.aof.") {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
     backup.files.clear();

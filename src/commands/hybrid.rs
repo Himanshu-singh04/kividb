@@ -428,7 +428,8 @@ fn parse(cmd: &[&[u8]]) -> Result<HybridQuery, String> {
                         .parse()
                         .map_err(|_| "ERR LOAD count must be * or integer".to_string())?;
                     i += 1;
-                    let mut fields = Vec::with_capacity(count);
+                    // `count` is the client's word: no more than there are arguments.
+                    let mut fields = Vec::with_capacity(count.min(cmd.len()));
                     for _ in 0..count {
                         if i >= cmd.len() {
                             return Err("ERR LOAD truncated".into());

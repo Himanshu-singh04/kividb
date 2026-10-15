@@ -217,6 +217,14 @@ pub async fn handle_replica_connection_uring(
                         parse_offset += consumed;
                     }
                     ack_parse_start = parse_offset;
+                    if ack_buf.len() - ack_parse_start
+                        > crate::replication::replica_client::ACK_PENDING_MAX
+                    {
+                        log_warn!(
+                            "Replication: replica {replica_id} sent what is not REPLCONF ACK; disconnecting it"
+                        );
+                        break;
+                    }
                     if ack_parse_start > 0 && ack_parse_start > ack_buf.len() / 2 {
                         ack_buf.drain(0..ack_parse_start);
                         ack_parse_start = 0;
@@ -530,6 +538,8 @@ pub async fn handle_client(
     // there is no buffer in between to copy it out of.
     let mut parse_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER);
     let mut parse_start = 0usize;
+    // How far the request still arriving has been read.
+    let mut progress = resp::parse::Progress::default();
     let mut out_buf: Vec<u8> = Vec::with_capacity(65536);
     let mut spare_buf: Vec<u8> = Vec::with_capacity(65536);
     // Push channel for out-of-band invalidation messages (CLIENT TRACKING).
@@ -727,7 +737,8 @@ pub async fn handle_client(
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
         while let Some((consumed, cmd)) =
-            match resp::parse::next_request(&mut parse_buf, parse_offset) {
+            match progress.next_request(&mut parse_buf, parse_offset, authenticated_user.is_some())
+            {
                 Ok(request) => request,
                 Err(e) => {
                     protocol_error = Some(e);

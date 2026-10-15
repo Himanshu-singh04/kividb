@@ -83,7 +83,7 @@ fn parse_values_vector(args: &[&[u8]], start: usize) -> Result<(Vec<f32>, usize)
         .parse()
         .map_err(|_| resp_error("ERR VALUES count must be an integer"))?;
 
-    if args.len() < start + 1 + count {
+    if count > args.len().saturating_sub(start + 1) {
         return Err(resp_error("ERR not enough values for VALUES vector"));
     }
 

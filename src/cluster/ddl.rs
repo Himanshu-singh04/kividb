@@ -166,14 +166,22 @@ fn read_reply(reader: &mut impl BufRead) -> Result<Result<(), String>, String> {
         "$" => {
             let len: i64 = rest.parse().map_err(|_| "bad reply")?;
             if len >= 0 {
-                let mut body = vec![0u8; len as usize + 2];
-                std::io::Read::read_exact(reader, &mut body).map_err(|e| e.to_string())?;
+                // Read and thrown away, a piece at a time.
+                let want = len as u64 + 2;
+                let got = std::io::copy(
+                    &mut std::io::Read::take(&mut *reader, want),
+                    &mut std::io::sink(),
+                )
+                .map_err(|e| e.to_string())?;
+                if got != want {
+                    return Err("connection closed".into());
+                }
             }
             Ok(Ok(()))
         }
         "*" | "%" | "~" => {
             let n: i64 = rest.parse().map_err(|_| "bad reply")?;
-            let n = if kind == "%" { n * 2 } else { n };
+            let n = if kind == "%" { n.saturating_mul(2) } else { n };
             for _ in 0..n.max(0) {
                 read_reply(reader)??;
             }

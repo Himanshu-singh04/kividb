@@ -98,8 +98,34 @@ fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    read_exactly(r, len)
+}
+
+/// How much room to make ahead for `count` things an image says follow.
+///
+/// An image is not always this server's own: `RESTORE` takes one from a
+/// client, and its checksum is no guard against one made up to lie. So a count
+/// is trusted only as far as this, and a container grows past it as what it
+/// holds is actually read: an image that claims four billion elements and
+/// stops runs out of input long before it runs out of memory.
+fn hint(count: usize) -> usize {
+    count.min(1 << 16)
+}
+
+/// `len` bytes. Room for the lot is made at once only for a length that is
+/// small; past that it grows with what is read (see [`hint`]).
+fn read_exactly(r: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
+    const AT_ONCE: usize = 1 << 20;
+    if len <= AT_ONCE {
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf)?;
+        return Ok(buf);
+    }
+    let mut buf = Vec::with_capacity(AT_ONCE);
+    Read::take(&mut *r, len as u64).read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(buf)
 }
 
@@ -235,7 +261,7 @@ fn read_stream_entries(r: &mut impl Read) -> io::Result<StreamInner> {
     for _ in 0..count {
         let id = read_stream_id(r)?;
         let fcount = read_u32_le(r)? as usize;
-        let mut fields = Vec::with_capacity(fcount);
+        let mut fields = Vec::with_capacity(hint(fcount));
         for _ in 0..fcount {
             let f = read_bytes(r)?;
             let v = read_bytes(r)?;
@@ -257,7 +283,7 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
         Some(max_entries)
     };
     let gcount = read_u32_le(r)? as usize;
-    stream.groups.reserve(gcount);
+    stream.groups.reserve(hint(gcount));
     for _ in 0..gcount {
         let name_bytes = read_bytes(r)?;
         let name = String::from_utf8(name_bytes)
@@ -284,7 +310,7 @@ fn read_stream_groups(r: &mut impl Read, stream: &mut StreamInner) -> io::Result
             );
         }
         let ccount = read_u32_le(r)? as usize;
-        let mut consumers = AHashMap::with_capacity(ccount);
+        let mut consumers = AHashMap::with_capacity(hint(ccount));
         for _ in 0..ccount {
             let cname_bytes = read_bytes(r)?;
             let cname = String::from_utf8(cname_bytes).map_err(|_| {
@@ -1101,7 +1127,10 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
     r.read_exact(&mut db_count_buf)?;
     let db_count = u32::from_le_bytes(db_count_buf) as usize;
 
-    let mut result = Vec::with_capacity(db_count);
+    let mut result = Vec::with_capacity(hint(db_count));
+    // The image stopped between two entries (see below): the databases it
+    // says are still to come are not there.
+    let mut ended = false;
 
     for _ in 0..db_count {
         let mut map: HashMap<String, KiviDBValue> = HashMap::new();
@@ -1112,7 +1141,10 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             match r.read_exact(&mut len_buf) {
                 // Verifying: an image that stops before a database's end
                 // marker is not a whole image.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && keep => break,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && keep => {
+                    ended = true;
+                    break;
+                }
                 Err(e) => return Err(e),
                 Ok(_) => {}
             }
@@ -1123,8 +1155,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                 break;
             }
 
-            let mut kbuf = vec![0u8; klen];
-            r.read_exact(&mut kbuf)?;
+            let kbuf = read_exactly(&mut r, klen)?;
             let key = String::from_utf8(kbuf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad key utf8"))?;
 
@@ -1141,7 +1172,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
-                    let mut deque = VecDeque::with_capacity(count);
+                    let mut deque = VecDeque::with_capacity(hint(count));
                     for _ in 0..count {
                         let item = read_bytes(&mut r)?;
                         deque.push_back(Arc::from(item.as_slice()));
@@ -1153,7 +1184,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
                     let mut hmap = crate::types::HashFields::with_capacity_and_hasher(
-                        count,
+                        hint(count),
                         Default::default(),
                     );
                     for _ in 0..count {
@@ -1170,7 +1201,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                     let mut count_buf = [0u8; 4];
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
-                    let mut hset = crate::member_set::MemberSet::with_capacity(count);
+                    let mut hset = crate::member_set::MemberSet::with_capacity(hint(count));
                     for _ in 0..count {
                         let member = read_bytes(&mut r)?;
                         hset.insert(Arc::from(member.as_slice()));
@@ -1292,7 +1323,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         let mut vlen_buf = [0u8; 4];
                         r.read_exact(&mut vlen_buf)?;
                         let vec_len = u32::from_le_bytes(vlen_buf) as usize;
-                        let mut vector = Vec::with_capacity(vec_len);
+                        let mut vector = Vec::with_capacity(hint(vec_len));
                         for _ in 0..vec_len {
                             let mut f_buf = [0u8; 4];
                             r.read_exact(&mut f_buf)?;
@@ -1319,7 +1350,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                     r.read_exact(&mut count_buf)?;
                     let count = u32::from_le_bytes(count_buf) as usize;
                     let mut hmap = crate::types::HashFields::with_capacity_and_hasher(
-                        count,
+                        hint(count),
                         Default::default(),
                     );
                     for _ in 0..count {
@@ -1337,7 +1368,7 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                     let mut exp_count_buf = [0u8; 4];
                     r.read_exact(&mut exp_count_buf)?;
                     let exp_count = u32::from_le_bytes(exp_count_buf) as usize;
-                    let mut exps = AHashMap::with_capacity(exp_count);
+                    let mut exps = AHashMap::with_capacity(hint(exp_count));
                     let now_sys = std::time::SystemTime::now();
                     let now_mono = std::time::Instant::now();
                     let unix_now_ms = now_sys
@@ -1401,6 +1432,9 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
         }
 
         result.push(map);
+        if ended {
+            break;
+        }
     }
 
     // ── Optional trailing sections ────────────────────────────────────────────
@@ -1546,7 +1580,7 @@ fn read_index_schemas(r: &mut impl Read) -> io::Result<Vec<IndexSchema>> {
     r.read_exact(&mut count_buf)?;
     let count = u32::from_le_bytes(count_buf) as usize;
 
-    let mut schemas = Vec::with_capacity(count);
+    let mut schemas = Vec::with_capacity(hint(count));
     for _ in 0..count {
         schemas.push(read_one_index_schema(r)?);
     }
@@ -1572,7 +1606,7 @@ fn read_one_index_schema(r: &mut impl Read) -> io::Result<IndexSchema> {
     let mut pcount_buf = [0u8; 4];
     r.read_exact(&mut pcount_buf)?;
     let pcount = u32::from_le_bytes(pcount_buf) as usize;
-    let mut prefixes = Vec::with_capacity(pcount);
+    let mut prefixes = Vec::with_capacity(hint(pcount));
     for _ in 0..pcount {
         let pb = read_bytes(r)?;
         prefixes.push(
@@ -1584,7 +1618,7 @@ fn read_one_index_schema(r: &mut impl Read) -> io::Result<IndexSchema> {
     let mut fcount_buf = [0u8; 4];
     r.read_exact(&mut fcount_buf)?;
     let fcount = u32::from_le_bytes(fcount_buf) as usize;
-    let mut fields = Vec::with_capacity(fcount);
+    let mut fields = Vec::with_capacity(hint(fcount));
     for _ in 0..fcount {
         let fname_bytes = read_bytes(r)?;
         let fname = String::from_utf8(fname_bytes)
@@ -1768,9 +1802,9 @@ fn read_hnsw_graphs(
         r.read_exact(&mut ncount_buf)?;
         let node_count = u32::from_le_bytes(ncount_buf) as usize;
 
-        let mut nodes: Vec<crate::vector::HnswNode> = Vec::with_capacity(node_count);
+        let mut nodes: Vec<crate::vector::HnswNode> = Vec::with_capacity(hint(node_count));
         let mut key_to_id: ahash::AHashMap<String, usize> =
-            ahash::AHashMap::with_capacity(node_count);
+            ahash::AHashMap::with_capacity(hint(node_count));
         let mut live_count: usize = 0;
         let mut tombstone_count: usize = 0;
 
@@ -1794,7 +1828,7 @@ fn read_hnsw_graphs(
                 let mut vlen_buf = [0u8; 4];
                 r.read_exact(&mut vlen_buf)?;
                 let vlen = u32::from_le_bytes(vlen_buf) as usize;
-                let mut vector = Vec::with_capacity(vlen);
+                let mut vector = Vec::with_capacity(hint(vlen));
                 for _ in 0..vlen {
                     let mut fbuf = [0u8; 4];
                     r.read_exact(&mut fbuf)?;
@@ -1804,12 +1838,12 @@ fn read_hnsw_graphs(
                 let mut lcount_buf = [0u8; 4];
                 r.read_exact(&mut lcount_buf)?;
                 let layer_count = u32::from_le_bytes(lcount_buf) as usize;
-                let mut neighbors: Vec<Vec<usize>> = Vec::with_capacity(layer_count);
+                let mut neighbors: Vec<Vec<usize>> = Vec::with_capacity(hint(layer_count));
                 for _ in 0..layer_count {
                     let mut nbcount_buf = [0u8; 4];
                     r.read_exact(&mut nbcount_buf)?;
                     let nb_count = u32::from_le_bytes(nbcount_buf) as usize;
-                    let mut nb_list = Vec::with_capacity(nb_count);
+                    let mut nb_list = Vec::with_capacity(hint(nb_count));
                     for _ in 0..nb_count {
                         let mut id_buf = [0u8; 4];
                         r.read_exact(&mut id_buf)?;

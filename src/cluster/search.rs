@@ -57,6 +57,18 @@ impl Reply {
 
 /// Read one reply. RESP2, as a coordinator's connections speak it.
 pub fn read_reply(reader: &mut impl BufRead) -> Result<Reply, String> {
+    read_reply_within(reader, 0)
+}
+
+/// The deepest a reply from another node may nest, and the longest string
+/// in it: what a search or an index's definition can come to, with room.
+const REPLY_DEPTH_MAX: u32 = 32;
+const REPLY_BULK_MAX: i64 = 512 * 1024 * 1024;
+
+fn read_reply_within(reader: &mut impl BufRead, depth: u32) -> Result<Reply, String> {
+    if depth > REPLY_DEPTH_MAX {
+        return Err("a reply nested too deep".into());
+    }
     let mut line = String::new();
     if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
         return Err("connection closed".into());
@@ -76,6 +88,9 @@ pub fn read_reply(reader: &mut impl BufRead) -> Result<Reply, String> {
             if len < 0 {
                 return Ok(Reply::Bulk(None));
             }
+            if len > REPLY_BULK_MAX {
+                return Err(format!("bad reply: {line}"));
+            }
             let mut body = vec![0u8; len as usize + 2];
             reader.read_exact(&mut body).map_err(|e| e.to_string())?;
             body.truncate(len as usize);
@@ -86,9 +101,10 @@ pub fn read_reply(reader: &mut impl BufRead) -> Result<Reply, String> {
             if n < 0 {
                 return Ok(Reply::Bulk(None));
             }
-            let mut items = Vec::with_capacity(n as usize);
+            // As many as the other node says, but room made only for some.
+            let mut items = Vec::with_capacity((n as usize).min(1024));
             for _ in 0..n {
-                items.push(read_reply(reader)?);
+                items.push(read_reply_within(reader, depth + 1)?);
             }
             Ok(Reply::Array(items))
         }

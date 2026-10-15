@@ -197,7 +197,18 @@ pub(crate) fn execute_command_from_script(
     // it returns, on every path.
     let refs_erased: Vec<&'static [u8]> = unsafe { std::mem::transmute(parts) };
     let saved_cmd = std::mem::replace(&mut ctx.cmd, refs_erased);
+    let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_from_script(ctx, read_only_script)
+    }));
+    // Restored on every path, a panic's too: what `ctx.cmd` points at now is
+    // gone once this returns, and a panic in a command a script calls is
+    // caught (`lua::bridge`) and the script goes on.
+    ctx.cmd = saved_cmd;
+    reply.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
 
+/// The rest of [`execute_command_from_script`], with the command in `ctx.cmd`.
+fn run_from_script(ctx: &mut Ctx, read_only_script: bool) -> Vec<u8> {
     // Re-derive cmd0/name from ctx.cmd in case parts were modified (XREAD BLOCK stripping).
     let cmd0 = ctx.cmd[0];
     let mut upper_buf = [0u8; 32];
@@ -236,13 +247,11 @@ pub(crate) fn execute_command_from_script(
                 })
         };
         if let Some(outside) = outside {
-            ctx.cmd = saved_cmd;
             return resp_error(&outside);
         }
     }
 
     if read_only_script && replication::inner_command_blocked_in_readonly_script(name2, &ctx.cmd) {
-        ctx.cmd = saved_cmd;
         return resp_error("ERR Write commands are not allowed from read-only scripts.");
     }
 
@@ -250,7 +259,6 @@ pub(crate) fn execute_command_from_script(
 
     if repl_is_slave && !ctx.apply_replication {
         if replication::is_denied_on_readonly_replica(name2, &ctx.cmd) {
-            ctx.cmd = saved_cmd;
             return resp_error("READONLY You can't write against a read only replica.");
         }
         if ctx
@@ -259,7 +267,6 @@ pub(crate) fn execute_command_from_script(
             .load(Ordering::Relaxed)
             && !replication::slave_command_allowed_during_loading(name2)
         {
-            ctx.cmd = saved_cmd;
             return resp_error("LOADING KiviDB is loading the dataset into memory");
         }
     }
@@ -275,7 +282,6 @@ pub(crate) fn execute_command_from_script(
         && !crate::eviction::allowed_when_out_of_memory(name2)
         && !skip_mem
     {
-        ctx.cmd = saved_cmd;
         log_throttled!(
             60,
             crate::loglevel::WARN,
@@ -290,7 +296,6 @@ pub(crate) fn execute_command_from_script(
 
     #[cfg(feature = "lua")]
     if !repl_is_slave && let Some(rep) = crate::commands::lua::script_min_replicas_gate(ctx, cmd0) {
-        ctx.cmd = saved_cmd;
         return rep;
     }
 
@@ -315,7 +320,6 @@ pub(crate) fn execute_command_from_script(
                 ctx.peer_addr,
             );
             let reply = resp_error(&denied.message(ctx.authenticated_user));
-            ctx.cmd = saved_cmd;
             return reply;
         }
     }
@@ -374,7 +378,6 @@ pub(crate) fn execute_command_from_script(
         notify_watchers(ctx, name2);
     }
 
-    ctx.cmd = saved_cmd;
     rewrite_wrong_arity_error_for_script(result)
 }
 

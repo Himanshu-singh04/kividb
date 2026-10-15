@@ -395,6 +395,8 @@ where
     let mut buffer = Vec::with_capacity(4096);
     let mut temp = [0u8; 4096];
     let mut read_start = 0usize;
+    // How far the request still arriving has been read.
+    let mut progress = resp::parse::Progress::default();
     let mut selected_db: usize = 0;
     // This connection's subscriptions, while it has any. `None` otherwise, so
     // that a connection that never uses pub/sub allocates nothing for it.
@@ -489,14 +491,15 @@ where
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
-        while let Some((consumed, cmd)) = match resp::parse::next_request(&mut buffer, parse_offset)
-        {
-            Ok(request) => request,
-            Err(e) => {
-                protocol_error = Some(e);
-                None
+        while let Some((consumed, cmd)) =
+            match progress.next_request(&mut buffer, parse_offset, authenticated_user.is_some()) {
+                Ok(request) => request,
+                Err(e) => {
+                    protocol_error = Some(e);
+                    None
+                }
             }
-        } {
+        {
             if cmd.is_empty() {
                 parse_offset += consumed;
                 continue;

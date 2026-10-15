@@ -39,6 +39,32 @@ people upgrading, are in
   the network with a passwordless `default` needs a password, a `bind`
   address, or `protected-mode no`. Replicas and cluster nodes connect as
   clients too.
+- **What a client sends cannot crash or stall the server.** Found by
+  reading the code and by a test that sends each of these (`tests/hostile_input.rs`):
+  - Counts that do not fit (`HSETEX … FIELDS`, `XACKDEL … IDS`, `MSETEX`,
+    `TS.NRANGE`, `FT.SEARCH … PARAMS`, `FCALL` keys, `VADD … VALUES`) were
+    added up past the largest number and then used: a crash, or in
+    `FT.AGGREGATE`'s `LOAD`/`SORTBY` a loop without end.
+  - `RESTORE` and `FUNCTION RESTORE` made room for as many elements as the
+    payload said, and its checksum is no guard against a payload made to lie:
+    one could make the server ask for terabytes and stop, or loop four
+    thousand million times.
+  - `BITFIELD` took any bit offset (SETBIT stops at 2^32), and grew the string
+    to it. `DEBUG SLEEP` with a negative or infinite time crashed.
+  - Without a limit on nesting, `cmsgpack.unpack`, an `FT.SEARCH` query, an
+    `APPLY` expression or a JSONPath filter could run the thread out of stack,
+    which takes the server down. Each now has one.
+  - A client that has not authenticated is held to Redis's limits (a request
+    of 10 arguments, each of 16 KB), and a request may come to 1 GB
+    (`client-query-buffer-limit`). A request arriving in many reads was
+    read again from its beginning after each one.
+  - A replica's acknowledgements, and another cluster node's replies, are
+    read with limits.
+  - A panic in a command a script calls left the connection with a command
+    pointing at freed memory; and a panic in a search coordinated across the
+    cluster left the thread answering every later search as a shard.
+- `BACKUP CLEANUP` removes only the backup's own files from `backupdirname`,
+  not everything in it.
 
 ### Added
 

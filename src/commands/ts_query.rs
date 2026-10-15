@@ -936,7 +936,7 @@ pub(super) fn ts_nrange(ctx: &mut Ctx, reverse: bool) -> Option<Vec<u8>> {
         _ => return Some(resp_error("TSDB: numkeys must be a positive integer")),
     };
     // numkeys keys, then from and to.
-    if cmd.len() < 2 + numkeys + 2 {
+    if numkeys > cmd.len() - 4 {
         return Some(resp_error(
             "TSDB: numkeys does not match the number of keys given",
         ));

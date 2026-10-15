@@ -2196,7 +2196,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
         }
     };
     idx += 1;
-    if cmd.len() - idx != numfields * 2 {
+    if numfields.checked_mul(2) != Some(cmd.len() - idx) {
         return Some(resp_error(
             "ERR wrong number of arguments for 'hsetex' command",
         ));

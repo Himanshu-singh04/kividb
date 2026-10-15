@@ -910,7 +910,7 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 if n % 2 != 0 {
                     return Err("Parameters must be specified in PARAM VALUE pairs".into());
                 }
-                if i + 2 + n > cmd.len() {
+                if n > cmd.len().saturating_sub(i + 2) {
                     return Err("Bad arguments for PARAMS: not enough values".into());
                 }
                 for pair in cmd[i + 2..i + 2 + n].chunks(2) {
@@ -946,7 +946,7 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
             }
             "RETURN" => {
                 let n = number(i + 1, "RETURN")?;
-                if i + 2 + n > cmd.len() {
+                if n > cmd.len().saturating_sub(i + 2) {
                     return Err("Bad arguments for RETURN: not enough fields".into());
                 }
                 let words = &cmd[i + 2..i + 2 + n];
@@ -980,7 +980,7 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
             }
             "INKEYS" => {
                 let n = number(i + 1, "INKEYS")?;
-                if i + 2 + n > cmd.len() {
+                if n > cmd.len().saturating_sub(i + 2) {
                     return Err("Bad arguments for INKEYS: not enough keys".into());
                 }
                 args.inkeys = Some(
@@ -998,7 +998,7 @@ fn parse_search_args(cmd: &[&[u8]], start: usize) -> Result<SearchArgs, String> 
                 loop {
                     if cmd.get(i).is_some_and(|a| is(a, "FIELDS")) {
                         let n = number(i + 1, "HIGHLIGHT FIELDS")?;
-                        if i + 2 + n > cmd.len() {
+                        if n > cmd.len().saturating_sub(i + 2) {
                             return Err("Bad arguments for HIGHLIGHT: not enough fields".into());
                         }
                         fields = cmd[i + 2..i + 2 + n]
@@ -1558,9 +1558,18 @@ fn coordinate(
         let parts: Vec<&'static [u8]> = unsafe { std::mem::transmute(parts) };
         let saved_cmd = std::mem::replace(&mut ctx.cmd, parts);
         let saved_resp = std::mem::replace(&mut ctx.resp, 2);
+        /// Clears `SHARD` however the search ends: left set by a panic, it
+        /// would make every later search on this thread answer as a shard.
+        struct NotAShard;
+        impl Drop for NotAShard {
+            fn drop(&mut self) {
+                SHARD.with(|s| s.set(false));
+            }
+        }
         SHARD.with(|s| s.set(true));
+        let not_a_shard = NotAShard;
         let reply = search(ctx);
-        SHARD.with(|s| s.set(false));
+        drop(not_a_shard);
         ctx.resp = saved_resp;
         ctx.cmd = saved_cmd;
         crate::cluster::search::parse_reply(&reply?)?

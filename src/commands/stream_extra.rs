@@ -326,7 +326,7 @@ pub(super) fn parse_policy_and_ids(
                 .and_then(|n| n.parse().ok())
                 .filter(|n| *n > 0)
                 .ok_or_else(|| resp_error("ERR Number of IDs must be a positive integer"))?;
-            let Some(raw) = args.get(i + 2..i + 2 + numids) else {
+            let Some(raw) = args.get(i + 2..(i + 2).saturating_add(numids)) else {
                 return Err(resp_error(
                     "ERR The `numids` parameter must match the number of arguments",
                 ));

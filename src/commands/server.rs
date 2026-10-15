@@ -2399,7 +2399,7 @@ pub(crate) fn extract_keys(args: &[&[u8]], with_flags: bool) -> Result<Vec<Vec<u
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            if args.len() < 3 + n {
+            if n > args.len() - 3 {
                 return Err("ERR Invalid arguments specified".into());
             }
             args[3..3 + n]
@@ -2416,7 +2416,7 @@ pub(crate) fn extract_keys(args: &[&[u8]], with_flags: bool) -> Result<Vec<Vec<u
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            if args.len() < 3 + n {
+            if n > args.len() - 3 {
                 return Err("ERR Invalid arguments specified".into());
             }
             args[3..3 + n]

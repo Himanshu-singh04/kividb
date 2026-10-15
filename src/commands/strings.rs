@@ -1816,7 +1816,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 _ => return Some(resp_error("ERR numkeys must be a positive integer")),
             };
             // pairs occupy cmd[2..2+numkeys*2]
-            let pairs_end = 2 + numkeys * 2;
+            let pairs_end = numkeys.saturating_mul(2).saturating_add(2);
             if cmd.len() < pairs_end {
                 return Some(resp_error("ERR not enough key-value pairs"));
             }

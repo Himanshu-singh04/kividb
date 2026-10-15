@@ -230,7 +230,18 @@ enum Expr {
 struct Parser {
     chars: Vec<char>,
     pos: usize,
+    /// How deep in parentheses, operators and literals the parse is.
+    depth: u32,
+    /// How many terms have been read.
+    terms: usize,
 }
+
+/// The deepest a path's expressions may nest, and the most terms they may
+/// have. Parsed and evaluated by calls that go as deep as the tree, which for
+/// `a && b && c` is as deep as it is long: without a limit, a path from a
+/// client would run the thread out of stack, which takes the server down.
+const DEPTH_MAX: u32 = 64;
+const TERMS_MAX: usize = 1024;
 
 type Parsed<T> = Result<T, String>;
 
@@ -271,7 +282,21 @@ impl Parser {
         Parser {
             chars: text.chars().collect(),
             pos: 0,
+            depth: 0,
+            terms: 0,
         }
+    }
+
+    /// `parse`, one level deeper, as one more term.
+    fn nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> Parsed<T>) -> Parsed<T> {
+        self.terms += 1;
+        if self.depth >= DEPTH_MAX || self.terms > TERMS_MAX {
+            return self.fail("an expression too long or nested too deep");
+        }
+        self.depth += 1;
+        let parsed = parse(self);
+        self.depth -= 1;
+        parsed
     }
 
     fn peek(&self) -> Option<char> {
@@ -363,7 +388,7 @@ impl Parser {
         self.skip_ws();
         if self.peek() == Some('!') && self.peek_at(1) != Some('=') {
             self.pos += 1;
-            return Ok(Expr::Not(Box::new(self.negation()?)));
+            return Ok(Expr::Not(Box::new(self.nested(Self::negation)?)));
         }
         self.comparison()
     }
@@ -443,15 +468,19 @@ impl Parser {
     fn unary(&mut self) -> Parsed<Expr> {
         self.skip_ws();
         if self.eat('-') {
-            return Ok(Expr::Negate(Box::new(self.unary()?)));
+            return Ok(Expr::Negate(Box::new(self.nested(Self::unary)?)));
         }
         if self.eat('+') {
-            return Ok(Expr::Plus(Box::new(self.unary()?)));
+            return Ok(Expr::Plus(Box::new(self.nested(Self::unary)?)));
         }
         self.primary()
     }
 
     fn primary(&mut self) -> Parsed<Expr> {
+        self.nested(Self::primary_term)
+    }
+
+    fn primary_term(&mut self) -> Parsed<Expr> {
         self.skip_ws();
         match self.peek() {
             Some('(') => {
@@ -737,6 +766,10 @@ impl Parser {
     /// A JSON value written in the path: a number, a string in either kind of
     /// quote, `true`, `false`, `null`, an array or an object.
     fn literal(&mut self) -> Parsed<Value> {
+        self.nested(Self::literal_value)
+    }
+
+    fn literal_value(&mut self) -> Parsed<Value> {
         self.skip_ws();
         match self.peek() {
             Some('"') | Some('\'') => Ok(Value::String(self.string()?)),
@@ -1610,6 +1643,23 @@ mod tests {
                  "specs": {"material": "alloy", "weight": 11.6}}
             ]
         }})
+    }
+
+    #[test]
+    fn a_filter_too_long_or_too_deep_is_an_error() {
+        assert!(Query::parse("$[?(@.a && (@.b || !@.c))]").is_ok());
+        for path in [
+            format!("$[?{}@.a{}]", "(".repeat(100_000), ")".repeat(100_000)),
+            format!("$[?{}@.a]", "!".repeat(100_000)),
+            format!("$[?@.a == {}1]", "-".repeat(100_000)),
+            format!("$[?@.a == {}]", "[".repeat(100_000)),
+            format!("$[?{}]", vec!["@.a"; 100_000].join(" && ")),
+        ] {
+            let Err(err) = Query::parse(&path) else {
+                panic!("accepted")
+            };
+            assert!(err.contains("too long or nested too deep"), "{err}");
+        }
     }
 
     #[test]

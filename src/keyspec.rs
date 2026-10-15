@@ -205,7 +205,7 @@ fn parse_usize(arg: &[u8]) -> Option<usize> {
 /// of the command — the handler will reject the command itself.
 fn numkeys(cmd: &[&[u8]], numkeys_at: usize, first: usize) -> Keys {
     match cmd.get(numkeys_at).and_then(|a| parse_usize(a)) {
-        Some(n) if n > 0 && first + n <= cmd.len() => Keys::Range {
+        Some(n) if n > 0 && n <= cmd.len().saturating_sub(first) => Keys::Range {
             first,
             last: first + n - 1,
             step: 1,
@@ -325,8 +325,8 @@ pub fn key_positions(name: &str, cmd: &[&[u8]]) -> Keys {
             step: 2,
         },
         // MSETEX numkeys key value [key value ...] [options]
-        "MSETEX" => match parse_usize(cmd[1]) {
-            Some(n) if n > 0 && 2 + 2 * n <= cmd.len() + 1 => Range {
+        "MSETEX" => match cmd.get(1).and_then(|n| parse_usize(n)) {
+            Some(n) if n > 0 && n <= cmd.len().saturating_sub(1) / 2 => Range {
                 first: 2,
                 last: 2 + 2 * (n - 1),
                 step: 2,
