@@ -250,8 +250,11 @@ impl Node {
             .spawn()
             .expect("could not start kividb");
         self.child = Some(child);
-        // Wait for both the client port and the bus.
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // Wait for both the client port and the bus. A new node writes its
+        // nodes.conf durably before it listens, and on a disk every other
+        // test is also syncing to (a container's overlay filesystem, the
+        // whole suite at once) that has been seen to take 9 s.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let up = TcpStream::connect(("127.0.0.1", self.port)).is_ok()
                 && TcpStream::connect(("127.0.0.1", self.port + 10_000)).is_ok();

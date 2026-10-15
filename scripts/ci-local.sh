@@ -63,6 +63,7 @@ lto=off
 
 MSYS_NO_PATHCONV=1 exec docker run --rm \
   --security-opt seccomp=unconfined \
+  --ulimit nofile=65535:65535 \
   -v "$host_root:/src:ro" \
   -v kividb-cargo-registry:/usr/local/cargo/registry \
   -v kividb-ci-target:/target \
