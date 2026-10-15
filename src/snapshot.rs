@@ -1721,8 +1721,13 @@ fn write_hnsw_graph(
     write_bytes(w, index_name.as_bytes())?;
     write_bytes(w, field_name.as_bytes())?;
 
+    // Inserts go on while the graph is written: they hold it for reading
+    // too. The nodes written are those up to the count taken after the entry
+    // point (so it is among them); a slot still being filled is written as a
+    // tombstone, and links to nodes past the count are left out.
     let nodes = hnsw.nodes.read();
     let entry_point = *hnsw.entry_point.read();
+    let count = nodes.count();
 
     match entry_point {
         None => w.write_all(&[0u8])?,
@@ -1732,24 +1737,33 @@ fn write_hnsw_graph(
         }
     }
 
-    w.write_all(&(nodes.len() as u32).to_le_bytes())?;
+    w.write_all(&(count as u32).to_le_bytes())?;
 
-    for node in nodes.iter() {
-        if node.vector.is_empty() {
-            w.write_all(&[0u8])?; // tombstone slot
-        } else {
-            w.write_all(&[1u8])?; // live node
-            write_bytes(w, node.key.as_bytes())?;
-            w.write_all(&(node.vector.len() as u32).to_le_bytes())?;
-            for f in &node.vector {
-                w.write_all(&f.to_le_bytes())?;
+    for id in 0..count {
+        let node = match nodes.get(id) {
+            Some(node) if !node.vector.is_empty() => node,
+            _ => {
+                w.write_all(&[0u8])?; // tombstone slot
+                continue;
             }
-            w.write_all(&(node.neighbors.len() as u32).to_le_bytes())?;
-            for layer_neighbors in &node.neighbors {
-                w.write_all(&(layer_neighbors.len() as u32).to_le_bytes())?;
-                for &nb_id in layer_neighbors {
-                    w.write_all(&(nb_id as u32).to_le_bytes())?;
-                }
+        };
+        w.write_all(&[1u8])?; // live node
+        write_bytes(w, node.key.as_bytes())?;
+        w.write_all(&(node.vector.len() as u32).to_le_bytes())?;
+        for f in &node.vector {
+            w.write_all(&f.to_le_bytes())?;
+        }
+        let neighbors = node.neighbors.lock().clone();
+        w.write_all(&(neighbors.len() as u32).to_le_bytes())?;
+        for layer_neighbors in &neighbors {
+            let kept: Vec<usize> = layer_neighbors
+                .iter()
+                .copied()
+                .filter(|&nb| nb < count)
+                .collect();
+            w.write_all(&(kept.len() as u32).to_le_bytes())?;
+            for nb_id in kept {
+                w.write_all(&(nb_id as u32).to_le_bytes())?;
             }
         }
     }
@@ -1814,11 +1828,7 @@ fn read_hnsw_graphs(
 
             if live_flag[0] == 0 {
                 tombstone_count += 1;
-                nodes.push(crate::vector::HnswNode {
-                    key: String::new(),
-                    vector: Vec::new(),
-                    neighbors: Vec::new(),
-                });
+                nodes.push(crate::vector::HnswNode::tombstone());
             } else {
                 live_count += 1;
                 let key_bytes = read_bytes(r)?;
@@ -1847,17 +1857,18 @@ fn read_hnsw_graphs(
                     for _ in 0..nb_count {
                         let mut id_buf = [0u8; 4];
                         r.read_exact(&mut id_buf)?;
-                        nb_list.push(u32::from_le_bytes(id_buf) as usize);
+                        let nb = u32::from_le_bytes(id_buf) as usize;
+                        // A neighbour outside the graph would be read out
+                        // of bounds by the first search: drop it.
+                        if nb < node_count {
+                            nb_list.push(nb);
+                        }
                     }
                     neighbors.push(nb_list);
                 }
 
                 key_to_id.insert(key.clone(), node_id);
-                nodes.push(crate::vector::HnswNode {
-                    key,
-                    vector,
-                    neighbors,
-                });
+                nodes.push(crate::vector::HnswNode::new(key, vector, neighbors));
             }
         }
 
@@ -1874,6 +1885,12 @@ fn read_hnsw_graphs(
         r.read_exact(&mut efc_buf)?;
         let ef_construction = u32::from_le_bytes(efc_buf) as usize;
 
+        // An entry point outside the graph would be read out of bounds by
+        // the first search: start from any live node instead.
+        let entry_point = match entry_point {
+            Some(id) if id < node_count => Some(id),
+            _ => key_to_id.values().next().copied(),
+        };
         let hnsw = crate::vector::HnswIndex::restore(
             m,
             ef_construction,

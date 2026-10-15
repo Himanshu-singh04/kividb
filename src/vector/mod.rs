@@ -1022,17 +1022,58 @@ impl VectorIndex {
 /// One node in the HNSW graph.
 /// Each node lives in layers 0..=top_layer.
 /// `neighbors[layer]` is the list of neighbour node ids at that layer.
-#[derive(Debug, Clone)]
+///
+/// A node's key and vector do not change while it is in the graph (deleting
+/// it empties both, under the graph's write lock). Its neighbour lists have a
+/// lock of their own, so that inserts link themselves into different parts of
+/// the graph at the same time, as hnswlib's do.
+#[derive(Debug)]
 pub struct HnswNode {
     pub key: String,
     pub vector: Vec<f32>,
-    pub neighbors: Vec<Vec<usize>>, // neighbors[layer] = [node_id, ...]
+    pub neighbors: parking_lot::Mutex<Vec<Vec<usize>>>, // neighbors[layer] = [node_id, ...]
 }
+
+impl HnswNode {
+    pub fn new(key: String, vector: Vec<f32>, neighbors: Vec<Vec<usize>>) -> Self {
+        Self {
+            key,
+            vector,
+            neighbors: parking_lot::Mutex::new(neighbors),
+        }
+    }
+
+    /// The slot a deleted node leaves.
+    pub fn tombstone() -> Self {
+        Self::new(String::new(), Vec::new(), Vec::new())
+    }
+
+    /// Empty the slot: the node is deleted.
+    fn clear(&mut self) {
+        self.vector = Vec::new();
+        self.key = String::new();
+        *self.neighbors.get_mut() = Vec::new();
+    }
+
+    /// How many layers the node is in (none once deleted).
+    fn layer_count(&self) -> usize {
+        self.neighbors.lock().len()
+    }
+}
+
+/// The nodes of a graph, by id. Appending takes only a shared reference, and
+/// ids never move, so an insert adds its node under the graph's read lock.
+pub type HnswNodes = boxcar::Vec<HnswNode>;
+
+/// The graph held for reading.
+type NodesGuard<'a> = parking_lot::RwLockReadGuard<'a, HnswNodes>;
 
 /// The HNSW graph index.
 #[derive(Debug, Default)]
 pub struct HnswIndex {
-    pub nodes: RwLock<Vec<HnswNode>>,
+    /// Searches and inserts hold this for reading; only deleting a node, which
+    /// empties its slot, takes it for writing.
+    pub nodes: RwLock<HnswNodes>,
     pub key_to_id: RwLock<AHashMap<String, usize>>,
     pub entry_point: RwLock<Option<usize>>, // node id of current entry point
     pub m: usize,                           // max neighbours per layer (except L0)
@@ -1058,7 +1099,7 @@ pub struct HnswIndex {
 impl HnswIndex {
     pub fn new(m: usize, ef_construction: usize) -> Self {
         Self {
-            nodes: RwLock::new(Vec::new()),
+            nodes: RwLock::new(HnswNodes::new()),
             key_to_id: RwLock::new(AHashMap::new()),
             entry_point: RwLock::new(None),
             m,
@@ -1084,7 +1125,7 @@ impl HnswIndex {
         tombstone_count: usize,
     ) -> Self {
         Self {
-            nodes: RwLock::new(nodes),
+            nodes: RwLock::new(nodes.into_iter().collect()),
             key_to_id: RwLock::new(key_to_id),
             entry_point: RwLock::new(entry_point),
             m,
@@ -1690,7 +1731,7 @@ pub fn knn_flat(
 /// Choose up to `m_max` of `candidates` as a node's neighbours. Like the
 /// search, it offers its read lock to a waiting insert every few candidates.
 fn select_neighbors_heuristic(
-    nodes: &mut parking_lot::RwLockReadGuard<'_, Vec<HnswNode>>,
+    nodes: &mut NodesGuard<'_>,
     candidates: &[(f32, usize)],
     m_max: usize,
     metric: &DistanceMetric,
@@ -1751,9 +1792,7 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
             if let Some(node) = nodes.get_mut(old_id)
                 && !node.vector.is_empty()
             {
-                node.vector = Vec::new();
-                node.key = String::new();
-                node.neighbors = Vec::new();
+                node.clear();
                 index.tombstone_count.fetch_add(1, Relaxed);
                 index.live_count.fetch_sub(1, Relaxed);
             }
@@ -1795,30 +1834,24 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
     const NEW_NODE: usize = usize::MAX;
     let mut precomputed_backlinks: Vec<PrecomputedBacklink> = Vec::new();
 
-    let (neighbors_per_layer, _curr_ep_final) = if let Some(mut ep) = ep_snapshot {
+    // The whole insert holds the graph for reading: it appends its node and
+    // links it in under the neighbours' own locks, so inserts do not wait for
+    // one another, nor searches for them. Before, each insert took the write
+    // lock to link itself in, and a writer that waits holds back every reader
+    // that comes after it: 6,000 inserts a second on 64 cores, 51 of 62
+    // workers waiting.
+    let mut nodes = index.nodes.read();
+    let neighbors_per_layer: Vec<Vec<usize>> = if let Some(mut ep) = ep_snapshot {
         // Check if entry point is tombstoned — find a live replacement
-        let ep_tombstoned = {
-            let nodes = index.nodes.read();
-            nodes.get(ep).map(|n| n.vector.is_empty()).unwrap_or(true)
-        };
-        if ep_tombstoned {
+        if nodes.get(ep).map(|n| n.vector.is_empty()).unwrap_or(true) {
             let k2id = index.key_to_id.read();
             match k2id.values().next().copied() {
                 Some(id) => ep = id,
                 None => {
-                    // No live nodes at all — we become entry point below
+                    // No live nodes at all — we become the entry point
                     drop(k2id);
-                    let node = HnswNode {
-                        key: key.clone(),
-                        vector: vector.clone(),
-                        neighbors: (0..=level).map(|_| Vec::new()).collect(),
-                    };
-                    let new_id = {
-                        let mut nodes = index.nodes.write();
-                        let id = nodes.len();
-                        nodes.push(node);
-                        id
-                    };
+                    let neighbors = (0..=level).map(|_| Vec::new()).collect();
+                    let new_id = nodes.push(HnswNode::new(key.clone(), vector, neighbors));
                     index.key_to_id.write().insert(key, new_id);
                     index.live_count.fetch_add(1, Relaxed);
                     *index.entry_point.write() = Some(new_id);
@@ -1827,227 +1860,190 @@ pub fn hnsw_insert(index: &Arc<HnswIndex>, key: String, vector: Vec<f32>, metric
             }
         }
 
-        let ep_level = {
-            let nodes = index.nodes.read();
-            nodes[ep].neighbors.len().saturating_sub(1)
-        };
+        let ep_level = nodes[ep].layer_count().saturating_sub(1);
 
         // Greedy descent from top layer to level+1 (just finding better ep)
-        // Hold ONE read lock for the entire search phase — no per-node lock overhead.
         let mut curr_ep = ep;
         let mut per_layer: Vec<Vec<usize>> = Vec::with_capacity(level + 1);
-        {
-            let mut nodes = index.nodes.read();
-            for lc in (level + 1..=ep_level).rev() {
-                let results =
-                    hnsw_search_layer_concurrent(&mut nodes, &vector, curr_ep, 1, lc, metric);
-                if let Some(&(_, best)) = results.first() {
-                    curr_ep = best;
-                }
-            }
-
-            // Search and collect neighbors for layers 0..=min(level, ep_level)
-            for lc in (0..=level.min(ep_level)).rev() {
-                let m_max = if lc == 0 { index.m0 } else { index.m };
-                let candidates = hnsw_search_layer_concurrent(
-                    &mut nodes,
-                    &vector,
-                    curr_ep,
-                    index.ef_construction,
-                    lc,
-                    metric,
-                );
-                if let Some(&(_, best)) = candidates.first() {
-                    curr_ep = best;
-                }
-                let selected =
-                    select_neighbors_heuristic(&mut nodes, &candidates, m_max, metric, true);
-                per_layer.push(selected);
-            }
-
-            // Reverse first so per_layer[0] = layer-0 neighbors, then pad with
-            // empty vecs for layers above ep_level when level > ep_level.
-            // (Padding before reversing would place the empty entries at [0].)
-            per_layer.reverse(); // per_layer[0] = layer 0 neighbors
-            while per_layer.len() <= level {
-                per_layer.push(vec![]);
-            }
-
-            // Prune here every forward neighbour that the back-link will
-            // overflow, so that the write lock only has to swap the lists in.
-            // Pruning reads up to M x 4 vectors from all over the graph; done
-            // under the write lock, for some 32 neighbours an insert, it held
-            // every other insert and search back (6,000 inserts a second on 64
-            // cores).
-            for (lc, forward_neighbors) in per_layer.iter().enumerate() {
-                let m_max = if lc == 0 { index.m0 } else { index.m };
-                for &nb_id in forward_neighbors {
-                    let nb_node = &nodes[nb_id];
-                    if nb_node.vector.is_empty() {
-                        continue;
-                    }
-                    let lc_neighbors = match nb_node.neighbors.get(lc) {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    if lc_neighbors.len() < m_max {
-                        continue; // won't overflow
-                    }
-                    let nb_vec = &nb_node.vector;
-                    let vector_of = |id: usize| {
-                        if id == NEW_NODE {
-                            &vector[..]
-                        } else {
-                            &nodes[id].vector[..]
-                        }
-                    };
-                    let mut scored: Vec<(f32, usize)> = lc_neighbors
-                        .iter()
-                        .filter_map(|&id| {
-                            let n = &nodes[id];
-                            if n.vector.is_empty() {
-                                return None;
-                            }
-                            Some((distance_prenorm(metric, nb_vec, &n.vector), id))
-                        })
-                        .collect();
-                    scored.push((distance_prenorm(metric, nb_vec, &vector), NEW_NODE));
-                    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-
-                    // Bounded Algorithm-4 heuristic: check each candidate
-                    // against at most K=4 already-accepted neighbours.
-                    for i in 0..scored.len() {
-                        let (d_i, id_i) = scored[i];
-                        let vec_i = vector_of(id_i);
-                        let mut checks = 0usize;
-                        for j in 0..i {
-                            let (d_j, id_j) = scored[j];
-                            if d_j.is_infinite() {
-                                continue;
-                            }
-                            if distance_prenorm(metric, vec_i, vector_of(id_j)) < d_i {
-                                scored[i].0 = f32::INFINITY;
-                                break;
-                            }
-                            checks += 1;
-                            if checks >= 4 {
-                                break;
-                            }
-                        }
-                    }
-                    let mut pruned = Vec::with_capacity(m_max);
-                    let kept = scored.iter().filter(|(d, _)| !d.is_infinite());
-                    let dropped = scored.iter().filter(|(d, _)| d.is_infinite());
-                    pruned.extend(kept.chain(dropped).take(m_max).map(|&(_, id)| id));
-                    precomputed_backlinks.push((nb_id, lc, lc_neighbors.clone(), pruned));
-                    parking_lot::RwLockReadGuard::bump(&mut nodes);
-                }
-            }
-        } // read lock drops here
-
-        (per_layer, curr_ep)
-    } else {
-        // First node ever — empty neighbor lists
-        ((0..=level).map(|_| vec![]).collect(), 0)
-    };
-
-    // Phases 3-6: hold ONE write lock across all state mutations.
-    // This guarantees that no concurrent reader can ever see a partially
-    // constructed insertion. The window is bounded by Phase 6's work,
-    // which is O(M * layers) — a small constant.
-    let node = HnswNode {
-        key: key.clone(),
-        vector: vector.clone(),
-        neighbors: neighbors_per_layer,
-    };
-
-    {
-        let mut nodes = index.nodes.write();
-        let new_id = nodes.len();
-        nodes.push(node);
-
-        // Phase 4: register in key_to_id while still holding nodes.write.
-        // Order matters: any reader that takes nodes.read after this point
-        // will see the new node AND find it via key_to_id. Any reader that
-        // already holds nodes.read can't see it at all.
-        index.key_to_id.write().insert(key, new_id);
-        index.live_count.fetch_add(1, Relaxed);
-
-        // Phase 5: entry point bump if the new node has higher level.
-        {
-            let mut ep = index.entry_point.write();
-            match *ep {
-                None => *ep = Some(new_id),
-                Some(current_ep) => {
-                    let current_level = nodes[current_ep].neighbors.len().saturating_sub(1);
-                    if level > current_level {
-                        *ep = Some(new_id);
-                    }
-                }
+        for lc in (level + 1..=ep_level).rev() {
+            let results = hnsw_search_layer_concurrent(&mut nodes, &vector, curr_ep, 1, lc, metric);
+            if let Some(&(_, best)) = results.first() {
+                curr_ep = best;
             }
         }
 
-        // Phase 6: back-links. Still under the same write lock.
-        let layer_count = nodes[new_id].neighbors.len();
-
-        for lc in 0..layer_count {
+        // Search and collect neighbors for layers 0..=min(level, ep_level)
+        for lc in (0..=level.min(ep_level)).rev() {
             let m_max = if lc == 0 { index.m0 } else { index.m };
-            let neighbors_at_layer: Vec<usize> = nodes[new_id].neighbors[lc].clone();
+            let candidates = hnsw_search_layer_concurrent(
+                &mut nodes,
+                &vector,
+                curr_ep,
+                index.ef_construction,
+                lc,
+                metric,
+            );
+            if let Some(&(_, best)) = candidates.first() {
+                curr_ep = best;
+            }
+            let selected = select_neighbors_heuristic(&mut nodes, &candidates, m_max, metric, true);
+            per_layer.push(selected);
+        }
 
-            for &nb_id in &neighbors_at_layer {
-                if nodes[nb_id].vector.is_empty() {
+        // Reverse first so per_layer[0] = layer-0 neighbors, then pad with
+        // empty vecs for layers above ep_level when level > ep_level.
+        // (Padding before reversing would place the empty entries at [0].)
+        per_layer.reverse(); // per_layer[0] = layer 0 neighbors
+        while per_layer.len() <= level {
+            per_layer.push(vec![]);
+        }
+
+        // Prune, before taking any neighbour's lock, every forward neighbour
+        // that the back-link will overflow; linking then only swaps the
+        // pruned list in. Pruning reads up to M x 4 vectors from all over the
+        // graph, for some 32 neighbours an insert.
+        for (lc, forward_neighbors) in per_layer.iter().enumerate() {
+            let m_max = if lc == 0 { index.m0 } else { index.m };
+            for &nb_id in forward_neighbors {
+                let nb_node = &nodes[nb_id];
+                if nb_node.vector.is_empty() {
                     continue;
                 }
-                while nodes[nb_id].neighbors.len() <= lc {
-                    nodes[nb_id].neighbors.push(Vec::new());
-                }
-                nodes[nb_id].neighbors[lc].push(new_id);
-
-                if nodes[nb_id].neighbors[lc].len() > m_max {
-                    // Fast path: the list pruned during the search, if the
-                    // neighbour's list is still the one it pruned (with new_id
-                    // just pushed on the end).
-                    let current = &nodes[nb_id].neighbors[lc];
-                    let fresh = precomputed_backlinks.iter().find(|(pid, plc, seen, _)| {
-                        *pid == nb_id && *plc == lc && current[..current.len() - 1] == seen[..]
-                    });
-                    if let Some((_, _, _, pruned)) = fresh {
-                        let list = &mut nodes[nb_id].neighbors[lc];
-                        list.clear();
-                        list.extend(
-                            pruned
-                                .iter()
-                                .map(|&id| if id == NEW_NODE { new_id } else { id }),
-                        );
-                        continue; // skip greedy fallback
+                let lc_neighbors = match nb_node.neighbors.lock().get(lc) {
+                    Some(n) if n.len() >= m_max => n.clone(),
+                    _ => continue, // won't overflow
+                };
+                let nb_vec = &nb_node.vector;
+                let vector_of = |id: usize| {
+                    if id == NEW_NODE {
+                        &vector[..]
+                    } else {
+                        &nodes[id].vector[..]
                     }
-                    // Stale (concurrent insert raced us) — fall through to greedy.
+                };
+                let mut scored: Vec<(f32, usize)> = lc_neighbors
+                    .iter()
+                    .filter_map(|&id| {
+                        let n = &nodes[id];
+                        if n.vector.is_empty() {
+                            return None;
+                        }
+                        Some((distance_prenorm(metric, nb_vec, &n.vector), id))
+                    })
+                    .collect();
+                scored.push((distance_prenorm(metric, nb_vec, &vector), NEW_NODE));
+                scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
 
-                    // Greedy fallback: sort by distance to nb_id, truncate to m_max.
-                    // Used when no pre-computation matched or the snapshot was stale.
-                    let candidates: Vec<usize> = std::mem::take(&mut nodes[nb_id].neighbors[lc]);
-                    let nb_vec: Vec<f32> = nodes[nb_id].vector.clone();
-                    BACKLINK_SCRATCH.with(|cell| {
-                        let mut scored = cell.borrow_mut();
-                        scored.clear();
-                        scored.reserve(candidates.len());
-                        for &id in &candidates {
-                            let n = &nodes[id];
-                            if n.vector.is_empty() {
-                                continue;
-                            }
-                            scored.push((distance_prenorm(metric, &nb_vec, &n.vector), id));
+                // Bounded Algorithm-4 heuristic: check each candidate
+                // against at most K=4 already-accepted neighbours.
+                for i in 0..scored.len() {
+                    let (d_i, id_i) = scored[i];
+                    let vec_i = vector_of(id_i);
+                    let mut checks = 0usize;
+                    for j in 0..i {
+                        let (d_j, id_j) = scored[j];
+                        if d_j.is_infinite() {
+                            continue;
                         }
-                        scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-                        scored.truncate(m_max);
-                        nodes[nb_id].neighbors[lc].clear();
-                        nodes[nb_id].neighbors[lc].reserve(scored.len());
-                        for &(_, id) in scored.iter() {
-                            nodes[nb_id].neighbors[lc].push(id);
+                        if distance_prenorm(metric, vec_i, vector_of(id_j)) < d_i {
+                            scored[i].0 = f32::INFINITY;
+                            break;
                         }
-                    });
+                        checks += 1;
+                        if checks >= 4 {
+                            break;
+                        }
+                    }
+                }
+                let mut pruned = Vec::with_capacity(m_max);
+                let kept = scored.iter().filter(|(d, _)| !d.is_infinite());
+                let dropped = scored.iter().filter(|(d, _)| d.is_infinite());
+                pruned.extend(kept.chain(dropped).take(m_max).map(|&(_, id)| id));
+                precomputed_backlinks.push((nb_id, lc, lc_neighbors, pruned));
+                parking_lot::RwLockReadGuard::bump(&mut nodes);
+            }
+        }
+
+        per_layer
+    } else {
+        // First node ever — empty neighbor lists
+        (0..=level).map(|_| vec![]).collect()
+    };
+
+    // Append the node. Nothing finds it until a neighbour links back to it
+    // below, or a reader looks its key up after the next line.
+    let forward_links = neighbors_per_layer.clone();
+    let new_id = nodes.push(HnswNode::new(key.clone(), vector, neighbors_per_layer));
+    index.key_to_id.write().insert(key, new_id);
+    index.live_count.fetch_add(1, Relaxed);
+
+    // Entry point bump if the new node has higher level.
+    {
+        let mut ep = index.entry_point.write();
+        match *ep {
+            None => *ep = Some(new_id),
+            Some(current_ep) => {
+                let current_level = nodes[current_ep].layer_count().saturating_sub(1);
+                if level > current_level {
+                    *ep = Some(new_id);
                 }
             }
+        }
+    }
+
+    // Back-links, each under that neighbour's lock alone.
+    for (lc, forward) in forward_links.iter().enumerate() {
+        let m_max = if lc == 0 { index.m0 } else { index.m };
+        for &nb_id in forward {
+            let nb = &nodes[nb_id];
+            if nb.vector.is_empty() {
+                continue;
+            }
+            let mut links = nb.neighbors.lock();
+            while links.len() <= lc {
+                links.push(Vec::new());
+            }
+            let list = &mut links[lc];
+            list.push(new_id);
+            if list.len() <= m_max {
+                continue;
+            }
+
+            // Fast path: the list pruned during the search, if the
+            // neighbour's list is still the one it pruned (with new_id just
+            // pushed on the end).
+            let fresh = precomputed_backlinks.iter().find(|(pid, plc, seen, _)| {
+                *pid == nb_id && *plc == lc && list[..list.len() - 1] == seen[..]
+            });
+            if let Some((_, _, _, pruned)) = fresh {
+                list.clear();
+                list.extend(
+                    pruned
+                        .iter()
+                        .map(|&id| if id == NEW_NODE { new_id } else { id }),
+                );
+                continue;
+            }
+
+            // Stale (a concurrent insert changed the list): keep the m_max
+            // nearest.
+            let candidates: Vec<usize> = std::mem::take(list);
+            BACKLINK_SCRATCH.with(|cell| {
+                let mut scored = cell.borrow_mut();
+                scored.clear();
+                scored.reserve(candidates.len());
+                for &id in &candidates {
+                    let n = &nodes[id];
+                    if n.vector.is_empty() {
+                        continue;
+                    }
+                    scored.push((distance_prenorm(metric, &nb.vector, &n.vector), id));
+                }
+                scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                scored.truncate(m_max);
+                list.reserve(scored.len());
+                list.extend(scored.iter().map(|&(_, id)| id));
+            });
         }
     }
 }
@@ -2096,15 +2092,13 @@ const EXPANSIONS_PER_YIELD: usize = 4;
 
 /// Search one layer of the graph from `ep`, the graph held for reading.
 ///
-/// Every few candidates the read lock is handed to an insert waiting for the
-/// write lock, if there is one, and taken back. An insert takes the write lock
-/// once, briefly, but a writer that waits holds back every reader that comes
-/// after it, so before this an ingest made one insert for about every search
-/// that ran: 6,000 inserts a second on 64 cores, the rest of them waiting.
-/// Ids stay valid across the yield: nodes are only appended, and deleted ones
-/// are tombstoned in place.
+/// Every few candidates the read lock is handed to a delete waiting for the
+/// write lock, if there is one, and taken back: a writer that waits holds back
+/// every reader that comes after it, so a long search would hold up all of
+/// them. Ids stay valid across the yield: nodes are only appended, and deleted
+/// ones are tombstoned in place.
 fn hnsw_search_layer_concurrent(
-    nodes: &mut parking_lot::RwLockReadGuard<'_, Vec<HnswNode>>,
+    nodes: &mut NodesGuard<'_>,
     query: &[f32],
     ep: usize,
     ef: usize,
@@ -2142,9 +2136,9 @@ fn hnsw_search_layer_concurrent(
             // Copy neighbors into the thread-local scratch buffer.
             bufs.neighbor_scratch.clear();
             {
-                let n = &nodes[c_id];
-                if layer < n.neighbors.len() {
-                    bufs.neighbor_scratch.extend_from_slice(&n.neighbors[layer]);
+                let links = nodes[c_id].neighbors.lock();
+                if let Some(list) = links.get(layer) {
+                    bufs.neighbor_scratch.extend_from_slice(list);
                 }
             }
 
@@ -2227,7 +2221,6 @@ pub fn knn_hnsw(
     if live_count < 500 {
         let mut scored: Vec<(f32, usize)> = nodes
             .iter()
-            .enumerate()
             .filter_map(|(i, n)| {
                 if n.vector.is_empty() || n.vector.len() != query.len() {
                     return None;
@@ -2247,7 +2240,7 @@ pub fn knn_hnsw(
     }
 
     // Large graph: HNSW traversal
-    let ep_level = nodes[ep_id].neighbors.len().saturating_sub(1);
+    let ep_level = nodes[ep_id].layer_count().saturating_sub(1);
     let mut curr_ep = ep_id;
 
     for lc in (1..=ep_level).rev() {
@@ -2340,9 +2333,7 @@ pub fn maybe_unindex(index_store: &IndexStore, key: &str) {
                         if let Some(node) = nodes.get_mut(node_id)
                             && !node.vector.is_empty()
                         {
-                            node.vector = Vec::new();
-                            node.key = String::new();
-                            node.neighbors = Vec::new();
+                            node.clear();
                             use std::sync::atomic::Ordering::Relaxed;
                             idx.tombstone_count.fetch_add(1, Relaxed);
                             idx.live_count.fetch_sub(1, Relaxed);
@@ -2446,7 +2437,7 @@ pub fn compact_hnsw(
         let nodes = old_arc.nodes.read();
         nodes
             .iter()
-            .filter_map(|n| {
+            .filter_map(|(_, n)| {
                 if n.vector.is_empty() {
                     return None;
                 }
@@ -2783,5 +2774,90 @@ mod alias_tests {
         let g = store.read();
         assert_eq!(resolve_index_name(&g, "a").as_deref(), Some("idx"));
         assert_eq!(index_aliases(&g, "idx"), ["a"]);
+    }
+}
+
+#[cfg(test)]
+mod concurrent_insert_tests {
+    use super::*;
+    use rand::{Rng, SeedableRng};
+
+    fn random_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..n)
+            .map(|_| (0..dim).map(|_| rng.r#gen::<f32>() - 0.5).collect())
+            .collect()
+    }
+
+    /// Inserts link themselves in under their neighbours' locks alone, while
+    /// searches run and keys are overwritten (which takes the write lock).
+    /// The graph that comes out must be whole, and every vector findable.
+    #[test]
+    fn concurrent_inserts_searches_and_overwrites_leave_a_whole_graph() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 1500;
+        const DIM: usize = 16;
+        let metric = DistanceMetric::Cosine;
+        let index = Arc::new(HnswIndex::new(16, 100));
+        let vectors: Vec<Vec<Vec<f32>>> = (0..THREADS)
+            .map(|t| random_vectors(PER_THREAD, DIM, t as u64))
+            .collect();
+
+        std::thread::scope(|s| {
+            for (t, vs) in vectors.iter().enumerate() {
+                let index = &index;
+                let metric = &metric;
+                s.spawn(move || {
+                    for (i, v) in vs.iter().enumerate() {
+                        hnsw_insert(index, format!("k:{t}:{i}"), v.clone(), metric);
+                        if i % 10 == 0 {
+                            knn_hnsw(index, v, 5, 50, metric);
+                        }
+                        // Overwrite an earlier key now and then: a tombstone
+                        // under the write lock, then a fresh insert.
+                        if i % 100 == 99 {
+                            let j = i - 50;
+                            hnsw_insert(index, format!("k:{t}:{j}"), vs[j].clone(), metric);
+                        }
+                    }
+                });
+            }
+        });
+
+        let nodes = index.nodes.read();
+        let count = nodes.count();
+        let overwrites = THREADS * (PER_THREAD / 100);
+        assert_eq!(count, THREADS * PER_THREAD + overwrites);
+        assert_eq!(index.live_count.load(Relaxed), THREADS * PER_THREAD);
+        assert_eq!(index.tombstone_count.load(Relaxed), overwrites);
+        for (id, node) in nodes.iter() {
+            let links = node.neighbors.lock();
+            for (lc, list) in links.iter().enumerate() {
+                let m_max = if lc == 0 { index.m0 } else { index.m };
+                assert!(
+                    list.len() <= m_max,
+                    "node {id} layer {lc}: {} links",
+                    list.len()
+                );
+                for &nb in list {
+                    assert!(nb < count && nb != id, "node {id} links to {nb}");
+                }
+            }
+        }
+        drop(nodes);
+
+        // Every vector is found as its own nearest neighbour (nearly always:
+        // HNSW is approximate).
+        let mut found = 0;
+        for (t, vs) in vectors.iter().enumerate() {
+            for (i, v) in vs.iter().enumerate() {
+                let hits = knn_hnsw(&index, v, 1, 100, &metric);
+                if hits.first().is_some_and(|h| h.key == format!("k:{t}:{i}")) {
+                    found += 1;
+                }
+            }
+        }
+        let total = THREADS * PER_THREAD;
+        assert!(found * 100 >= total * 98, "found {found} of {total}");
     }
 }
