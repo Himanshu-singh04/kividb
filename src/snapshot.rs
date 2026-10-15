@@ -23,7 +23,7 @@ pub struct LoadedSnapshot {
     pub index_schemas: Vec<IndexSchema>,
     /// The dictionaries (`FT.DICTADD`): name, terms.
     pub dictionaries: Vec<(String, Vec<String>)>,
-    /// Pre-built HNSW graphs from the snapshot (indexed by "index_name" →
+    /// HNSW graphs saved in the snapshot (indexed by "index_name" →
     /// field_name → Arc<HnswIndex>). When present for a given field, backfill
     /// is skipped and the saved graph is used directly, preserving precision.
     pub hnsw_graphs: std::collections::HashMap<

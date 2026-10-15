@@ -37,7 +37,7 @@ sudo -u ubuntu -H bash << EOSU
 set -euo pipefail
 cd /home/ubuntu
 
-# ── KiviDB: download pre-built binary (warm start; CI ships its own build) ──
+# ── KiviDB: download the release binary (warm start; CI ships its own build) ──
 # The release tarball already contains its own kividb/ directory (extracting
 # it here produces /home/ubuntu/kividb/kividb directly) — do not wrap it in
 # an extra kividb/ dir, or the CI scp step's destination becomes a directory
@@ -52,7 +52,7 @@ if [[ ! -x /home/ubuntu/kividb/kividb ]]; then
 fi
 echo "KiviDB warm binary ready."
 
-# ── Dragonfly: download pre-built binary ─────────────────────────────────────
+# ── Dragonfly: download the release binary ────────────────────────────────────
 if [[ ! -x /home/ubuntu/dragonfly-aarch64 ]]; then
   echo "Downloading Dragonfly $DRAGONFLY_VERSION..."
   wget -q "https://github.com/dragonflydb/dragonfly/releases/download/$DRAGONFLY_VERSION/dragonfly-aarch64.tar.gz" \

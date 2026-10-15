@@ -1122,7 +1122,7 @@ impl HnswIndex {
 
 /// Install index definitions carried by a KDB image (short write lock).
 ///
-/// Pre-built HNSW graphs are spliced straight into the `IndexDef`, so the
+/// HNSW graphs saved in a snapshot are spliced straight into the `IndexDef`, so the
 /// backfill that follows skips those fields entirely and the graph's precision
 /// is the one that was saved rather than one rebuilt from scratch.
 ///
