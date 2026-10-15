@@ -74,9 +74,10 @@ pub struct Config {
     #[arg(long, default_value_t = 16)]
     pub databases: usize,
 
-    /// Max memory in bytes (0 = unlimited). Once the process uses more, writes
-    /// are refused with an OOM error.
-    #[arg(long, default_value_t = 0)]
+    /// Max memory (0 = unlimited): bytes, or with a unit as in Redis (`3gb`,
+    /// `512mb`). Once the process uses more, writes are refused with an OOM
+    /// error.
+    #[arg(long, default_value_t = 0, value_parser = parse_memory_flag)]
     pub maxmemory: usize,
 
     /// What to do when `maxmemory` is reached (Redis `maxmemory-policy`):
@@ -1521,6 +1522,13 @@ pub(crate) fn parse_memory(key: &str, value: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("invalid value '{value}' for '{key}': not a memory size"))
 }
 
+/// [`parse_memory`] for a command-line flag, which Redis takes with units too
+/// (`--maxmemory 3gb`).
+fn parse_memory_flag(value: &str) -> Result<usize, String> {
+    parse_memory("--maxmemory", value)
+        .and_then(|n| usize::try_from(n).map_err(|_| format!("invalid value '{value}': too large")))
+}
+
 /// Parse Redis-style `yes` / `no` into a bool. Used by `--cluster-enabled`
 /// and any future flags that want to mirror redis.conf phrasing rather than
 /// clap's default `true` / `false`.
@@ -1554,6 +1562,17 @@ mod config_file_tests {
         assert_eq!(c.tls_auth_clients, "optional");
         let err = load("tls-auth-clients maybe\n").unwrap_err();
         assert!(err.contains("tls-auth-clients"), "{err}");
+    }
+
+    #[test]
+    fn maxmemory_on_the_command_line_takes_units_as_in_redis() {
+        use clap::Parser;
+        let at =
+            |v: &str| Config::try_parse_from(["kividb", "--maxmemory", v]).map(|c| c.maxmemory);
+        assert_eq!(at("3gb").unwrap(), 3 * 1024 * 1024 * 1024);
+        assert_eq!(at("512mb").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(at("1000").unwrap(), 1000);
+        assert!(at("lots").is_err());
     }
 
     #[test]
