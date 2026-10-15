@@ -1,0 +1,332 @@
+name: Linux Verification
+
+# Everything that cannot be verified on a Windows dev machine.
+#
+# Two classes of gap live here:
+#
+#   1. io_uring. `src/server_uring.rs` is `#[cfg(target_os = "linux")]`, so a
+#      Windows `cargo build` does not compile it at all and a Windows
+#      `cargo test` never executes it. It is a genuinely separate request path
+#      from the tokio loop — different read/write model, its own push-forwarder
+#      and write serialisation — so a green tokio run says nothing about it.
+#      This workflow builds it, lints it, and drives real traffic through it.
+#
+#   2. Pub/Sub subscriber mode. Deliveries are out-of-band writes racing the
+#      command path, and the two I/O models implement that differently.
+#      `smoke/pubsub_matrix.py` runs the same battery against both.
+#
+#   3. Blocking commands (BLPOP, BZPOPMIN, XREAD BLOCK, …). How the wait is
+#      performed depends on the runtime under the connection loop, so a green
+#      tokio run says nothing about io_uring here either.
+#      `smoke/blocking_matrix.py` runs the same battery against both.
+#
+# Runs on every push/PR that touches the server, because these paths have
+# already produced bugs that compiling cleanly did not catch: an io_uring
+# subscriber that acked, accepted commands, and then silently never received a
+# single message.
+
+# Deliberately PR-only, not `push` to main/master. Every merge into master
+# arrives through a PR that already ran this exact workflow on the same tree,
+# so a post-merge run re-verifies a commit that was verified minutes earlier
+# and adds nothing but queue time. Use `workflow_dispatch` to re-run a merged
+# commit on demand (e.g. bisecting, or after a runner-image change).
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "smoke/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/linux-verification.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Compile + lint the Linux-only code a Windows dev loop never sees ────────
+  lint-linux-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Confirm the io_uring module is actually being compiled
+        # Guards against this job silently passing because the module was
+        # cfg'd out — which would make the whole workflow theatre.
+        run: |
+          set -euo pipefail
+          grep -q 'pub mod server_uring' src/lib.rs
+          echo "server_uring is declared; target_os=linux so it compiles here."
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # ── Full Rust test suite on Linux ───────────────────────────────────────────
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        # --test-threads is capped: several suites bind ports and measure
+        # elapsed time, and full parallelism on a 2-core hosted runner makes
+        # the timing-sensitive ones flap.
+        run: cargo test --no-fail-fast -- --test-threads=4
+
+  # ── Drive real traffic through BOTH I/O models ──────────────────────────────
+  io-model-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        io_model: [tokio, uring]
+    name: traffic (${{ matrix.io_model }})
+    env:
+      # Most e2e tests talk to the already-running server on KIVI_PORT, but some
+      # spawn their own (persistence/restart, replication, slowlog with a custom
+      # config, maxmemory, CLIENT PAUSE) and resolve the binary themselves.
+      # Without this they fall back to `../../bin/kividb`, which does not exist
+      # on a runner — and `tests/e2e/utils/helpers.py` would instead pick up any
+      # `redis-server` on PATH, silently testing Redis rather than kividb.
+      KIVI_BINARY: ${{ github.workspace }}/target/release/kividb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install client deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-tools
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Report kernel io_uring support
+        # Informational, but printed before the server starts so a uring
+        # failure below can be told apart from "this runner can't do io_uring".
+        run: |
+          uname -r
+          if [ -e /proc/sys/kernel/io_uring_disabled ]; then
+            echo "io_uring_disabled=$(cat /proc/sys/kernel/io_uring_disabled)"
+          else
+            echo "io_uring_disabled: not present (no restriction knob)"
+          fi
+
+      - name: Build
+        run: cargo build --release --bin kividb
+
+      - name: Start kividb (--io-model ${{ matrix.io_model }})
+        run: |
+          set -euo pipefail
+          ./target/release/kividb --port 6380 --bind 127.0.0.1 \
+            --loglevel notice --io-model ${{ matrix.io_model }} \
+            > /tmp/kividb-${{ matrix.io_model }}.log 2>&1 &
+          for _ in $(seq 1 60); do
+            redis-cli -p 6380 ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! redis-cli -p 6380 ping >/dev/null 2>&1; then
+            echo "::error::kividb never became reachable with --io-model ${{ matrix.io_model }}"
+            cat /tmp/kividb-${{ matrix.io_model }}.log
+            exit 1
+          fi
+          # Prove the requested model is the one actually in use — otherwise a
+          # silent fallback to tokio would make the uring leg meaningless.
+          grep -i "I/O model" /tmp/kividb-${{ matrix.io_model }}.log || true
+
+      - name: Pub/Sub matrix (subscriber mode, both protocols)
+        run: python smoke/pubsub_matrix.py --port 6380 --label ${{ matrix.io_model }}
+
+      # Blocking commands are the other family whose behaviour depends on the
+      # runtime under the connection loop rather than on the handler: they used
+      # to bridge an async wait out of sync dispatch with `block_in_place`,
+      # which panics on a current-thread runtime, so every one of them killed
+      # the connection under io_uring while passing under tokio. The wait now
+      # happens in the connection loop, and this battery proves it on both.
+      - name: Blocking matrix (both protocols)
+        run: python smoke/blocking_matrix.py --port 6380 --label ${{ matrix.io_model }}
+
+      # Propagation runs through the connection loop, so it is worth proving on
+      # both I/O models. The bug this guards was silent: writes whose result is
+      # chosen at execution time (SPOP's random members, XADD *'s clock-derived
+      # id) were propagated verbatim, so the replica re-decided them and ended
+      # up holding different data with no error anywhere. It matters most on
+      # failover, when exactly this replica is promoted.
+      - name: Replication determinism (replica must converge)
+        run: |
+          set -euo pipefail
+          ./target/release/kividb --port 6381 --bind 127.0.0.1 \
+            --loglevel notice --io-model ${{ matrix.io_model }} \
+            --replicaof 127.0.0.1 6380 \
+            > /tmp/kividb-replica-${{ matrix.io_model }}.log 2>&1 &
+          for _ in $(seq 1 60); do
+            redis-cli -p 6381 ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! redis-cli -p 6381 ping >/dev/null 2>&1; then
+            echo "::error::replica never became reachable"
+            cat /tmp/kividb-replica-${{ matrix.io_model }}.log
+            exit 1
+          fi
+          # `set -e` would abort on a failing probe before the cleanup below,
+          # leaving a stray replica attached to the master that the remaining
+          # steps in this job share.
+          set +e
+          python smoke/replication_determinism.py \
+            --master-port 6380 --replica-port 6381 --label ${{ matrix.io_model }}
+          status=$?
+          set -e
+          redis-cli -p 6381 shutdown nosave >/dev/null 2>&1 || true
+          # The master is shared with the steps below, so leave it running but
+          # drop what this test wrote.
+          redis-cli -p 6380 flushall >/dev/null 2>&1 || true
+          exit $status
+
+      # The AOF queue used to be a bounded channel written with
+      # `let _ = try_send(..)`, so once writes outran the writer, records were
+      # discarded with no error and no counter while the client still got +OK.
+      # Measured at 200k pipelined writes: 176,667 of 200,000 (88%) never
+      # reached the file. Runs on its own instance in a scratch directory so
+      # the appendonly.aof it produces cannot interfere with the shared server
+      # the other steps use.
+      - name: AOF loses no acknowledged write
+        run: |
+          set -euo pipefail
+          aofdir=$(mktemp -d)
+          ( cd "$aofdir" && "${{ github.workspace }}/target/release/kividb" \
+              --port 6382 --bind 127.0.0.1 --aof --loglevel error \
+              --io-model ${{ matrix.io_model }} > "$aofdir/server.log" 2>&1 & )
+          for _ in $(seq 1 60); do
+            redis-cli -p 6382 ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! redis-cli -p 6382 ping >/dev/null 2>&1; then
+            echo "::error::AOF instance never became reachable"
+            cat "$aofdir/server.log"
+            exit 1
+          fi
+          set +e
+          python smoke/aof_no_loss.py --port 6382 --dir "$aofdir" \
+            -n 200000 --label ${{ matrix.io_model }}
+          status=$?
+          set -e
+          redis-cli -p 6382 shutdown nosave >/dev/null 2>&1 || true
+          exit $status
+
+      # BGREWRITEAOF is what bounds AOF growth, so orchestration tooling
+      # triggers it automatically on a size threshold — which makes it the most
+      # dangerous command in the server if it is wrong, and it was wrong in
+      # three separate ways, all silent:
+      #   * Stream/TimeSeries/VectorSet hit a `None` arm and were dropped.
+      #   * The walk was a fuzzy per-shard capture, then renamed over the log,
+      #     so writes landing mid-rewrite were in neither file.
+      #   * The writer never reopened the file, so every write AFTER a rewrite
+      #     went to an unlinked inode (the AOF froze at 41 bytes).
+      # Nothing tested any of it. This runs the rewrite under concurrent load,
+      # restarts, and checks nothing was lost or double-applied.
+      - name: AOF rewrite loses nothing (BGREWRITEAOF under load)
+        run: |
+          set -euo pipefail
+          rwdir=$(mktemp -d)
+          start() {
+            ( cd "$rwdir" && "${{ github.workspace }}/target/release/kividb" \
+                --port 6383 --bind 127.0.0.1 --aof --loglevel error \
+                --io-model ${{ matrix.io_model }} >> "$rwdir/server.log" 2>&1 & )
+            for _ in $(seq 1 60); do
+              redis-cli -p 6383 ping >/dev/null 2>&1 && return 0
+              sleep 1
+            done
+            echo "::error::AOF rewrite instance never came up"
+            cat "$rwdir/server.log"; exit 1
+          }
+          start
+          set +e
+          python smoke/aof_rewrite_durability.py --port 6383 --dir "$rwdir"
+          status=$?
+          set -e
+          [ $status -eq 0 ] || { cat "$rwdir/server.log"; exit $status; }
+          # Hard kill, not shutdown: a graceful stop would write dump.kdb and
+          # the restart would load that instead, testing nothing.
+          pkill -9 -f "kividb --port 6383" || true
+          sleep 2
+          start
+          set +e
+          python smoke/aof_rewrite_durability.py --port 6383 --dir "$rwdir" --verify-only
+          status=$?
+          set -e
+          grep -E "rewrite complete" "$rwdir/server.log" || true
+          redis-cli -p 6383 shutdown nosave >/dev/null 2>&1 || true
+          exit $status
+
+      # A replica used to apply its master's entire write stream and log none
+      # of it (the applier ran with `aof_enabled: false`), so promoting one
+      # produced a node that served the right data from RAM and had a 0-byte
+      # AOF on disk. Measured on a real operator deployment: 5,004 keys
+      # written, two ex-replicas at 0 bytes, the ex-master at 178 KB.
+      #
+      # Turning the append on is only half of it. A full resync replaces the
+      # whole store while the AOF keeps whatever was already in it, so without
+      # rebasing the log onto the synced dataset the replica recovers to a
+      # dataset it never had -- verified by ablation: DBSIZE looked healthy at
+      # 3001 while every key belonged to the node's previous life as a master.
+      #
+      # This spawns its own master/replica pairs, so it needs no server here.
+      - name: Replica AOF durability (own log, promotion, resync rebase)
+        run: |
+          set -euo pipefail
+          python smoke/replica_aof_durability.py \
+            --binary "${{ github.workspace }}/target/release/kividb" \
+            --io-model ${{ matrix.io_model }} \
+            --master-port 6384 --replica-port 6385 -n 5000
+
+      # Both legs run the identical set, so any divergence between tokio and
+      # uring is a failure. The uring leg used to deselect the blocking family
+      # because it panicked there; that is fixed.
+      #
+      # Nothing is excluded: the two MULTI/EXEC isolation tests that used to
+      # be are covered now that transactions run alone
+      # (docs/EXEC_ATOMICITY.md).
+      - name: e2e command surface — RESP2
+        run: |
+          cd tests/e2e
+          KIVI_EXTERNAL=1 KIVI_PORT=6380 KIVI_RESP=2 pytest modules/ -q
+
+      - name: e2e command surface — RESP3
+        run: |
+          cd tests/e2e
+          KIVI_EXTERNAL=1 KIVI_PORT=6380 KIVI_RESP=3 pytest modules/ -q
+
+      - name: Server log on failure
+        if: failure()
+        run: tail -200 /tmp/kividb-${{ matrix.io_model }}.log || true
+
+  summary:
+    needs: [lint-linux-only, test-linux, io-model-matrix]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Gate
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "::error::Linux verification failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::Linux verification was cancelled"
+            exit 1
+          fi
+          echo "Linux verification passed (both I/O models, both protocols)."

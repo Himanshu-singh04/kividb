@@ -1,0 +1,5 @@
+# Run inside Linux containers from a Windows checkout: keep LF there.
+*.sh text eol=lf
+scripts/client_compat/** text eol=lf
+.githooks/* text eol=lf
+scripts/ci/* text eol=lf

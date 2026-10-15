@@ -1,0 +1,674 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.2.3)"
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NFPM_VERSION: "2.41.0"
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+# ── Feature variants ─────────────────────────────────────────────────────────
+#
+#   name     features      tarball suffix   Docker manifest tag
+#   -------  ------------  ---------------  -----------------------------------
+#   default  (none)        (none)           v1.2.3 · MAJOR.MINOR · latest
+#   lua      lua           -lua             v1.2.3-lua
+#   tls      tls           -tls             v1.2.3-tls
+#   full     lua,tls       -full            v1.2.3-full
+#
+# Each Linux job also produces .deb / .rpm for the default variant only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  # ── Tag must match Cargo.toml ────────────────────────────────────────────
+  # The engine reports its version from CARGO_PKG_VERSION (INFO's
+  # kividb_version, HELLO, LOLWUT). If Cargo.toml says 1.0.4 while the tag
+  # says v1.0.4-rc2, every running instance claims to be a stable release
+  # that was never cut -- which has already misled downstream tooling
+  # into offering an upgrade to a version that does not exist, and made two
+  # different builds of "rc1" indistinguishable after a tag was recreated.
+  #
+  # Cheap, and it gates every build job below, so a mismatched tag fails in
+  # seconds instead of after a full multi-arch publish.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Cargo.toml version equals the release tag
+        run: |
+          set -euo pipefail
+          want="${RELEASE_TAG#v}"
+          # First `version =` after [package]; the [lib]/[[bin]] tables above
+          # it have no version key, but dependencies below it do.
+          have="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version *=/{gsub(/[" ]/,"");sub(/^version=/,"");print;exit}' Cargo.toml)"
+          echo "tag=${want} cargo=${have}"
+          if [ "${want}" != "${have}" ]; then
+            echo "::error::Cargo.toml version '${have}' does not match release tag '${RELEASE_TAG}'. Bump Cargo.toml (and Cargo.lock) before tagging -- the engine reports this string as kividb_version."
+            exit 1
+          fi
+
+  # ── Linux x86_64 ─────────────────────────────────────────────────────────
+  # Built INSIDE an amazonlinux:2023 container, not natively on the runner:
+  # ubuntu-latest's glibc (2.39+) is newer than Amazon Linux 2023's glibc
+  # (2.34), so a plain `cargo build` on the runner produces a binary that
+  # instantly fails with "GLIBC_2.38 not found". musl (statically linked, no
+  # glibc dependency) was tried first but tokio-uring 0.5's libc bindings
+  # (statx, msghdr.msg_controllen) don't compile against musl's libc at all —
+  # not a config issue, a real upstream incompatibility. Building on AL2023
+  # itself sidesteps that: same glibc as the deploy target, by construction.
+  linux-amd64:
+    needs: [verify-version]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant:
+          - { name: default, features: "",        tarball: "kividb-linux-x86_64",      package: true  }
+          - { name: lua,     features: "lua",     tarball: "kividb-lua-linux-x86_64",  package: false }
+          - { name: tls,     features: "tls",     tarball: "kividb-tls-linux-x86_64",  package: false }
+          - { name: full,    features: "lua,tls", tarball: "kividb-full-linux-x86_64", package: false }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Install nfpm
+        if: matrix.variant.package
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build binary (${{ matrix.variant.name }}) on Amazon Linux 2023
+        run: |
+          set -euo pipefail
+          FEATURES="${{ matrix.variant.features }}"
+          docker run --rm -v "${PWD}:/workspace" -w /workspace \
+            -e FEATURES="${FEATURES}" \
+            amazonlinux:2023 bash -c '
+              set -euo pipefail
+              dnf install -y gcc gcc-c++ make cmake perl git openssl-devel pkgconfig nasm >/dev/null
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+              sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+              source "$HOME/.cargo/env"
+              cargo build --release ${FEATURES:+--features "${FEATURES}"}
+            '
+
+      - name: Build .deb and .rpm
+        if: matrix.variant.package
+        run: |
+          set -euo pipefail
+          ver="${RELEASE_TAG#v}"
+          sed -e "s/^version:.*/version: ${ver}/" -e "s/^arch:.*/arch: amd64/" packaging/nfpm.yaml > /tmp/nfpm.yaml
+          mkdir -p dist
+          nfpm pkg -f /tmp/nfpm.yaml --packager deb --target dist/kividb_amd64.deb
+          nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target dist/kividb.x86_64.rpm
+
+      - name: Stage tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging/kividb
+          cp target/release/kividb staging/kividb/kividb
+          cp LICENSE staging/kividb/LICENSE
+          cp NOTICE staging/kividb/NOTICE
+          tar czf "dist/${{ matrix.variant.tarball }}.tar.gz" -C staging kividb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-amd64-${{ matrix.variant.name }}
+          path: dist/*
+
+  # ── Linux aarch64 ────────────────────────────────────────────────────────
+  # Built INSIDE an amazonlinux:2023 container — see the linux-amd64 job's
+  # comment for why (musl doesn't work here at all: tokio-uring 0.5 doesn't
+  # compile against musl's libc bindings, and a native build on this runner's
+  # own newer glibc is what crash-looped every new instance in the first
+  # place). amazonlinux:2023 is a genuine multi-arch image, so this runs
+  # natively on this arm64 runner — no emulation, no cross-rs involved.
+  linux-arm64:
+    needs: [verify-version]
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        variant:
+          - { name: default, features: "",        tarball: "kividb-linux-aarch64",      package: true  }
+          - { name: lua,     features: "lua",     tarball: "kividb-lua-linux-aarch64",  package: false }
+          - { name: tls,     features: "tls",     tarball: "kividb-tls-linux-aarch64",  package: false }
+          - { name: full,    features: "lua,tls", tarball: "kividb-full-linux-aarch64", package: false }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Install nfpm
+        if: matrix.variant.package
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_arm64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build binary (${{ matrix.variant.name }}) on Amazon Linux 2023
+        run: |
+          set -euo pipefail
+          FEATURES="${{ matrix.variant.features }}"
+          docker run --rm -v "${PWD}:/workspace" -w /workspace \
+            -e FEATURES="${FEATURES}" \
+            amazonlinux:2023 bash -c '
+              set -euo pipefail
+              dnf install -y gcc gcc-c++ make cmake perl git openssl-devel pkgconfig >/dev/null
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+              sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+              source "$HOME/.cargo/env"
+              # Atomics as single instructions (LSE), not as calls that choose
+              # at run time between those and the ARMv8.0 loops: every lock
+              # and every count is one. It needs ARMv8.1, which every arm64
+              # server has had since Graviton2; a Raspberry Pi 4 has not.
+              export RUSTFLAGS="-C target-feature=+lse"
+              cargo build --release ${FEATURES:+--features "${FEATURES}"}
+            '
+
+      - name: Build .deb and .rpm
+        if: matrix.variant.package
+        run: |
+          set -euo pipefail
+          ver="${RELEASE_TAG#v}"
+          sed -e "s/^version:.*/version: ${ver}/" -e "s/^arch:.*/arch: arm64/" packaging/nfpm.yaml > /tmp/nfpm.yaml
+          mkdir -p dist
+          nfpm pkg -f /tmp/nfpm.yaml --packager deb --target dist/kividb_arm64.deb
+          nfpm pkg -f /tmp/nfpm.yaml --packager rpm --target dist/kividb.aarch64.rpm
+
+      - name: Stage tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging/kividb
+          cp target/release/kividb staging/kividb/kividb
+          cp LICENSE staging/kividb/LICENSE
+          cp NOTICE staging/kividb/NOTICE
+          tar czf "dist/${{ matrix.variant.tarball }}.tar.gz" -C staging kividb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-arm64-${{ matrix.variant.name }}
+          path: dist/*
+
+  # ── macOS (Apple Silicon + Intel) ────────────────────────────────────────
+  # Not for a release candidate (a tag with a `-` in it): a macOS minute is
+  # billed as ten, and nobody installs a candidate with Homebrew. A candidate
+  # is published with its Linux binaries, packages and images only.
+  darwin:
+    needs: [verify-version]
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        variant:
+          - { name: default, features: "",        tarball_prefix: "kividb"      }
+          - { name: lua,     features: "lua",     tarball_prefix: "kividb-lua"  }
+          - { name: tls,     features: "tls",     tarball_prefix: "kividb-tls"  }
+          - { name: full,    features: "lua,tls", tarball_prefix: "kividb-full" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: darwin-${{ matrix.variant.name }}
+
+      - name: Build binary (${{ matrix.variant.name }})
+        run: |
+          FEATURES="${{ matrix.variant.features }}"
+          cargo build --release --target aarch64-apple-darwin ${FEATURES:+--features "${FEATURES}"}
+          cargo build --release --target x86_64-apple-darwin  ${FEATURES:+--features "${FEATURES}"}
+
+      - name: Stage tarballs
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging-arm64/kividb staging-x86/kividb
+
+          cp target/aarch64-apple-darwin/release/kividb staging-arm64/kividb/kividb
+          cp LICENSE staging-arm64/kividb/LICENSE
+          cp NOTICE staging-arm64/kividb/NOTICE
+          tar czf "dist/${{ matrix.variant.tarball_prefix }}-darwin-aarch64.tar.gz" -C staging-arm64 kividb
+
+          cp target/x86_64-apple-darwin/release/kividb staging-x86/kividb/kividb
+          cp LICENSE staging-x86/kividb/LICENSE
+          cp NOTICE staging-x86/kividb/NOTICE
+          tar czf "dist/${{ matrix.variant.tarball_prefix }}-darwin-x86_64.tar.gz" -C staging-x86 kividb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-darwin-${{ matrix.variant.name }}
+          path: dist/*
+
+  # ── Docker: build each platform image on its native runner ───────────────
+  #
+  # Per-arch intermediate tags (sources for docker-manifest):
+  #
+  #   Variant   amd64 tag               arm64 tag
+  #   -------   ----------------------  ----------------------
+  #   default   {TAG}-amd64             {TAG}-arm64
+  #   lua       {TAG}-lua-amd64         {TAG}-lua-arm64
+  #   tls       {TAG}-tls-amd64         {TAG}-tls-arm64
+  #   full      {TAG}-full-amd64        {TAG}-full-arm64
+  #
+  # Final multi-arch manifest tags:
+  #
+  #   default → {TAG}  ·  MAJOR.MINOR  ·  latest   (stable only)
+  #   lua     → {TAG}-lua
+  #   tls     → {TAG}-tls
+  #   full    → {TAG}-full
+
+  docker-amd64:
+    needs: [linux-amd64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        variant:
+          - { name: default, features: "",        arch_tag: "amd64"      }
+          - { name: lua,     features: "lua",     arch_tag: "lua-amd64"  }
+          - { name: tls,     features: "tls",     arch_tag: "tls-amd64"  }
+          - { name: full,    features: "lua,tls", arch_tag: "full-amd64" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and push (${{ matrix.variant.name }}, amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            KIVIDB_FEATURES=${{ matrix.variant.features }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
+            quay.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
+          cache-from: type=gha,scope=${{ matrix.variant.name }}-amd64
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-amd64
+
+  docker-arm64:
+    needs: [linux-arm64]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        variant:
+          - { name: default, features: "",        arch_tag: "arm64"      }
+          - { name: lua,     features: "lua",     arch_tag: "lua-arm64"  }
+          - { name: tls,     features: "tls",     arch_tag: "tls-arm64"  }
+          - { name: full,    features: "lua,tls", arch_tag: "full-arm64" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build and push (${{ matrix.variant.name }}, arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            KIVIDB_FEATURES=${{ matrix.variant.features }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
+            quay.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
+          cache-from: type=gha,scope=${{ matrix.variant.name }}-arm64
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-arm64
+
+  docker-manifest:
+    # Waits for ALL matrix instances of both docker-amd64 and docker-arm64.
+    needs: [docker-amd64, docker-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Create and push multi-arch manifests
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+
+          VER="${TAG#v}"
+          MAJOR_MINOR=$(echo "${VER}" | sed 's/\([0-9]*\.[0-9]*\)\..*/\1/')
+
+          # Stable = no pre-release suffix (no hyphen after the semver core)
+          IS_STABLE=false
+          case "${VER}" in *-*) IS_STABLE=false ;; *) IS_STABLE=true ;; esac
+
+          for registry in "ghcr.io/${{ github.repository }}" "quay.io/${{ github.repository }}"; do
+            for variant in default lua tls full; do
+              # Resolve the per-arch infix used when images were pushed
+              if [ "${variant}" = "default" ]; then
+                infix=""
+              else
+                infix="${variant}-"
+              fi
+
+              AMD64="${registry}:${TAG}-${infix}amd64"
+              ARM64="${registry}:${TAG}-${infix}arm64"
+
+              if [ "${variant}" = "default" ]; then
+                # Exact version tag (e.g. v1.2.3)
+                docker buildx imagetools create -t "${registry}:${TAG}" "${AMD64}" "${ARM64}"
+
+                # Floating tags — stable releases only
+                if [ "${IS_STABLE}" = "true" ]; then
+                  docker buildx imagetools create -t "${registry}:${MAJOR_MINOR}" "${AMD64}" "${ARM64}"
+                  docker buildx imagetools create -t "${registry}:latest"          "${AMD64}" "${ARM64}"
+                fi
+              else
+                # Named variant tag (e.g. v1.2.3-lua, v1.2.3-tls, v1.2.3-full)
+                docker buildx imagetools create -t "${registry}:${TAG}-${variant}" "${AMD64}" "${ARM64}"
+              fi
+            done
+          done
+
+  # Stable releases only: a candidate has no macOS binaries (see `darwin`),
+  # and the tap is what `brew install kividb` gives people. v1.0.6-rc1 went
+  # out through it to everybody.
+  homebrew-tap-update:
+    needs: [publish]
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: kividbio/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ref: master
+
+      - name: Create Formula directory
+        run: mkdir -p Formula
+
+      - name: Extract version and checksums
+        id: extract
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          aws s3 cp "s3://kividb-releases/v${VERSION}/SHA256SUMS.txt" /tmp/SHA256SUMS.txt
+
+          # Default (no-feature) binaries used by Homebrew
+          INTEL_SHA=$(grep "kividb-darwin-x86_64\.tar\.gz$"  /tmp/SHA256SUMS.txt | awk '{print $1}')
+          ARM_SHA=$(grep   "kividb-darwin-aarch64\.tar\.gz$" /tmp/SHA256SUMS.txt | awk '{print $1}')
+          echo "intel_sha=${INTEL_SHA}" >> $GITHUB_OUTPUT
+          echo "arm_sha=${ARM_SHA}"     >> $GITHUB_OUTPUT
+
+          echo "Version: ${VERSION}  Intel: ${INTEL_SHA}  ARM: ${ARM_SHA}"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_RELEASE }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ACCESS_SECRET_RELEASE }}
+          AWS_DEFAULT_REGION: us-east-1
+
+      - name: Update Homebrew formula
+        run: |
+          set -euo pipefail
+
+          cat > Formula/kividb.rb << 'EOF'
+          class Kividb < Formula
+            desc "A fast Redis-compatible in-memory store written in Rust"
+            homepage "https://kividb.io/"
+            license "AGPL-3.0-only"
+            version "${{ steps.extract.outputs.version }}"
+
+            on_macos do
+              on_arm do
+                url "https://releases.kividb.io/v${{ steps.extract.outputs.version }}/kividb-darwin-aarch64.tar.gz"
+                sha256 "${{ steps.extract.outputs.arm_sha }}"
+              end
+              on_intel do
+                url "https://releases.kividb.io/v${{ steps.extract.outputs.version }}/kividb-darwin-x86_64.tar.gz"
+                sha256 "${{ steps.extract.outputs.intel_sha }}"
+              end
+            end
+
+            def install
+              bin.install "kividb"
+              doc.install "LICENSE", "NOTICE"
+            end
+
+            service do
+              run [opt_bin/"kividb"]
+              keep_alive true
+              log_path var/"log/kividb.log"
+              error_log_path var/"log/kividb.error.log"
+            end
+
+            test do
+              system "#{bin}/kividb", "--version"
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/kividb.rb
+          git commit -m "chore: update kividb to ${{ steps.extract.outputs.version }}"
+          git push
+
+  # `darwin` is skipped for a release candidate, and a job that needs a
+  # skipped job is skipped too unless it says otherwise: so this says what it
+  # does need — every build that ran to have succeeded.
+  publish:
+    needs: [linux-amd64, linux-arm64, darwin, docker-manifest]
+    if: >-
+      ${{ !cancelled()
+          && needs.linux-amd64.result == 'success'
+          && needs.linux-arm64.result == 'success'
+          && needs.docker-manifest.result == 'success'
+          && (needs.darwin.result == 'success' || needs.darwin.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Assemble release directory
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp artifacts/* release-assets/
+          cd release-assets
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -exec sha256sum {} \; | sort > SHA256SUMS.txt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_RELEASE }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_RELEASE }}
+          aws-region: us-east-1
+
+      - name: Upload versioned release to S3
+        run: |
+          aws s3 sync release-assets/ s3://kividb-releases/${{ env.RELEASE_TAG }}/ \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Update latest pointer in S3
+        if: ${{ !contains(env.RELEASE_TAG, '-') }}
+        run: |
+          aws s3 sync release-assets/ s3://kividb-releases/latest/ \
+            --delete \
+            --cache-control "public, max-age=300"
+
+      # The release page: a heading, the release's own notes if it has them
+      # (docs/releases/<tag>.md, written for people upgrading), then what
+      # every release says. GitHub appends the list of merged PRs.
+      - name: Write release notes
+        env:
+          REPO_URL: https://github.com/${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          notes="docs/releases/${RELEASE_TAG}.md"
+          {
+            echo "## KiviDB ${RELEASE_TAG}"
+            echo
+            if [ -f "$notes" ]; then
+              cat "$notes"
+              echo
+            else
+              echo "No release notes were written for ${RELEASE_TAG} (\`$notes\`); see the changelog below."
+              echo
+            fi
+            cat <<EOF
+          ### Binary variants
+
+          Each OS/architecture ships **four binaries** — pick the one that matches your needs:
+
+          | Tarball suffix | Features included | When to use |
+          |----------------|-------------------|-------------|
+          | *(none)*       | —                 | Minimal / constrained environments |
+          | \`-lua\`         | Lua scripting     | \`EVAL\` / \`EVALSHA\` |
+          | \`-tls\`         | TLS termination   | Encrypted client connections |
+          | \`-full\`        | Lua + TLS         | Recommended general-purpose build |
+
+          **Full changelog:** [CHANGELOG.md](${REPO_URL}/blob/${DEFAULT_BRANCH}/CHANGELOG.md)
+
+          **License:** [GNU Affero General Public License v3 (AGPL-3.0-only)](${REPO_URL}/blob/${DEFAULT_BRANCH}/LICENSE)
+
+          **Code of conduct:** [CODE_OF_CONDUCT.md](${REPO_URL}/blob/${DEFAULT_BRANCH}/CODE_OF_CONDUCT.md)
+
+          ---
+          EOF
+          } > release-body.md
+          echo "release-body.md: $(wc -l < release-body.md) lines"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          generate_release_notes: true
+          body_path: release-body.md
+          files: |
+            release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Smoke test — release candidates only ────────────────────────────────
+  #
+  # Runs after images/binaries/the GitHub Release are all fully published, so
+  # smoke-test.yml pulls the exact artifacts a user would get, not a
+  # source-tree build. Only fires for `-rc` tags (e.g. v1.0.4-rc1); a stable
+  # tag skips this job entirely — the intent is to catch regressions on a
+  # release candidate before it's promoted to a stable tag, not to gate every
+  # stable release behind a ~15-20 minute workflow. `smoke-test.yml` stays
+  # independently callable (workflow_dispatch) for ad-hoc runs against a
+  # stable tag too, e.g. to bisect a regression.
+  smoke-test:
+    needs: [docker-manifest, publish]
+    # `uses:`-type (reusable-workflow-call) jobs only expose a restricted
+    # context set here — no `env`, despite RELEASE_TAG being defined at
+    # workflow level — so this repeats the same expression RELEASE_TAG
+    # itself is assigned from at the top of this file, rather than
+    # referencing it.
+    #
+    # `!cancelled()` and the two results, spelled out: a candidate skips
+    # `darwin`, and a job with a skipped job anywhere before it is skipped
+    # itself unless its condition says what it depends on.
+    if: >-
+      ${{ !cancelled()
+          && needs.publish.result == 'success'
+          && needs.docker-manifest.result == 'success'
+          && contains(github.event.inputs.tag || github.ref_name, '-rc') }}
+    # A called workflow can only request permissions the calling job already
+    # holds, and this file's workflow-level grant is `contents: write` alone —
+    # which makes every other scope `none`, so smoke-test.yml's `packages: read`
+    # is refused at parse time ("requesting 'packages: read', but is only
+    # allowed 'packages: none'") and the whole file is reported invalid, not
+    # just this job. Restating both scopes here is what grants them; keep this
+    # in step with smoke-test.yml's own `permissions:` block.
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      version: ${{ github.event.inputs.tag || github.ref_name }}
+    secrets: inherit

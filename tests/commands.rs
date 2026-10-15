@@ -1,0 +1,1468 @@
+// tests/pr1_commands.rs
+//
+// Integration tests for all PR1 commands:
+//   TOUCH, OBJECT REFCOUNT, DUMP / RESTORE, SORT / SORT_RO,
+//   TIME, LOLWUT, COMMAND LIST, COMMAND GETKEYS, COMMAND GETKEYSANDFLAGS
+//
+// Same harness as tests/string-json.rs — each test spawns its own server
+// on a random port so tests run fully in parallel with no shared state.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::thread;
+use std::time::Duration;
+
+// ── Minimal RESP client ───────────────────────────────────────────────────────
+
+struct Conn {
+    stream: TcpStream,
+    reader: BufReader<TcpStream>,
+}
+
+impl Conn {
+    fn connect(port: u16) -> Self {
+        let stream = (0..20)
+            .find_map(|_| {
+                thread::sleep(Duration::from_millis(50));
+                TcpStream::connect(("127.0.0.1", port)).ok()
+            })
+            .expect("could not connect to test server");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        Self { stream, reader }
+    }
+
+    fn cmd(&mut self, args: &[&[u8]]) -> RespValue {
+        let mut buf = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            buf.extend_from_slice(arg);
+            buf.extend_from_slice(b"\r\n");
+        }
+        self.stream.write_all(&buf).unwrap();
+        self.read_value()
+    }
+
+    fn cmds(&mut self, args: &[&str]) -> RespValue {
+        let owned: Vec<Vec<u8>> = args.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        self.cmd(&refs)
+    }
+
+    fn read_value(&mut self) -> RespValue {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        let line = line.trim_end_matches("\r\n");
+        match line.as_bytes().first() {
+            Some(b'+') => RespValue::SimpleStr(line[1..].to_string()),
+            Some(b'-') => RespValue::Error(line[1..].to_string()),
+            Some(b':') => RespValue::Int(line[1..].parse().unwrap()),
+            Some(b'$') => {
+                let len: i64 = line[1..].parse().unwrap();
+                if len == -1 {
+                    return RespValue::Nil;
+                }
+                let len = len as usize;
+                let mut data = vec![0u8; len + 2];
+                self.reader.read_exact(&mut data).unwrap();
+                data.truncate(len);
+                RespValue::Bulk(data)
+            }
+            Some(b'*') => {
+                let count: i64 = line[1..].parse().unwrap();
+                if count == -1 {
+                    return RespValue::Nil;
+                }
+                let items = (0..count).map(|_| self.read_value()).collect();
+                RespValue::Array(items)
+            }
+            _ => panic!("unexpected RESP byte sequence: {:?}", line),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RespValue {
+    SimpleStr(String),
+    Error(String),
+    Int(i64),
+    Bulk(Vec<u8>),
+    Array(Vec<RespValue>),
+    Nil,
+}
+
+impl RespValue {
+    fn as_str(&self) -> &str {
+        match self {
+            RespValue::SimpleStr(s) => s,
+            RespValue::Bulk(b) => std::str::from_utf8(b).unwrap(),
+            _ => panic!("not a string: {:?}", self),
+        }
+    }
+    fn as_int(&self) -> i64 {
+        match self {
+            RespValue::Int(n) => *n,
+            RespValue::Bulk(b) => std::str::from_utf8(b).unwrap().parse().unwrap(),
+            _ => panic!("not an int: {:?}", self),
+        }
+    }
+    fn as_array(&self) -> &[RespValue] {
+        match self {
+            RespValue::Array(v) => v,
+            _ => panic!("not an array: {:?}", self),
+        }
+    }
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            RespValue::Bulk(b) => b,
+            _ => panic!("not a bulk: {:?}", self),
+        }
+    }
+    fn is_ok(&self) -> bool {
+        matches!(self, RespValue::SimpleStr(s) if s == "OK")
+    }
+    fn is_nil(&self) -> bool {
+        matches!(self, RespValue::Nil)
+    }
+    fn is_error(&self) -> bool {
+        matches!(self, RespValue::Error(_))
+    }
+}
+
+// ── Server fixture ────────────────────────────────────────────────────────────
+
+/// Whether nothing has `port`. It is asked with a socket that is bound and
+/// never listens. One that listened, as this used to, could be given a
+/// connection: a server another test is starting holds, between its fork and
+/// its exec, a copy of every socket this process has open, and a client that
+/// dialled the port in that moment was connected to the copy and then reset
+/// ("Connection reset by peer", at the first command of a test).
+fn port_is_free(port: u16) -> bool {
+    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
+        return false;
+    };
+    // As the server's own socket, so that a copy of this one, while it
+    // lasts, does not keep the server from the port.
+    #[cfg(unix)]
+    let _ = probe.set_reuse_address(true);
+    probe
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .is_ok()
+}
+
+/// A port nothing is listening on — and not one the system hands out to
+/// outgoing connections. A client that starts dialling before its server is
+/// listening can otherwise be given, as its own end, the very port it is
+/// dialling: it is then connected to itself and reads back what it writes.
+fn free_port() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    loop {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed);
+        let from = (std::process::id() as u16).wrapping_mul(31);
+        let port = 10_000 + from.wrapping_add(step) % 20_000;
+        if port_is_free(port) {
+            return port;
+        }
+    }
+}
+
+fn start_server(port: u16) {
+    thread::spawn(move || {
+        let config = kividb::config::Config {
+            port,
+            bind: "127.0.0.1".to_string(),
+            threads: 2,
+            aof: false,
+            databases: 16,
+            maxmemory: 0,
+            loglevel: "error".to_string(),
+            io_model: kividb::config::IoModel::Tokio,
+            replicaof: None,
+            replica_announced_port: 0,
+            requirepass: "".to_string(),
+            aclfile: "".to_string(),
+            slowlog_log_slower_than: 10_000,
+            slowlog_max_len: 128,
+            cluster_enabled: false,
+            cluster_node_timeout: 15000,
+            configfile: "./kividb.conf".to_string(),
+            ..Default::default()
+        };
+        kividb::run_for_test(config);
+    });
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TOUCH
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Manual scenario:
+//   SET a "1"
+//   SET b "2"
+//   TOUCH a b nosuch   → 2  (only a and b exist)
+//   TOUCH nosuch       → 0
+#[test]
+fn test_touch_existing_keys() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "a", "1"]);
+    c.cmds(&["SET", "b", "2"]);
+
+    assert_eq!(c.cmds(&["TOUCH", "a", "b", "nosuch"]).as_int(), 2);
+    assert_eq!(c.cmds(&["TOUCH", "nosuch"]).as_int(), 0);
+}
+
+// TOUCH on a key that has expired returns 0 (expired = absent).
+#[test]
+fn test_touch_expired_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "v"]);
+    c.cmds(&["PEXPIRE", "k", "50"]); // expire in 50 ms
+    thread::sleep(Duration::from_millis(150));
+
+    assert_eq!(c.cmds(&["TOUCH", "k"]).as_int(), 0);
+}
+
+// TOUCH with no args returns an error.
+#[test]
+fn test_touch_no_args() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["TOUCH"]).is_error());
+}
+
+// TOUCH does not modify the key's TTL.
+#[test]
+fn test_touch_preserves_ttl() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "v"]);
+    c.cmds(&["EXPIRE", "k", "100"]);
+    let ttl_before = c.cmds(&["TTL", "k"]).as_int();
+
+    c.cmds(&["TOUCH", "k"]);
+    let ttl_after = c.cmds(&["TTL", "k"]).as_int();
+
+    // TTL should be unchanged (within 1 second of drift)
+    assert!((ttl_before - ttl_after).abs() <= 1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OBJECT REFCOUNT
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Manual scenario:
+//   SET k "hello"
+//   OBJECT REFCOUNT k   → 1
+//   OBJECT REFCOUNT nosuch → nil
+#[test]
+fn test_object_refcount_existing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "hello"]);
+    assert_eq!(c.cmds(&["OBJECT", "REFCOUNT", "k"]).as_int(), 1);
+}
+
+#[test]
+fn test_object_refcount_missing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["OBJECT", "REFCOUNT", "nosuch"]).is_nil());
+}
+
+// OBJECT REFCOUNT works on all value types, always returns 1.
+#[test]
+fn test_object_refcount_all_types() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "str_k", "hello"]);
+    c.cmds(&["LPUSH", "list_k", "a"]);
+    c.cmds(&["HSET", "hash_k", "f", "v"]);
+    c.cmds(&["SADD", "set_k", "m"]);
+    c.cmds(&["ZADD", "zset_k", "1.0", "m"]);
+
+    for key in &["str_k", "list_k", "hash_k", "set_k", "zset_k"] {
+        assert_eq!(
+            c.cmds(&["OBJECT", "REFCOUNT", key]).as_int(),
+            1,
+            "OBJECT REFCOUNT {key} should be 1"
+        );
+    }
+}
+
+// OBJECT REFCOUNT on an expired key returns nil.
+#[test]
+fn test_object_refcount_expired() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "v"]);
+    c.cmds(&["PEXPIRE", "k", "50"]);
+    thread::sleep(Duration::from_millis(150));
+
+    assert!(c.cmds(&["OBJECT", "REFCOUNT", "k"]).is_nil());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DUMP / RESTORE
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Round-trip a string value: DUMP → RESTORE → GET.
+#[test]
+fn test_dump_restore_string() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "src", "hello_world"]);
+    let payload = c.cmds(&["DUMP", "src"]);
+    assert!(
+        !payload.is_nil(),
+        "DUMP should return non-nil for existing key"
+    );
+
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    // Restore into a different key with no TTL
+    let payload_arg: Vec<&[u8]> = vec![b"RESTORE", b"dst", b"0", payload_bytes.as_slice()];
+    assert!(c.cmd(&payload_arg).is_ok());
+    assert_eq!(c.cmds(&["GET", "dst"]).as_str(), "hello_world");
+}
+
+// DUMP on a missing key returns nil.
+#[test]
+fn test_dump_missing_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["DUMP", "nosuch"]).is_nil());
+}
+
+// Round-trip a list value.
+#[test]
+fn test_dump_restore_list() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "src", "a"]);
+    c.cmds(&["RPUSH", "src", "b"]);
+    c.cmds(&["RPUSH", "src", "c"]);
+
+    let payload = c.cmds(&["DUMP", "src"]);
+    assert!(!payload.is_nil());
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    let args: Vec<&[u8]> = vec![b"RESTORE", b"dst", b"0", payload_bytes.as_slice()];
+    assert!(c.cmd(&args).is_ok());
+
+    let range = c.cmds(&["LRANGE", "dst", "0", "-1"]);
+    let elems: Vec<&str> = range.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(elems, vec!["a", "b", "c"]);
+}
+
+// Round-trip a hash value.
+#[test]
+fn test_dump_restore_hash() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["HSET", "src", "field1", "value1", "field2", "value2"]);
+
+    let payload = c.cmds(&["DUMP", "src"]);
+    assert!(!payload.is_nil());
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    let args: Vec<&[u8]> = vec![b"RESTORE", b"dst", b"0", payload_bytes.as_slice()];
+    assert!(c.cmd(&args).is_ok());
+
+    assert_eq!(c.cmds(&["HGET", "dst", "field1"]).as_str(), "value1");
+    assert_eq!(c.cmds(&["HGET", "dst", "field2"]).as_str(), "value2");
+}
+
+// RESTORE with TTL — the restored key should have an expiry.
+#[test]
+fn test_restore_with_ttl() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "src", "ttl_test"]);
+    let payload = c.cmds(&["DUMP", "src"]);
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    // Restore with 10 second TTL
+    let args: Vec<&[u8]> = vec![b"RESTORE", b"dst", b"10000", payload_bytes.as_slice()];
+    assert!(c.cmd(&args).is_ok());
+
+    let pttl = c.cmds(&["PTTL", "dst"]).as_int();
+    assert!(
+        pttl > 0 && pttl <= 10_000,
+        "expected PTTL in (0,10000], got {pttl}"
+    );
+}
+
+// RESTORE without REPLACE fails if destination key exists.
+#[test]
+fn test_restore_busykey() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "src", "hello"]);
+    c.cmds(&["SET", "dst", "already_here"]);
+
+    let payload = c.cmds(&["DUMP", "src"]);
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    let args: Vec<&[u8]> = vec![b"RESTORE", b"dst", b"0", payload_bytes.as_slice()];
+    assert!(c.cmd(&args).is_error(), "RESTORE should fail with BUSYKEY");
+}
+
+// RESTORE with REPLACE overwrites an existing key.
+#[test]
+fn test_restore_with_replace() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "src", "new_value"]);
+    c.cmds(&["SET", "dst", "old_value"]);
+
+    let payload = c.cmds(&["DUMP", "src"]);
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    let args: Vec<&[u8]> = vec![
+        b"RESTORE",
+        b"dst",
+        b"0",
+        payload_bytes.as_slice(),
+        b"REPLACE",
+    ];
+    assert!(c.cmd(&args).is_ok());
+    assert_eq!(c.cmds(&["GET", "dst"]).as_str(), "new_value");
+}
+
+// DUMP on an expired key returns nil.
+#[test]
+fn test_dump_expired_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "v"]);
+    c.cmds(&["PEXPIRE", "k", "50"]);
+    thread::sleep(Duration::from_millis(150));
+
+    assert!(c.cmds(&["DUMP", "k"]).is_nil());
+}
+
+// Round-trip a set value.
+#[test]
+fn test_dump_restore_set() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SADD", "src", "alpha", "beta", "gamma"]);
+
+    let payload = c.cmds(&["DUMP", "src"]);
+    assert!(!payload.is_nil());
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    let args: Vec<&[u8]> = vec![b"RESTORE", b"dst", b"0", payload_bytes.as_slice()];
+    assert!(c.cmd(&args).is_ok());
+
+    assert_eq!(c.cmds(&["SCARD", "dst"]).as_int(), 3);
+    assert_eq!(c.cmds(&["SISMEMBER", "dst", "alpha"]).as_int(), 1);
+    assert_eq!(c.cmds(&["SISMEMBER", "dst", "beta"]).as_int(), 1);
+    assert_eq!(c.cmds(&["SISMEMBER", "dst", "gamma"]).as_int(), 1);
+}
+
+// Round-trip a sorted set value.
+#[test]
+fn test_dump_restore_sortedset() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["ZADD", "src", "1.0", "one"]);
+    c.cmds(&["ZADD", "src", "2.0", "two"]);
+    c.cmds(&["ZADD", "src", "3.0", "three"]);
+
+    let payload = c.cmds(&["DUMP", "src"]);
+    assert!(!payload.is_nil());
+    let payload_bytes = payload.as_bytes().to_vec();
+
+    let args: Vec<&[u8]> = vec![b"RESTORE", b"dst", b"0", payload_bytes.as_slice()];
+    assert!(c.cmd(&args).is_ok());
+
+    assert_eq!(c.cmds(&["ZCARD", "dst"]).as_int(), 3);
+    assert_eq!(c.cmds(&["ZSCORE", "dst", "two"]).as_str(), "2");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SORT / SORT_RO
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Basic numeric sort on a list (ascending, the default).
+//   RPUSH nums 3 1 2
+//   SORT nums   → [1, 2, 3]
+#[test]
+fn test_sort_list_numeric_asc() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "3", "1", "2"]);
+    let result = c.cmds(&["SORT", "nums"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["1", "2", "3"]);
+}
+
+// Numeric sort descending.
+#[test]
+fn test_sort_list_numeric_desc() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "3", "1", "2"]);
+    let result = c.cmds(&["SORT", "nums", "DESC"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["3", "2", "1"]);
+}
+
+// ALPHA sort on a list.
+#[test]
+fn test_sort_list_alpha() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "words", "banana", "apple", "cherry"]);
+    let result = c.cmds(&["SORT", "words", "ALPHA"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["apple", "banana", "cherry"]);
+}
+
+// ALPHA DESC.
+#[test]
+fn test_sort_list_alpha_desc() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "words", "banana", "apple", "cherry"]);
+    let result = c.cmds(&["SORT", "words", "ALPHA", "DESC"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["cherry", "banana", "apple"]);
+}
+
+// LIMIT offset count.
+//   RPUSH nums 5 3 1 4 2
+//   SORT nums LIMIT 1 3   → [2, 3, 4]  (sorted=[1,2,3,4,5], skip 1, take 3)
+#[test]
+fn test_sort_limit() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "5", "3", "1", "4", "2"]);
+    let result = c.cmds(&["SORT", "nums", "LIMIT", "1", "3"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["2", "3", "4"]);
+}
+
+// LIMIT with offset beyond the list length returns empty array.
+#[test]
+fn test_sort_limit_offset_beyond_end() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "1", "2", "3"]);
+    let result = c.cmds(&["SORT", "nums", "LIMIT", "10", "5"]);
+    assert_eq!(result.as_array().len(), 0);
+}
+
+// SORT on a set.
+#[test]
+fn test_sort_set_numeric() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SADD", "nums", "30", "10", "20"]);
+    let result = c.cmds(&["SORT", "nums"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["10", "20", "30"]);
+}
+
+// SORT on a sorted set (members only, numeric).
+#[test]
+fn test_sort_zset_alpha() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["ZADD", "z", "1", "cherry"]);
+    c.cmds(&["ZADD", "z", "2", "apple"]);
+    c.cmds(&["ZADD", "z", "3", "banana"]);
+    let result = c.cmds(&["SORT", "z", "ALPHA"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["apple", "banana", "cherry"]);
+}
+
+// SORT STORE writes result as a list and returns the count.
+#[test]
+fn test_sort_store() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "src", "3", "1", "2"]);
+    let count = c.cmds(&["SORT", "src", "STORE", "dst"]).as_int();
+    assert_eq!(count, 3);
+
+    // Result should be stored as a sorted list
+    let range = c.cmds(&["LRANGE", "dst", "0", "-1"]);
+    let vals: Vec<&str> = range.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["1", "2", "3"]);
+
+    // Stored key is a list
+    assert_eq!(c.cmds(&["TYPE", "dst"]).as_str(), "list");
+}
+
+// SORT STORE on empty result deletes the destination key.
+#[test]
+fn test_sort_store_empty_deletes_dst() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // dst already exists
+    c.cmds(&["SET", "dst", "old_value"]);
+    // src doesn't exist — SORT of missing key returns empty
+    let count = c.cmds(&["SORT", "nosuch_src", "STORE", "dst"]).as_int();
+    assert_eq!(count, 0);
+    // dst should be deleted since result was empty
+    assert_eq!(c.cmds(&["EXISTS", "dst"]).as_int(), 0);
+}
+
+// SORT on missing key returns empty array (not error).
+#[test]
+fn test_sort_missing_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["SORT", "nosuch"]);
+    assert_eq!(result.as_array().len(), 0);
+}
+
+// SORT on non-numeric values without ALPHA returns error.
+#[test]
+fn test_sort_non_numeric_without_alpha_errors() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "words", "foo", "bar"]);
+    assert!(c.cmds(&["SORT", "words"]).is_error());
+}
+
+// SORT on a wrong-type key (e.g., a hash) returns WRONGTYPE error.
+#[test]
+fn test_sort_wrong_type() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["HSET", "h", "f", "v"]);
+    assert!(c.cmds(&["SORT", "h"]).is_error());
+}
+
+// SORT_RO is identical to SORT but rejects STORE.
+#[test]
+fn test_sort_ro_basic() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "3", "1", "2"]);
+    let result = c.cmds(&["SORT_RO", "nums"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["1", "2", "3"]);
+}
+
+#[test]
+fn test_sort_ro_rejects_store() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "1", "2", "3"]);
+    assert!(c.cmds(&["SORT_RO", "nums", "STORE", "dst"]).is_error());
+}
+
+// SORT with LIMIT 0 -1 means all (count=-1 treated as unlimited).
+// Redis uses -1 to mean "rest of the list", but our parser uses i64 and
+// treats negative count as unlimited.
+#[test]
+fn test_sort_limit_all() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "3", "1", "2"]);
+    // LIMIT 0 -1 means skip 0, take all
+    let result = c.cmds(&["SORT", "nums", "LIMIT", "0", "-1"]);
+    let vals: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["1", "2", "3"]);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TIME
+// ═════════════════════════════════════════════════════════════════════════════
+
+// TIME returns a two-element array of bulk strings:
+//   [unix_seconds, microseconds_within_second]
+#[test]
+fn test_time_returns_two_element_array() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["TIME"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2, "TIME must return exactly 2 elements");
+
+    // First element: Unix timestamp in seconds
+    let secs: u64 = arr[0]
+        .as_str()
+        .parse()
+        .expect("TIME[0] must be a valid u64");
+    // Second element: microseconds within the second (0..999999)
+    let micros: u64 = arr[1]
+        .as_str()
+        .parse()
+        .expect("TIME[1] must be a valid u64");
+
+    // Sanity check: seconds should be a plausible Unix timestamp (after 2024-01-01)
+    assert!(secs > 1_700_000_000, "TIME seconds looks wrong: {secs}");
+    // Microseconds must be in range
+    assert!(
+        micros < 1_000_000,
+        "TIME microseconds out of range: {micros}"
+    );
+}
+
+// Two successive TIME calls should return non-decreasing values.
+#[test]
+fn test_time_is_monotonically_non_decreasing() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let t1 = c.cmds(&["TIME"]);
+    let t2 = c.cmds(&["TIME"]);
+
+    let secs1: u64 = t1.as_array()[0].as_str().parse().unwrap();
+    let micros1: u64 = t1.as_array()[1].as_str().parse().unwrap();
+    let secs2: u64 = t2.as_array()[0].as_str().parse().unwrap();
+    let micros2: u64 = t2.as_array()[1].as_str().parse().unwrap();
+
+    let ts1 = secs1 * 1_000_000 + micros1;
+    let ts2 = secs2 * 1_000_000 + micros2;
+    assert!(ts2 >= ts1, "TIME went backwards: {ts1} then {ts2}");
+}
+
+// TIME takes no arguments (extra args should not cause a crash — Redis ignores them).
+#[test]
+fn test_time_no_args_required() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // Should succeed with no args
+    let result = c.cmds(&["TIME"]);
+    assert_eq!(result.as_array().len(), 2);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LOLWUT
+// ═════════════════════════════════════════════════════════════════════════════
+
+// LOLWUT returns a bulk string containing the version number.
+#[test]
+fn test_lolwut_contains_version() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["LOLWUT"]);
+    // Must be a non-empty string
+    assert!(!result.as_str().is_empty(), "LOLWUT returned empty string");
+    // Must mention "KiviDB" or version info somewhere
+    let text = result.as_str().to_lowercase();
+    assert!(
+        text.contains("kivi") || text.contains("version"),
+        "LOLWUT output doesn't mention KiviDB or version: {text}"
+    );
+}
+
+// LOLWUT with VERSION argument still succeeds.
+#[test]
+fn test_lolwut_with_version_arg() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["LOLWUT", "VERSION", "6"]);
+    assert!(!result.as_str().is_empty());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMMAND LIST
+// ═════════════════════════════════════════════════════════════════════════════
+
+// COMMAND LIST returns a non-empty array of command name strings.
+#[test]
+fn test_command_list_returns_array() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "LIST"]);
+    let arr = result.as_array();
+    assert!(!arr.is_empty(), "COMMAND LIST returned empty array");
+
+    // Every element should be a non-empty string
+    for item in arr {
+        let s = item.as_str();
+        assert!(!s.is_empty(), "COMMAND LIST contained empty string");
+    }
+}
+
+// COMMAND LIST contains all known PR1 commands.
+#[test]
+fn test_command_list_contains_pr1_commands() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "LIST"]);
+    let commands: Vec<String> = result
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_uppercase())
+        .collect();
+
+    for cmd in &[
+        "TOUCH", "DUMP", "RESTORE", "SORT", "SORT_RO", "TIME", "LOLWUT",
+    ] {
+        assert!(
+            commands.contains(&cmd.to_string()),
+            "COMMAND LIST missing: {cmd}"
+        );
+    }
+}
+
+// COMMAND LIST FILTERBY PATTERN filters by glob.
+#[test]
+fn test_command_list_filterby_pattern() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "LIST", "FILTERBY", "PATTERN", "z*"]);
+    let commands: Vec<String> = result
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_uppercase())
+        .collect();
+
+    // All returned commands must start with Z
+    for cmd in &commands {
+        assert!(
+            cmd.starts_with('Z'),
+            "COMMAND LIST FILTERBY PATTERN z* returned non-Z command: {cmd}"
+        );
+    }
+    // And known Z commands must be present
+    assert!(commands.contains(&"ZADD".to_string()));
+    assert!(commands.contains(&"ZRANGE".to_string()));
+}
+
+// COMMAND LIST FILTERBY MODULE returns empty (no modules loaded).
+#[test]
+fn test_command_list_filterby_module_empty() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "LIST", "FILTERBY", "MODULE", "nonexistent"]);
+    assert_eq!(result.as_array().len(), 0);
+}
+
+// COMMAND LIST FILTERBY ACLCAT returns commands in that category.
+#[test]
+fn test_command_list_filterby_aclcat() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "LIST", "FILTERBY", "ACLCAT", "string"]);
+    let commands: Vec<String> = result
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_uppercase())
+        .collect();
+
+    // String category must contain GET and SET
+    assert!(commands.contains(&"GET".to_string()));
+    assert!(commands.contains(&"SET".to_string()));
+    assert!(commands.contains(&"APPEND".to_string()));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMMAND GETKEYS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// COMMAND GETKEYS SET key value → [key]
+#[test]
+fn test_command_getkeys_set() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "SET", "mykey", "myval"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["mykey"]);
+}
+
+// COMMAND GETKEYS GET key → [key]
+#[test]
+fn test_command_getkeys_get() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "GET", "mykey"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["mykey"]);
+}
+
+// COMMAND GETKEYS MSET k1 v1 k2 v2 → [k1, k2]
+#[test]
+fn test_command_getkeys_mset() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "MSET", "k1", "v1", "k2", "v2"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["k1", "k2"]);
+}
+
+// COMMAND GETKEYS MGET k1 k2 k3 → [k1, k2, k3]
+#[test]
+fn test_command_getkeys_mget() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "MGET", "k1", "k2", "k3"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["k1", "k2", "k3"]);
+}
+
+// COMMAND GETKEYS RENAME src dst → [src, dst]
+#[test]
+fn test_command_getkeys_rename() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "RENAME", "src", "dst"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["src", "dst"]);
+}
+
+// COMMAND GETKEYS DEL k1 k2 k3 → [k1, k2, k3]
+#[test]
+fn test_command_getkeys_del() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "DEL", "k1", "k2", "k3"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["k1", "k2", "k3"]);
+}
+
+// COMMAND GETKEYS ZADD key score member → [key]
+#[test]
+fn test_command_getkeys_zadd() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "ZADD", "myzset", "1.0", "member"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["myzset"]);
+}
+
+// COMMAND GETKEYS XREAD STREAMS k1 k2 0-0 0-0 → [k1, k2]
+#[test]
+fn test_command_getkeys_xread() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&[
+        "COMMAND", "GETKEYS", "XREAD", "STREAMS", "stream1", "stream2", "0-0", "0-0",
+    ]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["stream1", "stream2"]);
+}
+
+// COMMAND GETKEYS with unknown command returns error.
+#[test]
+fn test_command_getkeys_unknown_command() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(
+        c.cmds(&["COMMAND", "GETKEYS", "NOTACOMMAND", "arg"])
+            .is_error()
+    );
+}
+
+// COMMAND GETKEYS with no subcommand args returns error.
+#[test]
+fn test_command_getkeys_no_args() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["COMMAND", "GETKEYS"]).is_error());
+}
+
+// COMMAND GETKEYS SORT key → [key]
+#[test]
+fn test_command_getkeys_sort() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "SORT", "mylist"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["mylist"]);
+}
+
+// COMMAND GETKEYS TOUCH k1 k2 → [k1, k2]
+#[test]
+fn test_command_getkeys_touch() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "TOUCH", "k1", "k2"]);
+    let keys: Vec<&str> = result.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(keys, vec!["k1", "k2"]);
+}
+
+// COMMAND GETKEYS TIME → an error, as in Redis: TIME takes no keys
+#[test]
+fn test_command_getkeys_time_no_keys() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYS", "TIME"]);
+    assert_eq!(
+        result,
+        RespValue::Error("ERR The command has no key arguments".to_string())
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// COMMAND GETKEYSANDFLAGS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// The flags are Redis's key-specification flags: how the key is opened
+// (RO, RW, OW, RM) and what is done with its value (access, update, insert,
+// delete).
+
+// COMMAND GETKEYSANDFLAGS SET key value → [[key, [OW, update]]]
+#[test]
+fn test_command_getkeysandflags_set() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYSANDFLAGS", "SET", "mykey", "myval"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 1);
+
+    let entry = arr[0].as_array();
+    assert_eq!(entry.len(), 2);
+    assert_eq!(entry[0].as_str(), "mykey");
+
+    let flags: Vec<&str> = entry[1].as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(flags, ["OW", "update"]);
+}
+
+// COMMAND GETKEYSANDFLAGS GET key → [[key, [RO, access]]]
+#[test]
+fn test_command_getkeysandflags_get() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYSANDFLAGS", "GET", "mykey"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 1);
+
+    let entry = arr[0].as_array();
+    let flags: Vec<&str> = entry[1].as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(flags, ["RO", "access"]);
+}
+
+// COMMAND GETKEYSANDFLAGS RENAME src dst → [[src, [RW, access, delete]], [dst, [OW, update]]]
+#[test]
+fn test_command_getkeysandflags_rename() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let result = c.cmds(&["COMMAND", "GETKEYSANDFLAGS", "RENAME", "src", "dst"]);
+    let arr = result.as_array();
+    assert_eq!(arr.len(), 2);
+
+    let src_entry = arr[0].as_array();
+    assert_eq!(src_entry[0].as_str(), "src");
+    let src_flags: Vec<&str> = src_entry[1].as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(src_flags, ["RW", "access", "delete"]);
+
+    let dst_entry = arr[1].as_array();
+    assert_eq!(dst_entry[0].as_str(), "dst");
+    let dst_flags: Vec<&str> = dst_entry[1].as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(dst_flags, ["OW", "update"]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SORT BY <external-pattern> and GET <external-pattern>
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// SORT BY <pattern>: sort a list by external string key values.
+// weight_* → for each element e, look up key "weight_{e}" as a string,
+// parse as f64, use as the sort key.
+#[test]
+fn test_sort_by_external_string_key() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    // List elements are IDs; weight_* keys hold their sort scores
+    c.cmds(&["RPUSH", "items", "item3", "item1", "item2"]);
+    c.cmds(&["SET", "weight_item1", "10"]);
+    c.cmds(&["SET", "weight_item2", "5"]);
+    c.cmds(&["SET", "weight_item3", "20"]);
+
+    let r = c.cmds(&["SORT", "items", "BY", "weight_*", "ALPHA"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    // Sorted by weight: item2(5) < item1(10) < item3(20)
+    assert_eq!(vals, vec!["item2", "item1", "item3"]);
+}
+
+// SORT BY DESC with external keys
+#[test]
+fn test_sort_by_external_key_desc() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "a", "b", "c"]);
+    c.cmds(&["SET", "score_a", "1"]);
+    c.cmds(&["SET", "score_b", "3"]);
+    c.cmds(&["SET", "score_c", "2"]);
+
+    let r = c.cmds(&["SORT", "ids", "BY", "score_*", "DESC", "ALPHA"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["b", "c", "a"]);
+}
+
+// SORT BY missing external key: missing keys sort as 0.0 (numeric default)
+#[test]
+fn test_sort_by_missing_external_key_sorts_as_zero() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "x", "y", "z"]);
+    c.cmds(&["SET", "score_z", "5"]);
+    // score_x and score_y don't exist — treated as 0.0
+
+    let r = c.cmds(&["SORT", "ids", "BY", "score_*", "ALPHA"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    // x(0) and y(0) tie — stable within ties; z(5) is last
+    assert_eq!(vals[2], "z", "z with score 5 must be last");
+    // x and y (both 0) must be in the first two positions
+    let first_two: std::collections::HashSet<&str> = vals[..2].iter().copied().collect();
+    assert!(first_two.contains("x") && first_two.contains("y"));
+}
+
+// SORT BY hash field: "hash_*->field" syntax
+#[test]
+fn test_sort_by_hash_field() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "users", "u1", "u2", "u3"]);
+    c.cmds(&["HSET", "user_u1", "age", "30"]);
+    c.cmds(&["HSET", "user_u2", "age", "25"]);
+    c.cmds(&["HSET", "user_u3", "age", "35"]);
+
+    let r = c.cmds(&["SORT", "users", "BY", "user_*->age", "ALPHA"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    // Sorted by age: u2(25) < u1(30) < u3(35)
+    assert_eq!(vals, vec!["u2", "u1", "u3"]);
+}
+
+// SORT BY hash field DESC
+#[test]
+fn test_sort_by_hash_field_desc() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "users", "u1", "u2", "u3"]);
+    c.cmds(&["HSET", "user_u1", "score", "100"]);
+    c.cmds(&["HSET", "user_u2", "score", "200"]);
+    c.cmds(&["HSET", "user_u3", "score", "150"]);
+
+    let r = c.cmds(&["SORT", "users", "BY", "user_*->score", "DESC", "ALPHA"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["u2", "u3", "u1"]);
+}
+
+// GET <pattern>: return external string key values instead of elements
+#[test]
+fn test_sort_get_external_string() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "3", "1", "2"]);
+    c.cmds(&["SET", "name_1", "alice"]);
+    c.cmds(&["SET", "name_2", "bob"]);
+    c.cmds(&["SET", "name_3", "carol"]);
+
+    // Sort numerically (1, 2, 3), GET the name for each
+    let r = c.cmds(&["SORT", "ids", "GET", "name_*"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["alice", "bob", "carol"]);
+}
+
+// GET hash->field: return a hash field for each element
+#[test]
+fn test_sort_get_hash_field() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "3", "1", "2"]);
+    c.cmds(&["HSET", "obj_1", "name", "alice", "city", "NYC"]);
+    c.cmds(&["HSET", "obj_2", "name", "bob", "city", "LA"]);
+    c.cmds(&["HSET", "obj_3", "name", "carol", "city", "SF"]);
+
+    // Sort numerically (1→alice, 2→bob, 3→carol)
+    let r = c.cmds(&["SORT", "ids", "GET", "obj_*->name"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["alice", "bob", "carol"]);
+}
+
+// GET # and GET hash->field together: multiple GET patterns → multiple values per element
+#[test]
+fn test_sort_get_hash_field_with_self() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "2", "1"]);
+    c.cmds(&["HSET", "obj_1", "name", "alice"]);
+    c.cmds(&["HSET", "obj_2", "name", "bob"]);
+
+    // GET # returns the element itself; GET obj_*->name returns the name
+    // For element "1": ["1", "alice"], for element "2": ["2", "bob"]
+    let r = c.cmds(&["SORT", "ids", "GET", "#", "GET", "obj_*->name"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    // Sorted numerically: 1 then 2
+    // Interleaved: [id, name, id, name]
+    assert_eq!(vals, vec!["1", "alice", "2", "bob"]);
+}
+
+// GET missing external key → nil in results
+#[test]
+fn test_sort_get_missing_key_returns_nil() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "1", "2"]);
+    c.cmds(&["SET", "name_1", "alice"]);
+    // name_2 doesn't exist
+
+    let r = c.cmds(&["SORT", "ids", "GET", "name_*"]);
+    let arr = r.as_array();
+    assert_eq!(arr[0].as_str(), "alice");
+    assert!(arr[1].is_nil(), "missing GET key should return nil");
+}
+
+// BY + GET combined: sort by weight, return name
+#[test]
+fn test_sort_by_and_get_combined() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "users", "u1", "u2", "u3"]);
+    c.cmds(&["HSET", "user_u1", "age", "30", "name", "alice"]);
+    c.cmds(&["HSET", "user_u2", "age", "25", "name", "bob"]);
+    c.cmds(&["HSET", "user_u3", "age", "35", "name", "carol"]);
+
+    // Sort by age, return name
+    let r = c.cmds(&[
+        "SORT",
+        "users",
+        "BY",
+        "user_*->age",
+        "GET",
+        "user_*->name",
+        "ALPHA",
+    ]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    // u2(25) → bob, u1(30) → alice, u3(35) → carol
+    assert_eq!(vals, vec!["bob", "alice", "carol"]);
+}
+
+// BY + GET + LIMIT
+#[test]
+fn test_sort_by_get_with_limit() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "a", "b", "c", "d", "e"]);
+    c.cmds(&["SET", "weight_a", "5"]);
+    c.cmds(&["SET", "weight_b", "2"]);
+    c.cmds(&["SET", "weight_c", "8"]);
+    c.cmds(&["SET", "weight_d", "1"]);
+    c.cmds(&["SET", "weight_e", "4"]);
+    c.cmds(&["SET", "label_a", "A"]);
+    c.cmds(&["SET", "label_b", "B"]);
+    c.cmds(&["SET", "label_c", "C"]);
+    c.cmds(&["SET", "label_d", "D"]);
+    c.cmds(&["SET", "label_e", "E"]);
+
+    // Sort by weight ASC, return label, take middle 3 (LIMIT 1 3)
+    // Sorted order by weight: d(1), b(2), e(4), a(5), c(8)
+    // LIMIT 1 3 → skip d, take b, e, a
+    let r = c.cmds(&[
+        "SORT", "ids", "BY", "weight_*", "GET", "label_*", "LIMIT", "1", "3", "ALPHA",
+    ]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["B", "E", "A"]);
+}
+
+// BY + GET + STORE: store sorted-by-external results as a list
+#[test]
+fn test_sort_by_external_store() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "ids", "x", "y", "z"]);
+    c.cmds(&["SET", "w_x", "30"]);
+    c.cmds(&["SET", "w_y", "10"]);
+    c.cmds(&["SET", "w_z", "20"]);
+
+    let count = c
+        .cmds(&["SORT", "ids", "BY", "w_*", "STORE", "sorted", "ALPHA"])
+        .as_int();
+    assert_eq!(count, 3);
+
+    let binding = c.cmds(&["LRANGE", "sorted", "0", "-1"]);
+    let vals: Vec<&str> = binding.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["y", "z", "x"]);
+}
+
+// SORT on a set BY external hash field
+#[test]
+fn test_sort_set_by_hash_field() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SADD", "members", "p1", "p2", "p3"]);
+    c.cmds(&["HSET", "data_p1", "rank", "3"]);
+    c.cmds(&["HSET", "data_p2", "rank", "1"]);
+    c.cmds(&["HSET", "data_p3", "rank", "2"]);
+
+    let r = c.cmds(&["SORT", "members", "BY", "data_*->rank", "ALPHA"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["p2", "p3", "p1"]);
+}
+
+// BY nosort still works (regression: must not be broken by external key path)
+#[test]
+fn test_sort_by_nosort_unchanged() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "items", "c", "a", "b"]);
+    let r = c.cmds(&["SORT", "items", "BY", "nosort", "ALPHA"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    // BY nosort = keep insertion order
+    assert_eq!(vals, vec!["c", "a", "b"]);
+}
+
+// GET # still works (regression)
+#[test]
+fn test_sort_get_hash_self_unchanged() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "nums", "3", "1", "2"]);
+    let r = c.cmds(&["SORT", "nums", "GET", "#"]);
+    let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(vals, vec!["1", "2", "3"]);
+}

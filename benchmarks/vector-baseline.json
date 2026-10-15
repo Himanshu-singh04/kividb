@@ -1,0 +1,52 @@
+{
+  "$schema": "vector-benchmark-baseline-v2",
+  "_provenance": "Seeded 2026-07-26 from a real run: redis-performance/vector-db-benchmark (v0, commit 02bb200c3845edde804f7608a8341a023e9d0e0c) redis-m-16-ef-128 config, glove-25-angular dataset (1,183,514 vectors, 25-dim), kividb (this repo's HEAD, including the ACL default-user fix) and redis/redis-stack-server:latest, both single-instance, same host (Docker on WSL2/Ubuntu). Update via `workflow_dispatch` with update_baseline=true after a reviewed, intentional change -- never hand-edit the numbers without a real run backing them.",
+  "_honesty_note": "Search: kividb clearly and consistently outperforms Redis Stack here (~2.3-2.5x RPS at every ef tier), matching and exceeding the publicly published comparison. Ingestion: kividb was SLOWER than Redis Stack in this run (913.7s vs 516.2s total time-to-queryable) -- the OPPOSITE of the published '4.7x faster' ingestion claim. This was verified against the tool's own source (engine/clients/redis/upload.py's post_upload polls FT.INFO's percent_indexed to 100% before stopping the clock, so this is a real total-time-to-queryable number, not a partial one). Not investigated further here -- gates below hold kividb to *not regressing further* from today's real, measured numbers, not to the marketing claim.",
+  "_known_calibration_gap": "These numbers were measured on a 16-core dev machine, where kividb's src/config.rs resolve_threads() (available_parallelism() - 2) gives it 14 worker threads. The actual CI target (.github/workflows/vector-benchmark.yml, t3.xlarge = 4 vCPUs) only gives kividb 2 threads -- confirmed live (2026-07-26) by forcing --threads 2 on this same dev machine against the same real dataset: results dropped to the 500-1600 QPS range, matching the first real t3.xlarge CI run's 450-950 QPS (the residual gap is Redis Stack sharing the same 4 vCPUs concurrently in CI, which this isolated local test didn't reproduce). Redis Stack's search path is far less sensitive to this than kividb's HNSW path is, which is why the competitive ratio (not just the absolute numbers) looked far worse on the small instance. Conclusion: the first CI run's REGRESSED verdict was a baseline/hardware mismatch, not a real code regression.",
+  "_stale_pending_recalibration": "The workflow has moved twice since these numbers were captured (2026-07-26): (1) x86 t3.xlarge/EF_CONSTRUCTION=128/the old Python v0 tool -> ARM (Graviton)/EF_CONSTRUCTION=256/kividbio's Rust vector-db-benchmark fork (dedicated kividb engine, merged upstream as redis/vector-db-benchmark#203 on 2026-07-26); (2) single shared instance (t4g.xlarge, burstable, running both the server AND the 100-thread client) -> a dedicated server + client pair in one cluster placement group (c7gn.12xlarge/c7gn.16xlarge by default), matching kivi-benchmark's memtier topology -- the shared-instance setup was confounding kividb's real numbers with CPU contention from its own benchmark client and, on a burstable instance, credit-exhaustion throttling partway through long runs (both observed live: kividb ingest measured at 735 rec/s average, degrading over the run, on the old topology). The kividb/redis_stack number blocks below predate BOTH changes and are not comparable to a run under the current tool/config/topology -- both gates below will misfire until this file is recalibrated for real via workflow_dispatch update_baseline=true on the actual server+client topology. Do not trust a 'REGRESSED' or 'ok' verdict from this file until that has happened.",
+  "methodology": {
+    "tool": "https://github.com/redis/vector-db-benchmark (official upstream -- PR #203 added the kividb engine; the fork this file previously pointed at is no longer needed, both fixes it carried are confirmed present upstream as of tool_commit)",
+    "tool_commit": "31a28b5ae6d35da96de6d218ada209868a628b42",
+    "engine_config": "redis-m-16-ef-256",
+    "dataset": "glove-25-angular",
+    "parallels": 100,
+    "redis_stack_version": "7.4.0-v8"
+  },
+  "kividb": {
+    "ingest": { "upload_time_s": 913.7351476040003, "total_time_s": 913.7392669559999 },
+    "search_by_ef": {
+      "64": { "rps": 3279.815045351875, "p50_ms": 21.029636499861226, "p95_ms": 45.82494405021861, "precision": 0.938276 },
+      "128": { "rps": 3005.4025299207105, "p50_ms": 22.08762950021992, "p95_ms": 47.18756204988494, "precision": 0.956264 },
+      "256": { "rps": 2155.189855038597, "p50_ms": 37.567386000091574, "p95_ms": 67.3337552003204, "precision": 0.9863 },
+      "512": { "rps": 1512.7793258905451, "p50_ms": 56.85184949993527, "p95_ms": 99.2533938998804, "precision": 0.996748 }
+    }
+  },
+  "redis_stack": {
+    "ingest": { "upload_time_s": 516.2082495190002, "total_time_s": 516.2156178160003 },
+    "search_by_ef": {
+      "64": { "rps": 1405.6748314194544, "p50_ms": 66.20118099999672, "p95_ms": 99.10164925011024, "precision": 0.906661 },
+      "128": { "rps": 1264.3415544244856, "p50_ms": 73.48487450008179, "p95_ms": 113.05281769989503, "precision": 0.931971 },
+      "256": { "rps": 901.4191308196664, "p50_ms": 105.65381449987399, "p95_ms": 151.5607680497851, "precision": 0.976123 },
+      "512": { "rps": 601.2488104820611, "p50_ms": 164.49933850003617, "p95_ms": 229.4531845501978, "precision": 0.993624 }
+    }
+  },
+  "gates": {
+    "kividb_absolute": {
+      "_comment": "kividb vs its own historical numbers above. Generous tolerance -- absolute perf varies across CI instance types/loads over time; this catches a real regression, not hardware noise.",
+      "search_by_ef.64.rps": { "regression_if": "below", "tolerance_pct": 20 },
+      "search_by_ef.128.rps": { "regression_if": "below", "tolerance_pct": 20 },
+      "search_by_ef.256.rps": { "regression_if": "below", "tolerance_pct": 20 },
+      "search_by_ef.512.rps": { "regression_if": "below", "tolerance_pct": 20 },
+      "search_by_ef.512.p95_ms": { "regression_if": "above", "tolerance_pct": 40 },
+      "ingest.total_time_s": { "regression_if": "above", "tolerance_pct": 30 }
+    },
+    "kividb_vs_redis_stack_ratio": {
+      "_comment": "Computed fresh each run from both engines on the SAME instance -- much less noisy than the absolute gate above, since both numbers share whatever the CI hardware happens to be that day. min_ratio is kividb_metric/redis_stack_metric for rps (higher=better, so a floor) or redis_stack_metric/kividb_metric for *_time_s (lower=better for kividb, so also expressed as a floor on the 'kividb is faster by this factor' ratio -- currently <1.0 for ingest, being tracked honestly, not hidden).",
+      "search_by_ef.64.rps": { "kind": "kividb_over_redis_stack", "min_ratio": 2.0 },
+      "search_by_ef.128.rps": { "kind": "kividb_over_redis_stack", "min_ratio": 2.0 },
+      "search_by_ef.256.rps": { "kind": "kividb_over_redis_stack", "min_ratio": 2.0 },
+      "search_by_ef.512.rps": { "kind": "kividb_over_redis_stack", "min_ratio": 2.0 },
+      "ingest.total_time_s": { "kind": "redis_stack_over_kividb", "min_ratio": 0.4 }
+    }
+  }
+}

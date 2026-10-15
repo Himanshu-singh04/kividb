@@ -1,0 +1,34 @@
+== GAP 1: FT.CREATE rejects per-field options after TEXT / TAG / NUMERIC
+[1] FT.CREATE repro_652db8_0 ON HASH PREFIX 1 repro_652db8_0: SCHEMA f TEXT WEIGHT 1
+    -> '(error) unknown field type'
+[1] FT.CREATE repro_652db8_0 ON HASH PREFIX 1 repro_652db8_0: SCHEMA f TAG SEPARATOR ,
+    -> '(error) unknown field type'
+[1] FT.CREATE repro_652db8_0 ON HASH PREFIX 1 repro_652db8_0: SCHEMA f TEXT SORTABLE
+    -> '(error) missing field type'
+[1] FT.CREATE repro_652db8_0 ON HASH PREFIX 1 repro_652db8_0: SCHEMA f TAG CASESENSITIVE
+    -> '(error) missing field type'
+[1] FT.CREATE repro_652db8_0 ON HASH PREFIX 1 repro_652db8_0: SCHEMA f NUMERIC SORTABLE
+    -> '(error) missing field type'
+[1] FT.CREATE repro_652db8_rvl ON HASH PREFIX 1 repro_652db8_rvl SCORE 1.0 SCHEMA prompt TEXT WEIGHT 1 response TEXT WEIGHT 1 inserted_at NUMERIC updated_at NUMERIC prompt_vector VECTOR FLAT 6 TYPE FLOAT32 DIM 4 DISTANCE_METRIC COSINE litellm_cache_key TAG SEPARATOR ,
+    -> '(error) unknown field type'
+[setup] FT.CREATE repro_652db8_q ON HASH PREFIX 1 repro_652db8_q: SCHEMA prompt TEXT k TAG v VECTOR FLAT 6 TYPE FLOAT32 DIM 4 DISTANCE_METRIC COSINE
+    -> b'OK'
+
+== GAP 2: VECTOR_RANGE query returns no results (no error); same doc is found by KNN
+[2] FT.SEARCH repro_652db8_q @v:[VECTOR_RANGE $r $q]=>{$YIELD_DISTANCE_AS: d} PARAMS 4 r 0.2 q <16-byte vector> RETURN 1 d DIALECT 2
+    -> [0]
+[2] FT.SEARCH repro_652db8_q *=>[KNN 1 @v $q AS d] PARAMS 2 q <16-byte vector> RETURN 1 d DIALECT 2
+    -> [1, b'repro_652db8_q:1', [b'd', b'0.004963']]
+
+== GAP 3: non-vector FT.SEARCH returns an empty field list; RETURN / NOCONTENT ignored
+[3] FT.SEARCH repro_652db8_q @k:{abc} RETURN 1 prompt DIALECT 2
+    -> [1, b'repro_652db8_q:1', []]
+[3] FT.SEARCH repro_652db8_q * DIALECT 2
+    -> [1, b'repro_652db8_q:1', []]
+[3] FT.SEARCH repro_652db8_q * NOCONTENT DIALECT 2
+    -> [1, b'repro_652db8_q:1', []]
+
+== PARITY: FT.SEARCH reply shape under RESP3 (Redis Stack returns a map)
+[resp3] FT.SEARCH repro_652db8_q *=>[KNN 1 @v $q AS d] PARAMS 2 q <16-byte vector> RETURN 1 d DIALECT 2
+    -> [1, b'repro_652db8_q:1', [b'd', b'0.004963']]
+    reply type under RESP3: list

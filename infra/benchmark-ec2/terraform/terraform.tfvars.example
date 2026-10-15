@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars for local/manual use (do not commit secrets).
+aws_region   = "us-east-1"
+project_name = "kividb-benchmark"
+
+# Any string that's unique to this apply, e.g. your username + date.
+run_id = "local-manual-run"
+
+# `ssh-keygen -y -f ~/.ssh/id_ed25519` (or generate a new dedicated pair).
+ssh_public_key = "ssh-ed25519 AAAA... you@example.com"
+
+# Restrict SSH to your IP, e.g. "203.0.113.10/32"
+ssh_cidr = "0.0.0.0/0"
+
+# Dragonfly-style topology
+server_instance_type = "c7gn.12xlarge"
+client_instance_type = "c7gn.16xlarge"
+
+# If c7gn.12xlarge has no capacity in an AZ, set this to an AZ AWS recommends (e.g. us-east-1f).
+# When unset, Terraform uses the region's "a" AZ (e.g. us-east-1a), not a random default-VPC subnet.
+# availability_zone = "us-east-1f"
+
+# Cluster PG packs both instances on the same rack. That is what stalls
+# `aws_instance.server: Still creating...` after the 16xlarge client is already up.
+# use_placement_group = false
+
+# Or pin an explicit subnet instead of availability_zone:
+# subnet_id = "subnet-xxxxxxxx"
+
+# Leave the client as a plain instance for manual use. CI sets these instead:
+# register_github_runner           = true
+# github_repository                = "kividbio/kividb"
+# github_runner_registration_token = "..."

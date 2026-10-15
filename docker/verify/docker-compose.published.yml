@@ -1,0 +1,102 @@
+# Same 4-variant + runner topology as docker-compose.yml, but pulling the
+# already-published images for a given release tag instead of building from
+# the local Dockerfile. Used by smoke-test.yml's `container-verify` job: it
+# runs the exact same checks (run-checks.sh, unchanged) against what
+# release.yml actually published to ghcr.io, rather than against a
+# from-source build — the point being to catch a class of bug docker-compose.yml
+# can't (e.g. a build-arg/feature-flag wiring bug that CI's own build step
+# shares, which a from-source rebuild in this harness would silently
+# reproduce rather than expose).
+#
+# Requires KIVIDB_IMAGE (base ref, e.g. ghcr.io/kividbio/kividb:v1.0.4-rc1)
+# to be set in the environment before `docker compose` is invoked — see
+# verify-published.sh, which derives the four variant tags from it.
+services:
+  kividb-default:
+    image: ${KIVIDB_IMAGE}
+    pull_policy: always
+    # No --tls-port: this variant is built without the `tls` feature, and
+    # such a build refuses to start when asked for a TLS port rather than
+    # serve plaintext where TLS was asked for (it used to ignore the option).
+    # That it refuses is checked separately — see tls-refusal-check.sh.
+    command:
+      [
+        "--port", "6380",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16380:6380"
+
+  kividb-tls:
+    image: ${KIVIDB_IMAGE}-tls
+    pull_policy: always
+    command:
+      [
+        "--port", "6380",
+        "--tls-port", "6390",
+        "--tls-cert-file", "/certs/server.crt",
+        "--tls-key-file", "/certs/server.key",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16381:6380"
+      - "16391:6390"
+
+  kividb-lua:
+    image: ${KIVIDB_IMAGE}-lua
+    pull_policy: always
+    # No --tls-port: this variant is built without the `tls` feature, and
+    # such a build refuses to start when asked for a TLS port rather than
+    # serve plaintext where TLS was asked for (it used to ignore the option).
+    # That it refuses is checked separately — see tls-refusal-check.sh.
+    command:
+      [
+        "--port", "6380",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16382:6380"
+
+  kividb-full:
+    image: ${KIVIDB_IMAGE}-full
+    pull_policy: always
+    command:
+      [
+        "--port", "6380",
+        "--tls-port", "6390",
+        "--tls-cert-file", "/certs/server.crt",
+        "--tls-key-file", "/certs/server.key",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16383:6380"
+      - "16393:6390"
+
+  # Identical to docker-compose.yml's runner — same checks, unmodified.
+  runner:
+    image: redis:7-alpine
+    depends_on:
+      - kividb-default
+      - kividb-tls
+      - kividb-lua
+      - kividb-full
+    volumes:
+      - ./run-checks.sh:/run-checks.sh:ro
+      - ./certs:/certs:ro
+    entrypoint: ["sh", "/run-checks.sh"]

@@ -1,0 +1,244 @@
+// src/pause.rs
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+/// Global pause expiry in Unix milliseconds.
+/// 0 = not paused. Positive = writes are paused until this timestamp.
+pub static PAUSE_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+
+// 0 = ALL (default), 1 = WRITE only
+static PAUSE_MODE_WRITE_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set while the pause in force is a *handoff*: this node is giving slots to
+/// another (atomic slot migration) or its role to its replica (manual
+/// failover), and has paused writes to do it.
+///
+/// The pause is checked in the connection loop, long before a write enters
+/// the write gate. A handoff sets the pause, waits out the writes in flight
+/// (`write_gate::cut`) and then takes what has been written as everything
+/// there is. A write that passed the pause check an instant before the pause
+/// was set, and reaches the gate after the cut, would run behind the
+/// handoff's back: applied here, acknowledged, and never sent to the node
+/// taking over. So a write looks at this flag *inside* the gate
+/// (`handoff`), steps out again and waits for the handoff to end
+/// (`wait_out_handoff`) — and is then answered by whoever owns the key.
+///
+/// Not set for `CLIENT PAUSE`: nothing is handed over, so a write that slips
+/// past it is merely a moment late in being paused, and waiting for it in
+/// the gate would hold a worker thread for as long as the client asked.
+static HANDOFF: AtomicBool = AtomicBool::new(false);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether clients are paused, and if they are, whether it is only the ones
+/// that write (`Some(true)`) or all of them (`Some(false)`).
+pub fn active() -> Option<bool> {
+    let until = PAUSE_UNTIL_MS.load(Ordering::Relaxed);
+    if until == 0 {
+        return None;
+    }
+    if now_ms() >= until {
+        if PAUSE_UNTIL_MS
+            .compare_exchange(until, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // A handoff that ran out of time is over, like its pause.
+            HANDOFF.store(false, Ordering::Release);
+        }
+        return None;
+    }
+    Some(PAUSE_MODE_WRITE_ONLY.load(Ordering::Relaxed))
+}
+
+/// `CLIENT PAUSE timeout [WRITE | ALL]`.
+///
+/// A pause given while clients are already paused does not shorten the
+/// pause or narrow it: the later of the two ends holds, and all clients stay
+/// paused if either pause was of all of them.
+pub fn set_pause(duration_ms: i64, write_only: bool) {
+    let end = now_ms().saturating_add(duration_ms);
+    let (end, write_only) = match active() {
+        Some(was_write_only) => (
+            end.max(PAUSE_UNTIL_MS.load(Ordering::Relaxed)),
+            write_only && was_write_only,
+        ),
+        None => (end, write_only),
+    };
+    PAUSE_MODE_WRITE_ONLY.store(write_only, Ordering::Relaxed);
+    PAUSE_UNTIL_MS.store(end, Ordering::Relaxed); // gate last
+}
+
+pub fn clear_pause() {
+    PAUSE_MODE_WRITE_ONLY.store(false, Ordering::Relaxed);
+    PAUSE_UNTIL_MS.store(0, Ordering::Relaxed);
+    HANDOFF.store(false, Ordering::Release);
+}
+
+/// Pause writes for a handoff (see `HANDOFF`). The caller takes its cut
+/// through the write stream *after* this returns; `clear_pause` ends it.
+pub fn set_handoff_pause(duration_ms: i64) {
+    // The flag first, and before the caller's cut: a write that enters the
+    // gate after that cut is certain to see it.
+    HANDOFF.store(true, Ordering::SeqCst);
+    set_pause(duration_ms, true);
+}
+
+/// Whether a write that has just entered the write gate has to step out
+/// again: a handoff is under way. One atomic load when none is.
+#[inline]
+pub fn handoff() -> bool {
+    HANDOFF.load(Ordering::Acquire) && active().is_some()
+}
+
+/// Wait for the handoff to end. Called by a write command, outside the write
+/// gate, on its worker thread: a handoff lasts milliseconds, and is bounded
+/// by its pause's timeout.
+pub fn wait_out_handoff() {
+    while handoff() {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
+/// Whether `cmd` has to wait for the pause to end. `queued` is the
+/// connection's transaction, which is what an `EXEC` would run.
+///
+/// With all clients paused, every command waits — but for `CLIENT UNPAUSE`,
+/// which Redis holds too: there, a pause of everything can only run out.
+/// With only writers paused, the commands that wait are the ones that may
+/// change the dataset or the replication stream: writes, `PFCOUNT` (which
+/// may rewrite its key), `PUBLISH`, a script that has not declared itself
+/// free of writes, and an `EXEC` of a transaction holding any of those.
+///
+/// A command with the wrong number of arguments is not held: it is going to
+/// be refused whenever it runs, and is refused now.
+pub fn holds<Q: AsRef<[u8]>>(cmd: &[&[u8]], queued: &[Vec<Q>]) -> bool {
+    let Some(write_only) = active() else {
+        return false;
+    };
+    let name = String::from_utf8_lossy(cmd[0]).to_ascii_uppercase();
+    if crate::commands::arity::check(&name, cmd).is_some() {
+        return false;
+    }
+    if !write_only {
+        return !(name == "CLIENT"
+            && cmd
+                .get(1)
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"UNPAUSE")));
+    }
+    if name == "EXEC" {
+        return queued.iter().any(|command| {
+            command.first().is_some_and(|cmd0| {
+                may_replicate(
+                    &String::from_utf8_lossy(cmd0.as_ref()).to_ascii_uppercase(),
+                    command.get(1).map(|arg| arg.as_ref()),
+                )
+            })
+        });
+    }
+    may_replicate(&name, cmd.get(1).copied())
+}
+
+/// Whether running `name` — with `first`, its first argument — may write.
+fn may_replicate(name: &str, first: Option<&[u8]>) -> bool {
+    #[cfg(feature = "lua")]
+    let declared_read_only = |name: &str, first: &[u8]| match name {
+        "EVAL" => crate::commands::script_declares_no_writes(first),
+        "EVALSHA" => crate::commands::cached_script_declares_no_writes(first),
+        _ => crate::commands::function_declares_no_writes(first),
+    };
+    #[cfg(not(feature = "lua"))]
+    let declared_read_only = |_: &str, _: &[u8]| false;
+    match name {
+        "PFCOUNT" | "PUBLISH" | "SPUBLISH" => true,
+        "EVAL" | "EVALSHA" | "FCALL" => !first.is_some_and(|first| declared_read_only(name, first)),
+        "EVAL_RO" | "EVALSHA_RO" | "FCALL_RO" => false,
+        _ => crate::replication::is_write_command(name),
+    }
+}
+
+/// A client held by the pause is a blocked client, for as long as it is.
+pub struct Held;
+
+impl Held {
+    pub fn new() -> Self {
+        crate::stats::BLOCKED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+        Held
+    }
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::stats::BLOCKED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One test, because the pause is the process's.
+    #[test]
+    fn the_longer_and_the_wider_pause_holds() {
+        clear_pause();
+        assert_eq!(active(), None);
+        set_pause(60_000, true);
+        assert_eq!(active(), Some(true));
+        // A shorter pause does not end it sooner.
+        let end = PAUSE_UNTIL_MS.load(Ordering::Relaxed);
+        set_pause(10, true);
+        assert_eq!(PAUSE_UNTIL_MS.load(Ordering::Relaxed), end);
+        // A pause of everybody widens it, and a later one of writers does not
+        // narrow it again.
+        set_pause(10, false);
+        assert_eq!(active(), Some(false));
+        set_pause(10, true);
+        assert_eq!(active(), Some(false));
+
+        let none: &[Vec<Vec<u8>>] = &[];
+        assert!(holds(&[b"GET", b"k"], none));
+        assert!(!holds(&[b"CLIENT", b"UNPAUSE"], none));
+        clear_pause();
+        set_pause(60_000, true);
+        assert!(!holds(&[b"GET", b"k"], none));
+        assert!(holds(&[b"SET", b"k", b"v"], none));
+        assert!(holds(&[b"PUBLISH", b"c", b"m"], none));
+        // Refused at once, not after the pause.
+        assert!(!holds(&[b"SET", b"k"], none));
+        // An EXEC waits if what it would run does.
+        let reads = vec![vec![b"GET".to_vec(), b"k".to_vec()]];
+        let writes = vec![vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]];
+        assert!(!holds(&[b"EXEC"], &reads));
+        assert!(holds(&[b"EXEC"], &writes));
+        clear_pause();
+        assert!(!holds(&[b"SET", b"k", b"v"], none));
+
+        // A handoff is a pause of writers that writes in the gate can see;
+        // CLIENT PAUSE is not one, and it ends with its pause.
+        assert!(!handoff());
+        set_pause(60_000, true);
+        assert!(!handoff());
+        clear_pause();
+        set_handoff_pause(60_000);
+        assert!(handoff() && holds(&[b"SET", b"k", b"v"], none));
+        clear_pause();
+        assert!(!handoff());
+        set_handoff_pause(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!handoff());
+        // ... and a later CLIENT PAUSE is not mistaken for one.
+        set_pause(60_000, true);
+        assert!(!handoff());
+        clear_pause();
+    }
+}

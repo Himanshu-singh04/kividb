@@ -1,0 +1,21 @@
+KiviDB
+Copyright (c) 2026 KIVIDB PRIVATE LIMITED
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program, in the file LICENSE. If not, see
+<https://www.gnu.org/licenses/>.
+
+KiviDB is also available under a commercial license from KIVIDB PRIVATE
+LIMITED, for use on terms other than those of the AGPLv3. Write to
+support@kividb.io.
+
+Redis is a registered trademark of Redis Ltd. KiviDB is not affiliated with
+Redis Ltd.

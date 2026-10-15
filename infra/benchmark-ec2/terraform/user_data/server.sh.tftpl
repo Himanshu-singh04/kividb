@@ -1,0 +1,67 @@
+#!/bin/bash
+# Benchmark server (c7gn.12xlarge class): OS prep + warm binaries.
+# CI overwrites the KiviDB binary with a from-source build and can upgrade
+# Dragonfly/Redis independently, so this script only needs to get close.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+exec > >(tee /var/log/user-data-server.log) 2>&1
+
+KIVIDB_VERSION="${kividb_version}"
+DRAGONFLY_VERSION="${dragonfly_version}"
+KIVIDB_RELEASES_BASE="https://releases.kividb.io"
+
+apt-get update -y
+apt-get install -y wget redis-server
+
+systemctl stop redis-server || true
+systemctl disable redis-server || true
+
+cat >> /etc/security/limits.conf << 'LIMITS'
+* soft nofile 65535
+* hard nofile 65535
+LIMITS
+
+sysctl -w net.core.somaxconn=65535 || true
+grep -q '^net.core.somaxconn' /etc/sysctl.conf || echo 'net.core.somaxconn = 65535' >> /etc/sysctl.conf
+
+# Fresh AMI boots default to the ondemand/schedutil governor, which ramps
+# frequency up under load instead of running flat-out from the first request —
+# a real difference from a long-lived, already-"warmed" box. Best-effort: some
+# instance types/hypervisors don't expose cpufreq control to the guest at all.
+for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+  if [[ -w "$gov" ]]; then echo performance > "$gov" || true; fi
+done
+
+sudo -u ubuntu -H bash << EOSU
+set -euo pipefail
+cd /home/ubuntu
+
+# ── KiviDB: download pre-built binary (warm start; CI ships its own build) ──
+# The release tarball already contains its own kividb/ directory (extracting
+# it here produces /home/ubuntu/kividb/kividb directly) — do not wrap it in
+# an extra kividb/ dir, or the CI scp step's destination becomes a directory
+# and both this chmod and the workflow's later one silently miss the binary.
+if [[ ! -x /home/ubuntu/kividb/kividb ]]; then
+  echo "Downloading KiviDB $KIVIDB_VERSION..."
+  curl -fsSL "$KIVIDB_RELEASES_BASE/$KIVIDB_VERSION/kividb-linux-aarch64.tar.gz" \
+    -o kividb-linux-aarch64.tar.gz
+  tar -xzf kividb-linux-aarch64.tar.gz
+  chmod +x kividb/kividb
+  rm -f kividb-linux-aarch64.tar.gz
+fi
+echo "KiviDB warm binary ready."
+
+# ── Dragonfly: download pre-built binary ─────────────────────────────────────
+if [[ ! -x /home/ubuntu/dragonfly-aarch64 ]]; then
+  echo "Downloading Dragonfly $DRAGONFLY_VERSION..."
+  wget -q "https://github.com/dragonflydb/dragonfly/releases/download/$DRAGONFLY_VERSION/dragonfly-aarch64.tar.gz" \
+    -O dragonfly-aarch64.tar.gz
+  tar -xzf dragonfly-aarch64.tar.gz
+  chmod +x dragonfly-aarch64
+  rm -f dragonfly-aarch64.tar.gz
+fi
+echo "Dragonfly ready."
+EOSU
+
+echo "Server user-data finished."

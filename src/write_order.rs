@@ -1,0 +1,205 @@
+// src/write_order.rs
+//
+// Writes to one key reach replicas and the AOF in the order the store took
+// them.
+//
+// A write has two halves: it changes the store under a shard lock, and then,
+// with that lock released, hands its payload to the replication hub and the
+// AOF. Two connections writing the *same key* at the same moment could do
+// those halves crossed over — A changes the store, B changes the store, B
+// hands over, A hands over. The master then holds A-then-B and every replica,
+// and the AOF, B-then-A. For `SET` the last value differs; for `RPUSH` the
+// order of the list; for `APPEND` the string. Nothing ever corrects it.
+//
+// Measured before this existed: six clients appending to one list, one
+// replica, no faults of any kind — about 500 of 18 000 elements out of place
+// on the replica, every run.
+//
+// The write gate (`write_gate`) does not prevent this: it is shared between
+// writers, and exists to give a cutter a point with no write in flight.
+//
+// So a write that somebody is listening to holds a lock on each key it names,
+// from before it touches the store until its payload is queued. The locks are
+// stripes — a fixed table indexed by a hash of the key — so two writes to the
+// same key always meet on the same lock, and writes to different keys almost
+// never do. A write that names no key but changes many (`FLUSHALL`), and a
+// script, which may touch keys it did not declare, take the write gate
+// exclusively instead ([`write_gate::enter_exclusive`]).
+//
+// Nothing is taken when nobody is listening — no replica, no backlog, no AOF,
+// no backup: with one observer of the dataset there is no second order to
+// disagree with.
+
+use parking_lot::{Mutex, MutexGuard};
+use std::cell::Cell;
+use std::marker::PhantomData;
+
+/// A power of two. Large enough that unrelated keys rarely share a stripe.
+const STRIPES: usize = 4096;
+
+static STRIPE: [Mutex<()>; STRIPES] = [const { parking_lot::const_mutex(()) }; STRIPES];
+
+thread_local! {
+    /// Set while this thread holds an [`OrderGuard`], so that a write made
+    /// from inside another — a script's `redis.call`, the commands of a
+    /// transaction applied as one — does not try to take a stripe its own
+    /// thread already holds.
+    static HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Held by a write from before it touches the store until its replication /
+/// AOF payload has been queued.
+pub struct OrderGuard {
+    /// The stripe of a single-key write — nearly all of them — held without
+    /// allocating.
+    _one: Option<MutexGuard<'static, ()>>,
+    _stripes: Vec<MutexGuard<'static, ()>>,
+    /// Whether this guard is the one that set [`HELD`].
+    outermost: bool,
+    /// Tied to the thread that took it.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for OrderGuard {
+    fn drop(&mut self) {
+        if self.outermost {
+            HELD.with(|h| h.set(false));
+        }
+    }
+}
+
+fn stripe_of(db: usize, key: &[u8]) -> usize {
+    (xxhash_rust::xxh3::xxh3_64_with_seed(key, db as u64) as usize) & (STRIPES - 1)
+}
+
+/// Take the order lock of every key in `keys`, in database `db`.
+///
+/// Stripes are taken in index order, so two writes that share several keys
+/// cannot deadlock. Nested on one thread, it takes nothing: the outer write's
+/// guard already orders everything this thread does until it is dropped.
+pub fn lock_keys<'a>(db: usize, keys: impl Iterator<Item = &'a [u8]>) -> OrderGuard {
+    if HELD.with(|h| h.get()) {
+        return OrderGuard {
+            _one: None,
+            _stripes: Vec::new(),
+            outermost: false,
+            _not_send: PhantomData,
+        };
+    }
+    HELD.with(|h| h.set(true));
+    let mut keys = keys;
+    let first = keys.next().map(|key| stripe_of(db, key));
+    let (one, stripes) = match (first, keys.next()) {
+        (None, _) => (None, Vec::new()),
+        (Some(only), None) => (Some(STRIPE[only].lock()), Vec::new()),
+        (Some(first), Some(second)) => {
+            let mut stripes: Vec<usize> = vec![first, stripe_of(db, second)];
+            stripes.extend(keys.map(|key| stripe_of(db, key)));
+            stripes.sort_unstable();
+            stripes.dedup();
+            (
+                None,
+                stripes.into_iter().map(|i| STRIPE[i].lock()).collect(),
+            )
+        }
+    };
+    OrderGuard {
+        _one: one,
+        _stripes: stripes,
+        outermost: true,
+        _not_send: PhantomData,
+    }
+}
+
+/// Mark this thread as ordered without taking any stripe — for a write that
+/// holds the write gate exclusively, and so has no other write to be ordered
+/// against. Writes nested inside it then take nothing either.
+pub fn held_exclusively() -> OrderGuard {
+    let outermost = !HELD.with(|h| h.replace(true));
+    OrderGuard {
+        _one: None,
+        _stripes: Vec::new(),
+        outermost,
+        _not_send: PhantomData,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn two_writes_to_one_key_take_turns() {
+        let guard = lock_keys(0, [b"k".as_slice()].into_iter());
+        let entered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&entered);
+        let other = std::thread::spawn(move || {
+            let _guard = lock_keys(0, [b"other".as_slice(), b"k".as_slice()].into_iter());
+            flag.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::SeqCst), "the second write got in");
+        drop(guard);
+        other.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn writes_to_different_keys_do_not_wait() {
+        // Different stripes, by construction of the names.
+        let (a, b) = (b"order:a".as_slice(), b"order:b".as_slice());
+        assert_ne!(stripe_of(0, a), stripe_of(0, b));
+        let _guard = lock_keys(0, [a].into_iter());
+        std::thread::spawn(move || {
+            let _guard = lock_keys(0, [b].into_iter());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn nested_and_repeated_keys_do_not_deadlock() {
+        let outer = lock_keys(
+            0,
+            [b"n".as_slice(), b"n".as_slice(), b"m".as_slice()].into_iter(),
+        );
+        // The same key again, from inside: nothing is taken.
+        let inner = lock_keys(0, [b"n".as_slice()].into_iter());
+        drop(inner);
+        // The outer guard is still the one in charge.
+        assert!(HELD.with(|h| h.get()));
+        drop(outer);
+        assert!(!HELD.with(|h| h.get()));
+
+        let exclusive = held_exclusively();
+        let inner = lock_keys(0, [b"n".as_slice()].into_iter());
+        drop(inner);
+        assert!(HELD.with(|h| h.get()));
+        drop(exclusive);
+        assert!(!HELD.with(|h| h.get()));
+    }
+
+    #[test]
+    fn opposite_key_orders_do_not_deadlock() {
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..2000 {
+                        let keys: [&[u8]; 3] = if (t + i) % 2 == 0 {
+                            [b"x", b"y", b"z"]
+                        } else {
+                            [b"z", b"y", b"x"]
+                        };
+                        let _guard = lock_keys(0, keys.into_iter());
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
+}

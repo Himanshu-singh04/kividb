@@ -1,0 +1,215 @@
+name: (reusable) Create benchmark instances
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        type: string
+        default: "us-east-1"
+      availability_zone:
+        type: string
+        default: ""
+      use_placement_group:
+        type: boolean
+        default: true
+    outputs:
+      server_instance_id:
+        value: ${{ jobs.create.outputs.server_instance_id }}
+      client_instance_id:
+        value: ${{ jobs.create.outputs.client_instance_id }}
+      server_private_ip:
+        value: ${{ jobs.create.outputs.server_private_ip }}
+      server_public_ip:
+        value: ${{ jobs.create.outputs.server_public_ip }}
+      client_public_ip:
+        value: ${{ jobs.create.outputs.client_public_ip }}
+      ssh_user:
+        value: ${{ jobs.create.outputs.ssh_user }}
+      ssh_key_path:
+        value: ${{ jobs.create.outputs.ssh_key_path }}
+      key_pair_name:
+        value: ${{ jobs.create.outputs.key_pair_name }}
+      security_group_id:
+        value: ${{ jobs.create.outputs.security_group_id }}
+      placement_group_name:
+        value: ${{ jobs.create.outputs.placement_group_name }}
+      region:
+        value: ${{ jobs.create.outputs.region }}
+      runner_label:
+        value: ${{ jobs.create.outputs.runner_label }}
+
+permissions:
+  contents: read
+
+env:
+  # Fixed on purpose: every job across every workflow that needs to SSH
+  # writes the same secret to this same path, so no SSH command's `-i`
+  # argument ever has to change between a persistent-runner-era workflow
+  # and this ephemeral one.
+  SSH_KEY_PATH: /tmp/kividb_benchmark_ssh_key
+  TF_DIR: infra/benchmark-ec2/terraform
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    outputs:
+      server_instance_id: ${{ steps.tfout.outputs.server_instance_id }}
+      client_instance_id: ${{ steps.tfout.outputs.client_instance_id }}
+      server_private_ip: ${{ steps.tfout.outputs.server_private_ip }}
+      server_public_ip: ${{ steps.tfout.outputs.server_public_ip }}
+      client_public_ip: ${{ steps.tfout.outputs.client_public_ip }}
+      ssh_user: ${{ steps.tfout.outputs.ssh_user }}
+      ssh_key_path: ${{ env.SSH_KEY_PATH }}
+      key_pair_name: ${{ steps.tfout.outputs.key_pair_name }}
+      security_group_id: ${{ steps.tfout.outputs.security_group_id }}
+      placement_group_name: ${{ steps.tfout.outputs.placement_group_name }}
+      region: ${{ steps.tfout.outputs.region }}
+      runner_label: run-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_BENCHMARK }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_BENCHMARK }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # ── SSH key: same secret, same path, every run ───────────────────────────
+      - name: Write SSH private key and derive its public half
+        id: ssh
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BENCHMARK_SSH_PRIVATE_KEY" ]]; then
+            echo "::error::secrets.BENCHMARK_SSH_PRIVATE_KEY is not set."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+          PUB="$(ssh-keygen -y -f "$SSH_KEY_PATH")"
+          echo "public_key=$PUB" >> "$GITHUB_OUTPUT"
+
+      # ── GitHub runner registration token (short-lived, minted just-in-time) ──
+      - name: Mint runner registration token
+        id: reg
+        env:
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_RUNNER_PAT" ]]; then
+            echo "::error::secrets.GH_RUNNER_PAT is not set (needs Administration: write on this repo)."
+            exit 1
+          fi
+          TOKEN=$(curl -sf -X POST \
+            -H "Authorization: token $GH_RUNNER_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
+            | jq -r .token)
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "::error::Failed to mint a runner registration token."
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        id: apply
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          # main.tf builds the runner label as "run-<run_id>" itself; keep this
+          # bare so it matches the `runner_label` job output used in `runs-on:`.
+          TF_VAR_run_id: ${{ github.run_id }}
+          TF_VAR_ssh_public_key: ${{ steps.ssh.outputs.public_key }}
+          TF_VAR_aws_region: ${{ inputs.aws_region }}
+          TF_VAR_availability_zone: ${{ inputs.availability_zone }}
+          TF_VAR_use_placement_group: ${{ inputs.use_placement_group }}
+          TF_VAR_register_github_runner: "true"
+          TF_VAR_github_repository: ${{ github.repository }}
+          TF_VAR_github_runner_registration_token: ${{ steps.reg.outputs.token }}
+          TF_VAR_github_runner_labels: "benchmark,client"
+        run: |
+          set -euo pipefail
+          if [[ -z "$TF_VAR_availability_zone" ]]; then
+            unset TF_VAR_availability_zone
+          fi
+          terraform apply -auto-approve -input=false
+
+      - name: Dump instance pending reason if apply failed
+        if: failure()
+        env:
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          echo "::error::terraform apply failed. These instances live in the AWS account for secrets.AWS_ACCESS_KEY_BENCHMARK, not your laptop CLI profile."
+          aws ec2 describe-instances \
+            --filters "Name=tag:RunId,Values=${{ github.run_id }}" \
+            --query 'Reservations[].Instances[].{Id:InstanceId,Type:InstanceType,State:State.Name,Reason:StateReason.Message,AZ:Placement.AvailabilityZone,PG:Placement.GroupName}' \
+            --output table || true
+
+      - name: Export instance details
+        id: tfout
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          {
+            echo "server_instance_id=$(terraform output -raw server_instance_id)"
+            echo "client_instance_id=$(terraform output -raw client_instance_id)"
+            echo "server_private_ip=$(terraform output -raw server_private_ip)"
+            echo "server_public_ip=$(terraform output -raw server_public_ip)"
+            echo "client_public_ip=$(terraform output -raw client_public_ip)"
+            echo "ssh_user=$(terraform output -raw ssh_user)"
+            echo "key_pair_name=$(terraform output -raw key_pair_name)"
+            echo "security_group_id=$(terraform output -raw security_group_id)"
+            echo "placement_group_name=$(terraform output -raw placement_group_name)"
+            echo "region=$(terraform output -raw region)"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── The runner has to show up ────────────────────────────────────────────
+      # The jobs that follow run on the client instance, on a runner its
+      # startup script registers. If that script fails — the runner release
+      # it installs has been retired by GitHub, a package mirror is down —
+      # no runner ever registers, and a job waiting for one waits in the queue
+      # for as long as GitHub lets it: hours, with both instances running.
+      # So this job does not succeed until the runner is there, and says what
+      # the instance printed if it is not.
+      - name: Wait for the runner to register
+        env:
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          RUNNER_LABEL: run-${{ github.run_id }}
+          CLIENT_INSTANCE_ID: ${{ steps.tfout.outputs.client_instance_id }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 20 * 60 ))
+          while true; do
+            status=$(curl -sf \
+              -H "Authorization: token $GH_RUNNER_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runners?per_page=100" \
+              | jq -r --arg want "$RUNNER_LABEL" \
+                  '[.runners[] | select(any(.labels[]; .name == $want)) | .status] | first // "absent"' \
+              || echo "unknown")
+            if [[ "$status" == "online" ]]; then
+              echo "Runner $RUNNER_LABEL is online."
+              exit 0
+            fi
+            if (( $(date +%s) >= deadline )); then
+              break
+            fi
+            echo "Runner $RUNNER_LABEL: $status; waiting."
+            sleep 20
+          done
+          echo "::error::The client instance did not register a runner within 20 minutes (last seen: $status). The end of its console output follows; the whole of it is in /var/log/user-data-client.log on the instance."
+          aws ec2 get-console-output --instance-id "$CLIENT_INSTANCE_ID" --latest \
+            --query Output --output text | tail -n 80 || true
+          exit 1

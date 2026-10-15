@@ -1,0 +1,184 @@
+name: Redis Benchmark
+
+# Command-surface throughput benchmark using `redis-benchmark`, on
+# GitHub-hosted runners.
+#
+# This complements, rather than replaces, the EC2 `benchmark.yml`:
+#
+#   benchmark.yml       memtier_benchmark on dedicated EC2 hardware, comparing
+#                       kividb against Dragonfly/Redis. Costs money to run, and
+#                       its workload is SET/GET pipelined throughput — which
+#                       says nothing about ZADD, LPUSH, XADD, SPOP, ...
+#
+#   this workflow       redis-benchmark across the whole command surface, free
+#                       on a hosted runner, against kividb AND a real
+#                       redis-server started on the same machine in the same
+#                       job. Absolute numbers are NOT comparable to the EC2 job
+#                       (shared CPU, noisy neighbours); this exists to catch a
+#                       command family falling off a cliff, which is exactly
+#                       what a SET/GET benchmark cannot see.
+#
+# Both I/O models are measured, because they are separate request paths and a
+# regression in one says nothing about the other.
+#
+# Two tables are produced per leg:
+#
+#   kividb vs redis     Report-only, never gates. Being slower than Redis at
+#                       some command is something to look at, not a build
+#                       failure — and the two are not like for like anyway
+#                       (Redis is single-threaded per instance). Its value is
+#                       relative shape: if one command family is 10x off while
+#                       its neighbours are at parity, that is a lead.
+#
+#   regression gate     kividb vs kividb at `baseline_ref`. This is the one
+#                       that can fail the run, because it compares like with
+#                       like.
+#
+# Pass `baseline_ref` to get an A/B against another ref with a pass/fail gate.
+# Without it the run is informational — it records numbers, it does not judge
+# them, because a hosted runner's absolute throughput is not stable enough to
+# threshold against a hardcoded figure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: "Ref to compare against (e.g. master). Empty = report only, no pass/fail gate."
+        required: false
+        default: ""
+      regression_pct:
+        description: "Fail if any command is slower than baseline by more than this percent."
+        required: false
+        default: "15"
+      requests:
+        description: "Requests per command"
+        required: false
+        default: "1000000"
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/redis-benchmark.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redis-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        io_model: [tokio, uring]
+    name: redis-benchmark (${{ matrix.io_model }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install redis-benchmark and redis-server
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-tools redis-server
+          redis-benchmark --version
+          redis-server --version
+          # Installing redis-server starts it as a service on the default port;
+          # stop it so the benchmark controls its own instance on :7777 and
+          # nothing else is competing for CPU during a run.
+          sudo systemctl stop redis-server 2>/dev/null || true
+          sudo service redis-server stop 2>/dev/null || true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: redis-bench-${{ matrix.io_model }}
+
+      - name: Build current
+        run: cargo build --release --bin kividb
+
+      - name: Save current binary
+        run: cp target/release/kividb /tmp/kividb-current
+
+      # Only built when an A/B was requested — a fresh checkout + build of the
+      # baseline ref roughly doubles the job, so it is opt-in.
+      - name: Build baseline (${{ github.event.inputs.baseline_ref }})
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.baseline_ref != ''
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "${{ github.event.inputs.baseline_ref }}"
+          git worktree add /tmp/baseline FETCH_HEAD
+          cd /tmp/baseline
+          cargo build --release --bin kividb
+          cp target/release/kividb /tmp/kividb-baseline
+
+      # Each arm gets its own port. Sharing one meant the next server could hit
+      # "bind: Address already in use" against the previous one's socket, which
+      # surfaced as a confusing "did not become reachable" failure.
+      - name: Run benchmarks
+        env:
+          IO_MODEL: ${{ matrix.io_model }}
+          REQUESTS: ${{ github.event.inputs.requests || '1000000' }}
+          BENCH_PORT: "7777"
+        run: |
+          chmod +x scripts/redis_bench.sh
+          ./scripts/redis_bench.sh /tmp/kividb-current "$IO_MODEL" "$REQUESTS" /tmp/current.csv
+
+      # Real Redis, same runner, same moment, identical workload. Run per matrix
+      # leg rather than once in a shared job on purpose: comparing numbers taken
+      # on two different hosted runners would measure the runners, not the
+      # servers.
+      - name: Run redis-server benchmarks
+        env:
+          REQUESTS: ${{ github.event.inputs.requests || '1000000' }}
+          BENCH_PORT: "7778"
+        run: ./scripts/redis_bench.sh "$(command -v redis-server)" redis "$REQUESTS" /tmp/redis.csv
+
+      - name: Run baseline benchmarks
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.baseline_ref != ''
+        env:
+          IO_MODEL: ${{ matrix.io_model }}
+          REQUESTS: ${{ github.event.inputs.requests || '1000000' }}
+          BENCH_PORT: "7779"
+        run: ./scripts/redis_bench.sh /tmp/kividb-baseline "$IO_MODEL" "$REQUESTS" /tmp/baseline.csv
+
+      - name: Report — kividb vs redis
+        env:
+          IO_MODEL: ${{ matrix.io_model }}
+        run: |
+          python3 scripts/redis_bench_report.py \
+            --current /tmp/current.csv \
+            --baseline /tmp/redis.csv \
+            --baseline-label redis \
+            --current-label "kividb-$IO_MODEL" \
+            --label "kividb ($IO_MODEL) vs redis" \
+            --no-gate >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report — regression gate
+        env:
+          REGRESSION_PCT: ${{ github.event.inputs.regression_pct || '15' }}
+          IO_MODEL: ${{ matrix.io_model }}
+        run: |
+          if [ -f /tmp/baseline.csv ]; then
+            python3 scripts/redis_bench_report.py \
+              --current /tmp/current.csv \
+              --baseline /tmp/baseline.csv \
+              --label "$IO_MODEL" \
+              --max-regression "$REGRESSION_PCT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            python3 scripts/redis_bench_report.py \
+              --current /tmp/current.csv \
+              --label "$IO_MODEL" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-benchmark-${{ matrix.io_model }}
+          path: /tmp/*.csv
+          if-no-files-found: warn

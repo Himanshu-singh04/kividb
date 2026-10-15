@@ -1,0 +1,21 @@
+/target
+*.rdb
+*.aof
+*.log
+*.txt
+./*.py
+*.kdb
+*.pyc
+nodes.conf
+kividb.conf
+cert.pem
+key.pem
+tests/e2e/benchmarks/results/
+# scripts/client_compat results
+client-compat-out/
+# Local, never published: editor/agent state, internal notes, per-machine cargo config
+.claude/
+docs/internal/
+.cargo/
+__pycache__/
+docker/verify/certs/

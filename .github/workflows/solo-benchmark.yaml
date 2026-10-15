@@ -1,0 +1,374 @@
+name: Solo Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch to benchmark (leave empty for current)"
+        required: false
+        default: ""
+      availability_zone:
+        description: "AZ for both instances. Change this if that AZ is out of c7gn capacity."
+        required: false
+        default: "us-east-1a"
+      use_placement_group:
+        description: "Cluster PG (lowest latency). Off by default — packing c7gn.12xlarge + c7gn.16xlarge on one rack often leaves the server pending forever."
+        type: boolean
+        default: false
+
+concurrency:
+  group: solo-benchmark-global
+  cancel-in-progress: false
+
+jobs:
+
+  # ── Create instances (Terraform, self-contained under infra/benchmark-ec2) ───
+  create-instances:
+    uses: ./.github/workflows/_benchmark-create.yml
+    secrets: inherit
+    with:
+      aws_region: us-east-1
+      availability_zone: ${{ inputs.availability_zone }}
+      # workflow_dispatch booleans are strings; reusable workflow inputs are real booleans
+      use_placement_group: ${{ fromJSON(inputs.use_placement_group) }}
+
+  # ── Benchmark (single job on client runner) ──────────────────────────────────
+  benchmark:
+    needs: create-instances
+    runs-on: [self-hosted, benchmark, client, "${{ needs.create-instances.outputs.runner_label }}"]
+    env:
+      SERVER_IP: ${{ needs.create-instances.outputs.server_private_ip }}
+      SERVER_USER: ${{ needs.create-instances.outputs.ssh_user }}
+      SSH_KEY_PATH: ${{ needs.create-instances.outputs.ssh_key_path }}
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          echo "ref=${INPUT_REF:-${{ github.ref_name }}}" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      # ── SSH key: same secret, same path as the create-instances job ─────────
+      - name: Write SSH private key
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "${{ env.SSH_KEY_PATH }}"
+          chmod 600 "${{ env.SSH_KEY_PATH }}"
+
+      # Each `run:` step is a fresh, non-login shell (no .profile/.bashrc sourced),
+      # so an `export PATH=...` in one step doesn't carry over to the next one.
+      # $GITHUB_PATH persists for every later step in this job instead.
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # ── Ensure memtier is installed on client ────────────────────────────────
+      - name: Ensure memtier_benchmark is installed
+        run: |
+          if ! command -v memtier_benchmark &>/dev/null; then
+            echo "Installing memtier_benchmark..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq \
+              build-essential autoconf automake \
+              libpcre3-dev libevent-dev pkg-config \
+              zlib1g-dev libssl-dev git
+            git clone https://github.com/RedisLabs/memtier_benchmark /tmp/memtier_src
+            cd /tmp/memtier_src
+            autoreconf -ivf
+            ./configure
+            make -j$(nproc)
+            sudo make install
+          fi
+          memtier_benchmark --version
+
+      - name: Build KiviDB from source and deploy to server
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build --release
+          ssh -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+              "mkdir -p /home/ubuntu/kividb"
+          scp -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              target/release/kividb \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }}:/home/ubuntu/kividb/kividb
+          # scp doesn't preserve the executable bit unless -p is passed, and -p
+          # is unreliable across scp/sftp implementations — set it explicitly.
+          ssh -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+              "chmod +x /home/ubuntu/kividb/kividb"
+
+      # ── Ensure server has correct binaries ──────────────────────────────────
+      - name: Ensure server binaries are up to date
+        run: |
+          ssh -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=30 \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+          bash << 'REMOTE'
+          set -euo pipefail
+          cd /home/ubuntu
+
+          # ── Dragonfly ───────────────────────────────────────────────────────
+          DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v1.37.0}"
+          INSTALLED_DF=""
+          if [[ -x ./dragonfly-aarch64 ]]; then
+            INSTALLED_DF=$(./dragonfly-aarch64 --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+          fi
+          WANT_DF="${DRAGONFLY_VERSION#v}"
+
+          if [[ "$INSTALLED_DF" != "$WANT_DF" ]]; then
+            echo "Installing Dragonfly $DRAGONFLY_VERSION..."
+            rm -f dragonfly-aarch64 dragonfly-aarch64.tar.gz
+            wget -q "https://github.com/dragonflydb/dragonfly/releases/download/${DRAGONFLY_VERSION}/dragonfly-aarch64.tar.gz" \
+              -O dragonfly-aarch64.tar.gz
+            tar -xzf dragonfly-aarch64.tar.gz
+            chmod +x dragonfly-aarch64
+            rm -f dragonfly-aarch64.tar.gz
+          fi
+          echo "Dragonfly: $(./dragonfly-aarch64 --version 2>/dev/null || echo 'ready')"
+
+          # ── Redis 8.6 ────────────────────────────────────────────────────────
+          INSTALLED_REDIS=$(redis-server --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+          if [[ "$INSTALLED_REDIS" != "8."* ]]; then
+            echo "Installing Redis 8.x..."
+            sudo apt-get remove -y redis-server redis-tools || true
+            curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg arch=arm64] \
+          https://packages.redis.io/deb $(lsb_release -cs) main" \
+              | sudo tee /etc/apt/sources.list.d/redis.list
+            sudo apt-get update -qq
+            # Check what's actually available first
+            apt-cache madison redis-server | head -5 || true
+            sudo apt-get install -y redis-server
+            sudo systemctl stop redis-server || true
+            sudo systemctl disable redis-server || true
+          fi
+          echo "Redis: $(redis-server --version)"
+
+          ulimit -n 65535
+          REMOTE
+        env:
+          KIVIDB_VERSION: ${{ env.KIVIDB_VERSION }}
+          DRAGONFLY_VERSION: ${{ env.DRAGONFLY_VERSION }}
+
+      - name: Verify SSH connectivity and install readiness helper
+        run: |
+          # Confirm SSH works
+          ssh -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+              echo "SSH OK"
+
+          mkdir -p /tmp/bench-results
+
+          # Waits must verify RESP PING, not only TCP accept — nc succeeds too early on some stacks.
+          # TLS waits use Python ssl (same idea memtier uses) with verify disabled for bench certs.
+          cat > /tmp/wait_redis_ready.py << 'WAIT_SCRIPT'
+          import argparse
+          import socket
+          import ssl
+          import sys
+          import time
+
+          PING = b"*1\r\n$4\r\nPING\r\n"
+
+          def resp_ok(data: bytes) -> bool:
+              if not data:
+                  return False
+              return data.startswith(b"+") or b"PONG" in data
+
+          def read_resp_chunk(sock, max_total: int = 8192) -> bytes:
+              """Enough bytes for one RESP line or bulk header + short payload."""
+              buf = b""
+              while len(buf) < max_total:
+                  chunk = sock.recv(4096)
+                  if not chunk:
+                      break
+                  buf += chunk
+                  if b"\r\n" in buf and (
+                      buf.startswith(b"+")
+                      or buf.startswith(b"-")
+                      or buf.startswith(b":")
+                      or buf.startswith(b"$")
+                  ):
+                      break
+              return buf
+
+          def try_plain(host: str, port: int) -> bool:
+              try:
+                  s = socket.create_connection((host, port), timeout=10)
+              except OSError:
+                  return False
+              try:
+                  s.sendall(PING)
+                  data = read_resp_chunk(s)
+                  return resp_ok(data)
+              except OSError:
+                  return False
+              finally:
+                  s.close()
+
+          def try_tls(host: str, port: int) -> bool:
+              ctx = ssl.create_default_context()
+              ctx.check_hostname = False
+              ctx.verify_mode = ssl.CERT_NONE
+              tls = None
+              try:
+                  raw = socket.create_connection((host, port), timeout=12)
+                  tls = ctx.wrap_socket(raw, server_hostname="localhost")
+                  tls.sendall(PING)
+                  data = read_resp_chunk(tls)
+                  return resp_ok(data)
+              except OSError:
+                  return False
+              except ssl.SSLError:
+                  return False
+              finally:
+                  if tls is not None:
+                      try:
+                          tls.close()
+                      except Exception:
+                          pass
+
+          def main() -> int:
+              ap = argparse.ArgumentParser()
+              ap.add_argument("host")
+              ap.add_argument("port", type=int)
+              ap.add_argument("--tls", action="store_true", help="TLS port (still sends RESP over TLS)")
+              ap.add_argument("--attempts", type=int, default=120)
+              ap.add_argument("--sleep", type=float, default=3.0)
+              ap.add_argument("--label", default="Redis-compatible server")
+              args = ap.parse_args()
+              for i in range(1, args.attempts + 1):
+                  ok = try_tls(args.host, args.port) if args.tls else try_plain(args.host, args.port)
+                  if ok:
+                      print(f"{args.label} ready on {args.host}:{args.port} (attempt {i}/{args.attempts})")
+                      return 0
+                  if i % 10 == 0:
+                      print(f"... still waiting for {args.label} ({i}/{args.attempts})")
+                  time.sleep(args.sleep)
+              print(f"ERROR: {args.label} never answered PING on {args.host}:{args.port}", file=sys.stderr)
+              return 1
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          WAIT_SCRIPT
+
+          scp -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              /tmp/wait_redis_ready.py \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }}:/tmp/wait_redis_ready.py
+
+          echo "Pre-flight checks passed."
+
+      # ════════════════════════════════════════════════════════════════════════
+      # KiviDB
+      # ════════════════════════════════════════════════════════════════════════
+      - name: Start KiviDB on server
+        run: |
+          ssh -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+          bash << 'REMOTE'
+          pkill -f "kividb" || true
+          sleep 1
+          ulimit -n 65535
+          nohup /home/ubuntu/kividb/kividb \
+            --bind 0.0.0.0 --port 6380 --threads 48 --loglevel error \
+            > /tmp/kividb.log 2>&1 &
+          echo $! > /tmp/kividb.pid
+          disown
+          REMOTE
+
+      - name: Wait for KiviDB port
+        env:
+          SERVER_IP: ${{ env.SERVER_IP }}
+        run: |
+          set -euo pipefail
+          diag() {
+            ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+              'echo "=== /tmp/kividb.log ==="; tail -n 120 /tmp/kividb.log 2>/dev/null || true
+               echo "=== listeners ==="; ss -tlnp 2>/dev/null | grep -E "6380|kividb" || true
+               echo "=== process ==="; pgrep -a kividb || true'
+          }
+          # Wait from the server — avoids false negatives when SG blocks bench-client→EC2 (SSH still works).
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+            ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+            'python3 /tmp/wait_redis_ready.py 127.0.0.1 6380 --label "KiviDB (plaintext, localhost)"' \
+            || { diag; exit 1; }
+          # memtier runs from this runner — verify path to SERVER_IP:6380 or fail with a clear hint.
+          python3 /tmp/wait_redis_ready.py "$SERVER_IP" 6380 --attempts 40 --sleep 2 \
+            --label "bench client → server :6380 (for memtier)" \
+            || { echo "::error::Cannot reach $SERVER_IP:6380 from the benchmark runner (security group?). Open TCP 6380 from this host to the server."; diag; exit 1; }
+
+      - name: KiviDB — warm up
+        # The write benchmark is the first traffic to ever hit this just-started
+        # process (past a bare TCP/PING readiness check) — no time to reach steady
+        # state (thread scheduling, TCP ramp-up, allocator warm-up). Left unwarmed
+        # this systematically penalizes whichever test runs first, every run.
+        # Discarded on purpose; not a measurement.
+        run: |
+          memtier_benchmark \
+            -s ${{ env.SERVER_IP }} -p 6380 \
+            --hide-histogram --ratio 1:1 -t 5 -c 5 -n 20000 --pipeline=10 \
+            > /dev/null 2>&1 || true
+
+      - name: KiviDB — write benchmark
+        run: |
+          memtier_benchmark \
+            -s ${{ env.SERVER_IP }} -p 6380 \
+            --distinct-client-seed --hide-histogram \
+            --ratio 1:0 -t 60 -c 5 -n 200000 --pipeline=10 \
+            > /tmp/bench-results/kivi_write_pipelined.txt 2>&1
+          echo "=== KiviDB pipelined write ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_write_pipelined.txt
+
+      - name: KiviDB — read benchmark
+        run: |
+          memtier_benchmark \
+            -s ${{ env.SERVER_IP }} -p 6380 \
+            --distinct-client-seed --hide-histogram \
+            --ratio 0:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            > /tmp/bench-results/kivi_read_pipelined.txt 2>&1
+          echo "=== KiviDB pipelined read ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_read_pipelined.txt
+
+      - name: KiviDB — mixed benchmark
+        run: |
+          memtier_benchmark \
+            -s ${{ env.SERVER_IP }} -p 6380 \
+            --distinct-client-seed --hide-histogram \
+            --ratio 1:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            > /tmp/bench-results/kivi_mixed.txt 2>&1
+          echo "=== KiviDB mixed ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_mixed.txt
+
+      - name: Stop KiviDB on server
+        run: |
+          ssh -i ${{ env.SSH_KEY_PATH }} \
+              -o StrictHostKeyChecking=no \
+              ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
+              "kill \$(cat /tmp/kividb.pid) 2>/dev/null || pkill -f kividb || true; sleep 2"
+
+  # ── Destroy instances (always) ────────────────────────────────────────────────
+  destroy-instances:
+    needs: [create-instances, benchmark]
+    if: always()
+    uses: ./.github/workflows/_benchmark-destroy.yml
+    secrets: inherit
+    with:
+      aws_region: us-east-1
+      server_instance_id: ${{ needs.create-instances.outputs.server_instance_id }}
+      client_instance_id: ${{ needs.create-instances.outputs.client_instance_id }}
+      key_pair_name: ${{ needs.create-instances.outputs.key_pair_name }}
+      security_group_id: ${{ needs.create-instances.outputs.security_group_id }}
+      placement_group_name: ${{ needs.create-instances.outputs.placement_group_name }}
+      run_id: ${{ github.run_id }}

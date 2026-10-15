@@ -1,0 +1,22 @@
+# Template: version and arch are overridden in CI via a generated file (see .github/workflows/release.yml).
+name: kividb
+arch: amd64
+version: 0.0.0
+maintainer: "KIVIDB PRIVATE LIMITED <support@kividb.io>"
+vendor: "KIVIDB PRIVATE LIMITED"
+homepage: "https://github.com/kividbio/kividb"
+description: "Fast Redis-compatible in-memory store written in Rust."
+license: "AGPL-3.0-only"
+contents:
+  - src: ./target/release/kividb
+    dst: /usr/bin/kividb
+    file_info:
+      mode: 0755
+  # KiviDB is licensed under the GNU Affero General Public License v3 (AGPL-3.0-only),
+  # as in the release tarballs.
+  - src: ./LICENSE
+    dst: /usr/share/doc/kividb/LICENSE
+  - src: ./NOTICE
+    dst: /usr/share/doc/kividb/NOTICE
+    file_info:
+      mode: 0644

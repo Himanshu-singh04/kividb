@@ -1,0 +1,256 @@
+name: Smoke Test
+
+# Independent workflow — callable directly (workflow_dispatch, any published
+# tag including stable releases, for ad-hoc reruns/bisects) or as a reusable
+# workflow (workflow_call, invoked by release.yml for -rc tags). It guards
+# bugs of the kind fixed in v1.0.4: a replica whose master died could never
+# be re-pointed at a new one, found via a real deployment, not CI. The point
+# of this workflow is to make that class of bug reproducible and catchable
+# automatically, before a release ships, using the actual published artifact
+# rather than a synthetic harness.
+#
+# Every job pulls the ALREADY-PUBLISHED image for `version` — none of them
+# build from source. That's deliberate: this workflow verifies what
+# release.yml actually shipped, not what the source tree currently produces.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published tag to test, e.g. v1.0.4-rc1 (any already-published tag works, including stable releases)"
+        required: true
+      registry:
+        description: "Container registry + repo to pull from"
+        required: false
+        default: "ghcr.io/kividbio/kividb"
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      registry:
+        required: false
+        type: string
+        default: "ghcr.io/kividbio/kividb"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # ── Validate the input and resolve the per-variant image refs every other
+  # job needs, once, instead of each job re-deriving the same strings.
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      image_default: ${{ steps.tags.outputs.default }}
+      image_full: ${{ steps.tags.outputs.full }}
+    steps:
+      - name: Validate version looks like a real release tag
+        run: |
+          set -euo pipefail
+          v="${{ inputs.version }}"
+          if [[ ! "$v" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+            echo "::error::'$v' doesn't look like a semver tag (expected vX.Y.Z or vX.Y.Z-suffix, e.g. v1.0.4-rc1)"
+            exit 1
+          fi
+
+      - name: Resolve per-variant image refs
+        id: tags
+        run: |
+          set -euo pipefail
+          reg="${{ inputs.registry }}"
+          v="${{ inputs.version }}"
+          echo "default=${reg}:${v}" >> "$GITHUB_OUTPUT"
+          echo "full=${reg}:${v}-full" >> "$GITHUB_OUTPUT"
+
+  # ── Full existing e2e suite (23 files, ~14.7k lines: strings/hashes/lists/
+  # sets/zsets/streams/json/ts/geo/vector/pubsub/acl/transactions/
+  # persistence/cluster) against the PUBLISHED container instead of a
+  # locally-built binary. This is the "cover the entire command surface"
+  # requirement — it already existed (tests/e2e/), this job just points it at
+  # a real published artifact.
+  #
+  # The suite runs once per wire protocol. `KIVI_RESP` selects one; the matrix
+  # runs them as separate jobs so a RESP3-only regression is obvious from the
+  # job name instead of buried in a combined log, and so one protocol failing
+  # doesn't mask results for the other.
+  command-surface:
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        resp: [2, 3]
+    name: command-surface (RESP${{ matrix.resp }})
+    env:
+      # Most e2e tests talk to the container on KIVI_PORT, but ~144 of them
+      # spawn their OWN server — persistence/restart, replication, slowlog with
+      # a custom config — and resolve the binary themselves. Without this they
+      # fall back to `../../bin/kividb`, which does not exist here because this
+      # workflow deliberately builds nothing, and every one of them fails with
+      # `FileNotFoundError: '../../bin/kividb'`.
+      #
+      # Setting it also closes a nastier hole: `tests/e2e/utils/helpers.py`
+      # otherwise falls back to any `redis-server` on PATH, so an unset
+      # KIVI_BINARY can silently test Redis and report a green kividb release.
+      #
+      # The binary is lifted out of the published image below rather than built,
+      # so this still tests exactly what shipped. Same fix as the job-level env
+      # in linux-verification.yml; that one was applied when this failure was
+      # first seen there, and this workflow was missed.
+      KIVI_BINARY: ${{ github.workspace }}/kividb-published
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install e2e dependencies
+        run: pip install -r tests/e2e/requirements.txt
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and start kividb (${{ needs.resolve.outputs.image_default }})
+        run: |
+          set -euo pipefail
+          docker pull "${{ needs.resolve.outputs.image_default }}"
+          docker run -d --name kividb-smoke-resp${{ matrix.resp }} -p 6380:6380 \
+            "${{ needs.resolve.outputs.image_default }}" \
+            --port 6380 --loglevel error --io-model tokio --protected-mode no
+          for i in $(seq 1 30); do
+            nc -z 127.0.0.1 6380 2>/dev/null && echo "KiviDB is up." && exit 0
+            sleep 0.5
+          done
+          echo "::error::kividb never came up"; docker logs kividb-smoke-resp${{ matrix.resp }}; exit 1
+
+      # Self-spawning tests need a real binary on disk, not a container. Take it
+      # out of the image that was just pulled so the thing under test is still
+      # the published artifact — building one here would defeat the point of
+      # this workflow.
+      - name: Lift the binary out of the published image
+        run: |
+          set -euo pipefail
+          cid=$(docker create "${{ needs.resolve.outputs.image_default }}")
+          docker cp "$cid:/usr/local/bin/kividb" "$KIVI_BINARY"
+          docker rm "$cid" >/dev/null
+          chmod +x "$KIVI_BINARY"
+          # The image is bookworm (glibc 2.36) and the runner is newer, which is
+          # forward-compatible — but assert it actually runs here rather than
+          # letting 144 tests fail one by one with a confusing error.
+          "$KIVI_BINARY" --version
+
+      # The deselected pair is the MULTI/EXEC isolation bug: EXEC's lock-held
+      # fast path only covers all-SET transactions, so anything else releases
+      # its locks between queued commands and a concurrent MGET can observe a
+      # half-applied transaction. It is fixed in the tree
+      # (docs/EXEC_ATOMICITY.md), and ci.yml and linux-verification.yml no
+      # longer exclude these; this job tests the image that is *published*,
+      # so delete these lines once an image later than v1.0.4 is.
+      - name: Run e2e suite against the published image (RESP${{ matrix.resp }})
+        run: |
+          cd tests/e2e
+          KIVI_EXTERNAL=1 KIVI_PORT=6380 KIVI_RESP=${{ matrix.resp }} pytest modules/ -v \
+            --deselect modules/test_acid.py::TestFullACIDScenario::test_balance_transfer_acid \
+            --deselect modules/test_acid.py::TestAtomicity::test_multi_key_transfer_is_atomic
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs kividb-smoke-resp${{ matrix.resp }} || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f kividb-smoke-resp${{ matrix.resp }} || true
+
+  # ── Container-level defense-in-depth: extends the existing docker/verify/
+  # harness (already proven — it's what originally caught an image variant
+  # missing its features, a build-arg wiring bug pytest-against-a-binary
+  # can't see) to
+  # pull the published images instead of building from the local Dockerfile.
+  container-verify:
+    needs: resolve
+    runs-on: ubuntu-latest
+    # A few minutes when it works. Without a limit, a harness waiting on a
+    # container that is not coming up holds the release run open for hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run published-image ACL/TLS/feature-flag checks
+        working-directory: docker/verify
+        run: |
+          chmod +x verify-published.sh gen-certs.sh
+          ./verify-published.sh "${{ inputs.version }}" "${{ inputs.registry }}"
+
+  # ── Black-box replication verification against the published image — three
+  # real containers, driven entirely through redis-cli. Re-asserts the same
+  # scenarios already proven in tests/replication.rs, but against the
+  # compiled release artifact rather than an in-process test binary. See
+  # smoke/replication_blackbox.sh's own header for the exact bug this guards
+  # (a replica re-pointed between masters could get permanently stuck).
+  replication-blackbox:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run replication black-box scenarios
+        run: |
+          chmod +x smoke/replication_blackbox.sh
+          ./smoke/replication_blackbox.sh "${{ needs.resolve.outputs.image_default }}"
+
+  # ── Gate: every job above must pass. `if: always()` so this still runs
+  # (and reports clearly) even when an earlier job failed rather than being
+  # skipped, which would otherwise make a red workflow look ambiguous.
+  #
+  # `resolve` is in `needs` and `skipped` counts as a failure, because without
+  # both this gate reports success when nothing ran at all: a failing `resolve`
+  # skips every job below it, and `contains(needs.*.result, 'failure')` is
+  # false for a skipped job. That was observed, not theorised — a run with a
+  # deliberately invalid version gave `resolve => failure` alongside
+  # `summary => success`, printing "All smoke-test jobs passed".
+  #
+  # No job here carries its own `if:`, so a skip can only ever mean an upstream
+  # dependency failed. Add an `if:`-guarded (legitimately skippable) job and
+  # this check has to be revisited.
+  summary:
+    needs: [resolve, command-surface, container-verify, replication-blackbox]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all smoke-test jobs passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "::error::One or more smoke-test jobs failed for ${{ inputs.version }}"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::One or more smoke-test jobs were cancelled for ${{ inputs.version }}"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'skipped') }}" == "true" ]]; then
+            echo "::error::One or more smoke-test jobs were skipped for ${{ inputs.version }} — an upstream job must have failed, so this run proves nothing"
+            exit 1
+          fi
+          echo "All smoke-test jobs passed for ${{ inputs.version }}"

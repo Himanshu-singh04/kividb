@@ -1,0 +1,609 @@
+// Reusable aggregation pipeline runner.
+//
+// FT.AGGREGATE and FT.HYBRID both end with a sequence of pipeline clauses
+// (LOAD / GROUPBY+REDUCE / APPLY / FILTER / SORTBY / LIMIT) operating on
+// a Vec<Row>. The grammar is identical; only the row-source differs:
+//   - FT.AGGREGATE: rows from a keyspace walk
+//   - FT.HYBRID:    rows from fused-and-paged hybrid results, post-LOAD
+//
+// This module holds the parser-and-executor for the pipeline tail. Both
+// commands build their initial Vec<Row> however they want, then call
+// `run(rows, cmd, start_idx)`.
+//
+// The input row buffer is consumed (moved in) and the result is returned
+// — same value-passing pattern the inline ft_aggregate code already uses.
+
+pub type Row = ahash::AHashMap<String, String>;
+
+// ── Values that are not strings ──────────────────────────────────────────────
+//
+// A row's values are strings, which is what nearly every stage of a
+// pipeline makes and reads. Two reducers make something else: `TOLIST` and
+// `RANDOM_SAMPLE` a list, `COLLECT` a list of documents. Those travel as a
+// string too — this marker, then JSON — and are unpacked where the reply is
+// written.
+
+const NESTED: char = '\u{1}';
+
+fn nested(value: &serde_json::Value) -> String {
+    format!("{NESTED}{value}")
+}
+
+/// One value of a row, as the reply carries it: a string, or for a nested
+/// value arrays within arrays (an entry of a `COLLECT` is name, value, name,
+/// value … under RESP2 and a map under RESP3).
+pub fn value_reply(value: &str, resp: u8) -> Vec<u8> {
+    use crate::resp::write::{resp_array, resp_bulk_str, resp_map_for};
+    fn write(value: &serde_json::Value, resp: u8) -> Vec<u8> {
+        match value {
+            serde_json::Value::String(s) => resp_bulk_str(s),
+            serde_json::Value::Array(items) => {
+                resp_array(items.iter().map(|item| write(item, resp)).collect())
+            }
+            serde_json::Value::Object(entries) => resp_map_for(
+                resp,
+                entries
+                    .iter()
+                    .flat_map(|(name, value)| [resp_bulk_str(name), write(value, resp)])
+                    .collect(),
+            ),
+            other => resp_bulk_str(&other.to_string()),
+        }
+    }
+    match value
+        .strip_prefix(NESTED)
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+    {
+        Some(value) => write(&value, resp),
+        None => resp_bulk_str(value),
+    }
+}
+
+/// Rows in the order `keys` gives: each a field and whether ascending.
+/// Values that are both numbers compare as numbers.
+fn sort_rows(rows: &mut [&Row], keys: &[(String, bool)]) {
+    rows.sort_by(|a, b| compare_rows(a, b, keys));
+}
+
+fn compare_rows(a: &Row, b: &Row, keys: &[(String, bool)]) -> std::cmp::Ordering {
+    for (field, ascending) in keys {
+        let va = a.get(field).map(|s| s.as_str()).unwrap_or("");
+        let vb = b.get(field).map(|s| s.as_str()).unwrap_or("");
+        let ord = match (va.parse::<f64>(), vb.parse::<f64>()) {
+            (Ok(na), Ok(nb)) => na.total_cmp(&nb),
+            _ => va.cmp(vb),
+        };
+        let ord = if *ascending { ord } else { ord.reverse() };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// `field [ASC | DESC] …` — sort keys, as `SORTBY` gives them.
+fn parse_sort_keys(words: &[String]) -> Vec<(String, bool)> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let field = words[i].trim_start_matches('@').to_string();
+        i += 1;
+        let mut ascending = true;
+        if let Some(direction) = words.get(i) {
+            if direction.eq_ignore_ascii_case("ASC") {
+                i += 1;
+            } else if direction.eq_ignore_ascii_case("DESC") {
+                ascending = false;
+                i += 1;
+            }
+        }
+        keys.push((field, ascending));
+    }
+    keys
+}
+
+/// Execute pipeline clauses starting at cmd[start_idx]. Returns the
+/// transformed rows. On an unrecognised clause we advance past it (lenient
+/// behaviour matching the existing ft_aggregate implementation), which
+/// handles tokens like SCORER/DIALECT that ft_search consumes earlier.
+pub fn run(mut rows: Vec<Row>, cmd: &[&[u8]], start_idx: usize) -> Vec<Row> {
+    let mut i = start_idx;
+
+    while i < cmd.len() {
+        let clause = match std::str::from_utf8(cmd[i]) {
+            Ok(s) => s.to_ascii_uppercase(),
+            Err(_) => {
+                i += 1;
+                continue;
+            }
+        };
+
+        match clause.as_str() {
+            "LOAD" => {
+                // LOAD count @field [@field ...] | LOAD *
+                // Every field is in the row already; which of them the reply
+                // shows is decided where the reply is written.
+                i += 1;
+                if cmd.get(i).is_some_and(|a| *a == b"*") {
+                    i += 1;
+                    continue;
+                }
+                let count = cmd
+                    .get(i)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                i += 1 + count;
+            }
+
+            "GROUPBY" => {
+                let (consumed, new_rows) = run_groupby(rows, cmd, i);
+                rows = new_rows;
+                i = consumed;
+            }
+
+            "APPLY" => {
+                i += 1;
+                if let Some(expr_bytes) = cmd.get(i) {
+                    if let Ok(expr_str) = std::str::from_utf8(expr_bytes)
+                        && let Some(ast) = crate::commands::expr::parse(expr_str)
+                    {
+                        i += 1;
+                        // Optional AS <alias>
+                        let alias = if cmd
+                            .get(i)
+                            .and_then(|b| std::str::from_utf8(b).ok())
+                            .map(|s| s.eq_ignore_ascii_case("AS"))
+                            .unwrap_or(false)
+                        {
+                            i += 1;
+                            let a = cmd
+                                .get(i)
+                                .and_then(|b| std::str::from_utf8(b).ok())
+                                .unwrap_or("value")
+                                .to_string();
+                            i += 1;
+                            a
+                        } else {
+                            // no alias keyword — synthesise from expression
+                            expr_str.to_string()
+                        };
+
+                        for row in rows.iter_mut() {
+                            let value = crate::commands::expr::eval(&ast, row).to_resp_string();
+                            row.insert(alias.clone(), value);
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+
+            "FILTER" => {
+                i += 1;
+                if let Some(expr_bytes) = cmd.get(i) {
+                    if let Ok(expr_str) = std::str::from_utf8(expr_bytes)
+                        && let Some(ast) = crate::commands::expr::parse(expr_str)
+                    {
+                        rows.retain(|row| crate::commands::expr::eval(&ast, row).is_truthy());
+                    }
+                    i += 1;
+                }
+            }
+
+            "SORTBY" => {
+                i += 1;
+                let nargs = cmd
+                    .get(i)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                i += 1;
+
+                let mut sort_keys: Vec<(String, bool)> = Vec::new();
+                let end = i + nargs;
+                while i < end && i < cmd.len() {
+                    let field = match std::str::from_utf8(cmd[i]) {
+                        Ok(s) => s.trim_start_matches('@').to_string(),
+                        Err(_) => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    i += 1;
+
+                    let ascending = if i < end && i < cmd.len() {
+                        let dir = std::str::from_utf8(cmd[i])
+                            .map(|s| s.to_ascii_uppercase())
+                            .unwrap_or_default();
+                        match dir.as_str() {
+                            "ASC" => {
+                                i += 1;
+                                true
+                            }
+                            "DESC" => {
+                                i += 1;
+                                false
+                            }
+                            _ => true, // direction omitted, default ASC
+                        }
+                    } else {
+                        true
+                    };
+                    sort_keys.push((field, ascending));
+                }
+
+                rows.sort_by(|a, b| compare_rows(a, b, &sort_keys));
+
+                // `MAX n`: only the first n are wanted.
+                if cmd.get(i).is_some_and(|a| a.eq_ignore_ascii_case(b"MAX")) {
+                    if let Some(max) = cmd
+                        .get(i + 1)
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        rows.truncate(max);
+                    }
+                    i += 2;
+                }
+            }
+
+            "LIMIT" => {
+                i += 1;
+                let offset = cmd
+                    .get(i)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                i += 1;
+                let count = cmd
+                    .get(i)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(usize::MAX);
+                i += 1;
+                rows = rows.into_iter().skip(offset).take(count).collect();
+            }
+
+            // `PARAMS n name value …` was read by the query parser.
+            "PARAMS" => {
+                let n = cmd
+                    .get(i + 1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                i += 2 + n;
+            }
+
+            // Read where the command is: they say nothing to the pipeline.
+            "DIALECT" | "SCORER" | "TIMEOUT" => {
+                i += 2;
+            }
+            // `WITHCURSOR [COUNT n] [MAXIDLE ms]`
+            "WITHCURSOR" => {
+                i += 1;
+                while cmd.get(i).is_some_and(|a| {
+                    a.eq_ignore_ascii_case(b"COUNT") || a.eq_ignore_ascii_case(b"MAXIDLE")
+                }) {
+                    i += 2;
+                }
+            }
+
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    rows
+}
+
+// ── GROUPBY + REDUCE ────────────────────────────────────────────────────────
+//
+// Extracted as its own function to keep `run` readable. Returns the
+// post-clause cursor index and the new rows.
+
+fn run_groupby(rows: Vec<Row>, cmd: &[&[u8]], start: usize) -> (usize, Vec<Row>) {
+    let mut i = start + 1; // skip GROUPBY
+
+    let nargs = cmd
+        .get(i)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    i += 1;
+
+    let mut group_props: Vec<String> = Vec::new();
+    for _ in 0..nargs {
+        if let Some(prop) = cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
+            group_props.push(prop.trim_start_matches('@').to_string());
+        }
+        i += 1;
+    }
+
+    #[derive(Debug)]
+    struct Reducer {
+        func: String,
+        args: Vec<String>,
+        alias: String,
+    }
+
+    let mut reducers: Vec<Reducer> = Vec::new();
+
+    while i < cmd.len() {
+        let next = match std::str::from_utf8(cmd[i]) {
+            Ok(s) => s.to_ascii_uppercase(),
+            Err(_) => break,
+        };
+        if next != "REDUCE" {
+            break;
+        }
+        i += 1;
+
+        let func = match cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
+            Some(f) => f.to_ascii_uppercase(),
+            None => break,
+        };
+        i += 1;
+
+        let r_nargs = cmd
+            .get(i)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        i += 1;
+
+        let mut args: Vec<String> = Vec::new();
+        for _ in 0..r_nargs {
+            if let Some(a) = cmd.get(i).and_then(|b| std::str::from_utf8(b).ok()) {
+                args.push(a.trim_start_matches('@').to_string());
+            }
+            i += 1;
+        }
+
+        let alias = if cmd
+            .get(i)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(|s| s.eq_ignore_ascii_case("AS"))
+            .unwrap_or(false)
+        {
+            i += 1;
+            let a = cmd
+                .get(i)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .unwrap_or("value")
+                .to_string();
+            i += 1;
+            a
+        } else if args.is_empty() {
+            func.to_lowercase()
+        } else {
+            format!("{}({})", func.to_lowercase(), args[0])
+        };
+
+        reducers.push(Reducer { func, args, alias });
+    }
+
+    // The rows of each group, groups in the order they first appear.
+    let mut index: ahash::AHashMap<Vec<String>, usize> = ahash::AHashMap::new();
+    let mut groups: Vec<(Vec<String>, Vec<&Row>)> = Vec::new();
+    for row in &rows {
+        let key: Vec<String> = group_props
+            .iter()
+            .map(|p| row.get(p).cloned().unwrap_or_default())
+            .collect();
+        let at = *index.entry(key.clone()).or_insert_with(|| {
+            groups.push((key, Vec::new()));
+            groups.len() - 1
+        });
+        groups[at].1.push(row);
+    }
+
+    let mut new_rows: Vec<Row> = Vec::with_capacity(groups.len());
+    for (group_key, members) in &groups {
+        let mut row: Row = ahash::AHashMap::new();
+        for (prop, val) in group_props.iter().zip(group_key.iter()) {
+            row.insert(prop.clone(), val.clone());
+        }
+        for reducer in &reducers {
+            row.insert(
+                reducer.alias.clone(),
+                reduce(&reducer.func, &reducer.args, members),
+            );
+        }
+        new_rows.push(row);
+    }
+
+    (i, new_rows)
+}
+
+/// One reducer over the rows of one group.
+fn reduce(func: &str, args: &[String], members: &[&Row]) -> String {
+    use crate::commands::vector::format_f64;
+    use serde_json::Value;
+
+    let field = args.first().map(String::as_str).unwrap_or("");
+    let values = || members.iter().filter_map(|row| row.get(field));
+    let numbers = || values().filter_map(|v| v.parse::<f64>().ok());
+    // In the order they first appear.
+    let distinct = || {
+        let mut seen: ahash::AHashSet<&String> = ahash::AHashSet::new();
+        values().filter(move |v| seen.insert(*v))
+    };
+
+    match func {
+        "COUNT" => members.len().to_string(),
+        "SUM" => format_f64(numbers().sum()),
+        "AVG" => {
+            if members.is_empty() {
+                "0".to_string()
+            } else {
+                format_f64(numbers().sum::<f64>() / members.len() as f64)
+            }
+        }
+        "MIN" => numbers()
+            .min_by(|a, b| a.total_cmp(b))
+            .map_or("0".to_string(), format_f64),
+        "MAX" => numbers()
+            .max_by(|a, b| a.total_cmp(b))
+            .map_or("0".to_string(), format_f64),
+        "COUNT_DISTINCT" | "COUNT_DISTINCTISH" => {
+            let mut seen: ahash::AHashSet<&str> = ahash::AHashSet::new();
+            members
+                .iter()
+                .filter(|row| seen.insert(row.get(field).map_or("", |v| v.as_str())))
+                .count()
+                .to_string()
+        }
+        "STDDEV" => {
+            // Of a sample: n - 1 below the line.
+            let all: Vec<f64> = numbers().collect();
+            if all.len() < 2 {
+                return "0".to_string();
+            }
+            let mean = all.iter().sum::<f64>() / all.len() as f64;
+            let variance =
+                all.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (all.len() - 1) as f64;
+            format_f64(variance.sqrt())
+        }
+        // QUANTILE field q — the value a fraction q of the way up.
+        "QUANTILE" => {
+            let mut all: Vec<f64> = numbers().collect();
+            if all.is_empty() {
+                return "0".to_string();
+            }
+            all.sort_by(|a, b| a.total_cmp(b));
+            let q = args
+                .get(1)
+                .and_then(|q| q.parse::<f64>().ok())
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+            format_f64(all[(q * (all.len() - 1) as f64).round() as usize])
+        }
+        // Every distinct value, as a list.
+        "TOLIST" => nested(&Value::Array(
+            distinct().map(|v| Value::String(v.clone())).collect(),
+        )),
+        // RANDOM_SAMPLE field n — n of the values, picked at random.
+        "RANDOM_SAMPLE" => {
+            use rand::seq::SliceRandom;
+            let n = args
+                .get(1)
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(1);
+            let all: Vec<&String> = values().collect();
+            nested(&Value::Array(
+                all.choose_multiple(&mut rand::thread_rng(), n)
+                    .map(|v| Value::String(v.to_string()))
+                    .collect(),
+            ))
+        }
+        // FIRST_VALUE field [BY other [ASC | DESC]] — the group's first row's
+        // value, or that of the row first by `other`.
+        "FIRST_VALUE" => {
+            let first = if args.get(1).is_some_and(|by| by.eq_ignore_ascii_case("BY")) {
+                let keys = parse_sort_keys(&args[2..]);
+                members
+                    .iter()
+                    .filter(|row| row.contains_key(field))
+                    .min_by(|a, b| compare_rows(a, b, &keys))
+            } else {
+                members.iter().find(|row| row.contains_key(field))
+            };
+            first
+                .and_then(|row| row.get(field))
+                .cloned()
+                .unwrap_or_default()
+        }
+        "COLLECT" => collect(args, members),
+        _ => String::new(),
+    }
+}
+
+/// `REDUCE COLLECT n FIELDS (* | m field …) [SORTBY k field [ASC | DESC] …]
+/// [LIMIT offset count] [DISTINCT]` — the group's rows themselves, each as
+/// the fields asked for: sorted, deduplicated and cut within the group.
+/// (Redis 8.8. Whole documents per group in one query, where it used to take
+/// a query per group.)
+fn collect(args: &[String], members: &[&Row]) -> String {
+    use serde_json::Value;
+
+    // `None`: every field the pipeline has.
+    let mut fields: Option<Vec<String>> = None;
+    let mut order: Vec<(String, bool)> = Vec::new();
+    let mut limit: Option<(usize, usize)> = None;
+    let mut distinct = false;
+    let number = |at: usize| args.get(at).and_then(|n| n.parse::<usize>().ok());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].to_ascii_uppercase().as_str() {
+            "FIELDS" if args.get(i + 1).is_some_and(|a| a == "*") => i += 2,
+            "FIELDS" => {
+                let n = number(i + 1).unwrap_or(0);
+                let end = (i + 2 + n).min(args.len());
+                fields = Some(
+                    args[(i + 2).min(end)..end]
+                        .iter()
+                        .map(|f| f.trim_start_matches('@').to_string())
+                        .collect(),
+                );
+                i = end;
+            }
+            "SORTBY" => {
+                let n = number(i + 1).unwrap_or(0);
+                let end = (i + 2 + n).min(args.len());
+                order = parse_sort_keys(&args[(i + 2).min(end)..end]);
+                i = end;
+            }
+            "LIMIT" => {
+                limit = Some((
+                    number(i + 1).unwrap_or(0),
+                    number(i + 2).unwrap_or(usize::MAX),
+                ));
+                i += 3;
+            }
+            "DISTINCT" => {
+                distinct = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    let mut rows: Vec<&Row> = members.to_vec();
+    if !order.is_empty() {
+        sort_rows(&mut rows, &order);
+    }
+    let entry = |row: &Row| -> Value {
+        let mut entry = serde_json::Map::new();
+        match &fields {
+            Some(fields) => {
+                for field in fields {
+                    if let Some(value) = row.get(field) {
+                        entry.insert(field.clone(), Value::String(value.clone()));
+                    }
+                }
+            }
+            None => {
+                let mut all: Vec<(&String, &String)> = row
+                    .iter()
+                    .filter(|(name, _)| !name.starts_with("__"))
+                    .collect();
+                all.sort();
+                for (name, value) in all {
+                    entry.insert(name.clone(), Value::String(value.clone()));
+                }
+            }
+        }
+        Value::Object(entry)
+    };
+    let mut entries: Vec<Value> = rows.into_iter().map(entry).collect();
+    if distinct {
+        let mut seen: ahash::AHashSet<String> = ahash::AHashSet::new();
+        entries.retain(|entry| seen.insert(entry.to_string()));
+    }
+    if let Some((offset, count)) = limit {
+        entries = entries.into_iter().skip(offset).take(count).collect();
+    }
+    nested(&Value::Array(entries))
+}

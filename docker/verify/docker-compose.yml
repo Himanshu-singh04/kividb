@@ -1,0 +1,123 @@
+# Live verification harness for:
+#   - Docker image variants silently all being the default-feature
+#     build
+#   - ACL command rules being enforced live
+#   - PING requiring auth
+#   - the `readonly` ACL template and `@read`/`@write` categories added
+#     alongside those fixes
+#
+# Usage: see verify.sh in this directory (drives everything below).
+#
+# Four kividb variants, matching the four tags release.yml publishes
+# (default / -tls / -lua / -full), each built from the *same* Dockerfile
+# with a different KIVIDB_FEATURES build-arg — this is exactly what CI does,
+# so a pass here means the CI-built images will behave the same way.
+services:
+  # --tls-port/--tls-cert-file/--tls-key-file are passed here even though the
+  # `tls` feature is NOT compiled in for this variant — that's the point:
+  # config parsing accepts the flags either way (they're not feature-gated),
+  # but only the listener setup is `#[cfg(feature = "tls")]`'d out. Proving
+  # the TLS port never reaches LISTEN despite being "configured" is exactly
+  # how the missing-features bug was caught originally.
+  kividb-default:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KIVIDB_FEATURES: ""
+    # No --tls-port: this variant is built without the `tls` feature, and
+    # such a build refuses to start when asked for a TLS port rather than
+    # serve plaintext where TLS was asked for (it used to ignore the option).
+    # That it refuses is checked separately — see tls-refusal-check.sh.
+    command:
+      [
+        "--port", "6380",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16380:6380"
+
+  kividb-tls:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KIVIDB_FEATURES: "tls"
+    command:
+      [
+        "--port", "6380",
+        "--tls-port", "6390",
+        "--tls-cert-file", "/certs/server.crt",
+        "--tls-key-file", "/certs/server.key",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16381:6380"
+      - "16391:6390"
+
+  kividb-lua:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KIVIDB_FEATURES: "lua"
+    # No --tls-port: this variant is built without the `tls` feature, and
+    # such a build refuses to start when asked for a TLS port rather than
+    # serve plaintext where TLS was asked for (it used to ignore the option).
+    # That it refuses is checked separately — see tls-refusal-check.sh.
+    command:
+      [
+        "--port", "6380",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16382:6380"
+
+  kividb-full:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        KIVIDB_FEATURES: "lua,tls"
+    command:
+      [
+        "--port", "6380",
+        "--tls-port", "6390",
+        "--tls-cert-file", "/certs/server.crt",
+        "--tls-key-file", "/certs/server.key",
+        "--requirepass", "adminpass",
+        "--aclfile", "/etc/kividb/users.acl",
+      ]
+    volumes:
+      - ./users.acl:/etc/kividb/users.acl:ro
+      - ./certs:/certs:ro
+    ports:
+      - "16383:6380"
+      - "16393:6390"
+
+  # Drives every check from inside the compose network (service-name DNS),
+  # so the harness works the same on any host regardless of what's installed
+  # locally — only Docker itself is required.
+  runner:
+    image: redis:7-alpine
+    depends_on:
+      - kividb-default
+      - kividb-tls
+      - kividb-lua
+      - kividb-full
+    volumes:
+      - ./run-checks.sh:/run-checks.sh:ro
+      - ./certs:/certs:ro
+    entrypoint: ["sh", "/run-checks.sh"]

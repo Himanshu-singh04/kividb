@@ -1,0 +1,15 @@
+# ACL file for docker/verify — loaded via --aclfile by every kividb-* service.
+#
+# Deliberately does NOT define "default": the default user's password comes
+# from --requirepass on the CLI (see docker-compose.yml), and load_acl_file
+# applies rules on top of whatever already exists for a name — a "user
+# default nopass ..." line here would silently strip the requirepass-derived
+# password out from under the pre-auth (NOAUTH) checks this harness verifies.
+#
+# noflusher: the ACL command-rule bypass scenario
+# — full access except FLUSHALL/FLUSHDB.
+user noflusher on >noflusherpass ~* +@all -flushall -flushdb
+
+# analyst: the `readonly` sugar keyword (expands to -@write) — read-only
+# access to everything.
+user analyst on >analystpass ~* +@all readonly

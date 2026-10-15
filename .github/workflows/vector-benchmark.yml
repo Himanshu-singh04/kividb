@@ -1,0 +1,826 @@
+name: Vector Benchmark
+
+# Regression + competitive gate for vector search performance, using the
+# real methodology behind the published kividb-vs-Redis-Stack comparison:
+# the official redis/vector-db-benchmark (see below for why upstream, not our
+# fork), glove-25-angular (1.18M vectors), HNSW M=16/EF_CONSTRUCTION=256.
+#
+# Server + client, same placement group, like the main benchmark: kividb and
+# redis-stack-server run on a dedicated SERVER instance; vector-db-benchmark
+# (the driver) runs on a SEPARATE CLIENT instance, both in one cluster
+# placement group for lowest latency -- the same topology
+# github.com/kividbio/kivi-benchmark's memtier runbook uses, and for the same
+# reason: co-locating the server and a 100-thread client on one small,
+# burstable box (this workflow's original design) starves the server of CPU
+# under its own load, confounding the numbers with contention that has
+# nothing to do with kividb's real performance. A dedicated, non-burstable
+# server also avoids a burstable instance's CPU-credit exhaustion silently
+# throttling a long ingest run partway through -- both confounds were caught
+# live on a shared t4g.xlarge before this topology change.
+#
+# Why upstream, not our fork: redis-performance/vector-db-benchmark (now
+# redis/vector-db-benchmark) rewrote the tool in Rust and moved the old Python
+# tool this workflow originally used to a v0/ subtree. It didn't have a
+# "kividb" engine either, until we added one and it merged upstream as
+# PR redis/vector-db-benchmark#203 (2026-07-26) -- fixing a real bug the old
+# Python setup hit: generic wait-for-indexing polls RediSearch's `num_docs`,
+# which kividb's FT.INFO never sets, so it stalled every run until its own
+# timeout even though the index was already fully built. We initially kept
+# running from our own fork because of a second, separate bug (kividb missing
+# from experiment.rs's engine allowlist, caught live) that PR #203 hadn't
+# covered -- confirmed fixed upstream too as of the pinned commit below, so
+# this now runs straight from the official repo. Bump VDB_BENCHMARK_REF
+# deliberately when re-validating against a newer upstream commit, rather
+# than tracking `master` and letting the pin drift silently.
+#
+# ARM/Graviton, not x86: matches kividb-benchmark's own memtier runbook, and
+# lets `benchmark` build on a native GitHub-hosted ubuntu-*-arm runner (GA'd
+# 2026-01) instead of cross-compiling -- see that job below. c7gn is
+# Graviton (arm64) + network-optimized, same family the memtier runbook uses.
+#
+# Both engines run natively (no Docker) on the SERVER -- kividb as a built
+# binary (both it and vector-db-benchmark are Rust, both built on the same
+# arm64 runner as `launch` provisions -- no cross-compiling, no Rust
+# toolchain needed on either ephemeral instance), redis-stack-server from the
+# same packages.redis.io apt repo benchmark.yml already uses for plain Redis
+# -- on different ports on the SERVER, strictly one resident at a time: each
+# engine is started, benchmarked, and stopped before the next one starts, and
+# each start asserts the other is absent. (This comment claimed "one at a
+# time" while the workflow actually started both up front and left them both
+# running for both phases -- see the ordering comment on the start steps for
+# why that biased the comparison, and in which direction.) redis-stack-server is
+# pinned to 7.4.0-v8 (bundles Redis engine 7.4.7 + RediSearch 2.10.20) -- the
+# exact build used for the public comparison numbers this gate protects; do
+# not float on whatever the apt repo's latest happens to be on a given day.
+#
+# No Python anywhere in this workflow (the old Python v0/ setup needed a
+# venv, a `redis==4.6.0` pin to dodge a RESP3 incompatibility, etc. -- all
+# gone with the Rust tool, which defaults to RESP2 like kividb) except
+# compare_vector_baseline.py, which only runs on the GitHub-hosted runner.
+#
+# Real run times: on the shared-instance topology this replaced, kividb
+# ingest took ~27 min on a throttled/thread-starved t4g.xlarge (735 rec/s
+# average, degrading over the run -- see the topology comment above) vs.
+# ~7 min (2,899 rec/s) on an unconstrained machine. Expect the dedicated
+# c7gn server to land close to the latter; budget accordingly -- see
+# timeout-minutes -- and recalibrate via update_baseline once a real run
+# lands on this topology instead of trusting the pre-existing numbers in
+# benchmarks/vector-baseline.json, which predate this topology entirely.
+
+on:
+  # Manual only. This provisions two real EC2 instances (c7gn server + client)
+  # and ingests 1.18M vectors, so it costs real money and tens of minutes per
+  # run -- too much to fire automatically on every merge that happens to touch
+  # a vector file. It is a deliberate regression/competitive gate: run it when
+  # re-validating vector performance or before a release, not on every push.
+  #
+  # It was never on `pull_request` either, for the same reason plus the churn
+  # of pushes that only edit this workflow file while iterating on it.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/SHA to benchmark (leave empty for current)"
+        required: false
+        default: ""
+      server_instance_type:
+        description: "EC2 instance type for kividb/redis-stack-server (ARM/Graviton; matches kivi-benchmark's memtier runbook default)"
+        required: false
+        default: "c7gn.12xlarge"
+      client_instance_type:
+        description: "EC2 instance type for the vector-db-benchmark driver (ARM/Graviton; matches kivi-benchmark's memtier runbook default)"
+        required: false
+        default: "c7gn.16xlarge"
+      availability_zone:
+        description: "AZ for both instances + the placement group (c7gn capacity varies by AZ -- see kivi-benchmark's README if this fails to launch)"
+        required: false
+        default: "us-east-1a"
+      update_baseline:
+        description: "After a run (regressed or not), overwrite benchmarks/vector-baseline.json with these results and commit. Only use after deliberately reviewing why numbers changed."
+        type: boolean
+        required: false
+        default: false
+
+# Shared group name with .github/workflows/benchmark.yml ("Benchmark",
+# the memtier/general benchmark -- also c7gn.12xlarge/c7gn.16xlarge, also
+# provisioned in AWS): a run of either workflow queues behind a run of the
+# other, rather than both racing for the same account's c7gn capacity/vCPU
+# quota simultaneously. cancel-in-progress: false to match benchmark.yml --
+# queue, don't cancel a run that's already paying for real EC2 time.
+concurrency:
+  group: benchmark-global
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  SSH_KEY_PATH: /tmp/kividb_vector_bench_ssh_key
+  RUN_TAG: vecbench-${{ github.run_id }}
+  # The official upstream repo -- see the top-of-file comment for the fork
+  # history. Pinned to today's HEAD of `master` (verified to include both the
+  # kividb engine from PR #203 and the experiment.rs allowlist fix), not a
+  # floating branch ref -- bump deliberately when re-validating against a
+  # newer commit, don't let this drift silently.
+  VDB_BENCHMARK_REPO: "redis/vector-db-benchmark"
+  VDB_BENCHMARK_REF: "31a28b5ae6d35da96de6d218ada209868a628b42"
+  DATASET: "glove-25-angular"
+  # Exact packages.redis.io arm64 build bundling Redis engine 7.4.7 +
+  # RediSearch 2.10.20 -- see the top-of-file comment.
+  REDIS_STACK_VERSION: "7.4.0-v8"
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Launch server + client, same placement group ─────────────────────────
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      server_instance_id: ${{ steps.launch.outputs.server_instance_id }}
+      client_instance_id: ${{ steps.launch.outputs.client_instance_id }}
+      server_public_ip: ${{ steps.launch.outputs.server_public_ip }}
+      server_private_ip: ${{ steps.launch.outputs.server_private_ip }}
+      client_public_ip: ${{ steps.launch.outputs.client_public_ip }}
+      security_group_id: ${{ steps.launch.outputs.security_group_id }}
+      placement_group_name: ${{ steps.launch.outputs.placement_group_name }}
+      key_pair_name: ${{ steps.launch.outputs.key_pair_name }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_BENCHMARK }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_BENCHMARK }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Write SSH private key and derive its public half
+        id: ssh
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$BENCHMARK_SSH_PRIVATE_KEY" ]]; then
+            echo "::error::secrets.BENCHMARK_SSH_PRIVATE_KEY is not set."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+          echo "public_key=$(ssh-keygen -y -f "$SSH_KEY_PATH")" >> "$GITHUB_OUTPUT"
+
+      - name: Launch server + client instances
+        id: launch
+        run: |
+          set -euo pipefail
+
+          SERVER_TYPE="${{ inputs.server_instance_type }}"
+          CLIENT_TYPE="${{ inputs.client_instance_type }}"
+          AZ="${{ inputs.availability_zone }}"
+          [[ -z "$SERVER_TYPE" ]] && SERVER_TYPE="c7gn.12xlarge"
+          [[ -z "$CLIENT_TYPE" ]] && CLIENT_TYPE="c7gn.16xlarge"
+          [[ -z "$AZ" ]] && AZ="us-east-1a"
+          echo "Server: $SERVER_TYPE / Client: $CLIENT_TYPE / AZ: $AZ"
+
+          # Same distro/owner and arm64 image family as kivi-benchmark's own
+          # Terraform (Canonical's official owner ID) -- c7gn is Graviton
+          # (arm64), and the `benchmark` job below builds both kividb and
+          # vector-db-benchmark on a native arm64 GitHub-hosted runner and
+          # scp's them over, so no cross-compilation or Rust toolchain is
+          # needed on either ephemeral instance.
+          AMI_ID=$(aws ec2 describe-images \
+            --owners 099720109477 \
+            --filters \
+              "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*" \
+              "Name=virtualization-type,Values=hvm" \
+              "Name=architecture,Values=arm64" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --output text)
+          echo "AMI: $AMI_ID"
+
+          # One subnet, explicitly, for BOTH instances -- a cluster placement
+          # group requires everything in it to share an AZ, and letting AWS
+          # pick a default subnet per-instance doesn't guarantee that.
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters "Name=availability-zone,Values=$AZ" "Name=default-for-az,Values=true" \
+            --query 'Subnets[0].SubnetId' --output text)
+          if [[ "$SUBNET_ID" == "None" || -z "$SUBNET_ID" ]]; then
+            echo "::error::No default subnet found in $AZ -- pick a different availability_zone input."
+            exit 1
+          fi
+          VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$SUBNET_ID" --query 'Subnets[0].VpcId' --output text)
+          echo "Subnet: $SUBNET_ID (VPC $VPC_ID)"
+
+          KEY_NAME="kividb-vecbench-${{ github.run_id }}"
+          printf '%s\n' '${{ steps.ssh.outputs.public_key }}' > /tmp/vecbench_key.pub
+          aws ec2 import-key-pair \
+            --key-name "$KEY_NAME" \
+            --public-key-material fileb:///tmp/vecbench_key.pub
+
+          # One security group, self-referencing: SSH from anywhere (the
+          # runner needs to reach both instances), plus 6380-6381 (kividb /
+          # redis-stack-server) open only between members of this SG --
+          # i.e. server<->client, not the internet -- mirroring
+          # kivi-benchmark's Terraform ingress rules for the memtier pair.
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name "kividb-vecbench-${{ github.run_id }}" \
+            --description "Ephemeral, single-run: SSH + kividb/redis-stack ports, for ${{ env.RUN_TAG }}" \
+            --vpc-id "$VPC_ID" \
+            --query 'GroupId' --output text)
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" --protocol tcp --port 6380-6381 \
+            --source-group "$SG_ID" >/dev/null
+
+          PG_NAME="kividb-vecbench-${{ github.run_id }}"
+          aws ec2 create-placement-group \
+            --group-name "$PG_NAME" --strategy cluster >/dev/null
+          echo "Placement group: $PG_NAME"
+
+          RUN_ARGS=(--image-id "$AMI_ID" --key-name "$KEY_NAME"
+            --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID"
+            --placement "GroupName=$PG_NAME,AvailabilityZone=$AZ"
+            --instance-initiated-shutdown-behavior terminate)
+
+          SERVER_ID=$(aws ec2 run-instances "${RUN_ARGS[@]}" \
+            --instance-type "$SERVER_TYPE" \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.RUN_TAG }}-server},{Key=purpose,Value=kividb-vector-benchmark}]" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "Server instance: $SERVER_ID"
+
+          CLIENT_ID=$(aws ec2 run-instances "${RUN_ARGS[@]}" \
+            --instance-type "$CLIENT_TYPE" \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":50,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.RUN_TAG }}-client},{Key=purpose,Value=kividb-vector-benchmark}]" \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "Client instance: $CLIENT_ID"
+
+          aws ec2 wait instance-running --instance-ids "$SERVER_ID" "$CLIENT_ID"
+
+          SERVER_PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$SERVER_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          SERVER_PRIVATE_IP=$(aws ec2 describe-instances --instance-ids "$SERVER_ID" \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+          CLIENT_PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$CLIENT_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "Server: $SERVER_PUBLIC_IP (private $SERVER_PRIVATE_IP) / Client: $CLIENT_PUBLIC_IP"
+
+          {
+            echo "server_instance_id=$SERVER_ID"
+            echo "client_instance_id=$CLIENT_ID"
+            echo "server_public_ip=$SERVER_PUBLIC_IP"
+            echo "server_private_ip=$SERVER_PRIVATE_IP"
+            echo "client_public_ip=$CLIENT_PUBLIC_IP"
+            echo "security_group_id=$SG_ID"
+            echo "placement_group_name=$PG_NAME"
+            echo "key_pair_name=$KEY_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH to come up on both instances
+        run: |
+          set -euo pipefail
+          for HOST in "${{ steps.launch.outputs.server_public_ip }}" "${{ steps.launch.outputs.client_public_ip }}"; do
+            for i in $(seq 1 30); do
+              if ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                   ubuntu@"$HOST" 'echo ready' 2>/dev/null; then
+                break
+              fi
+              if [[ $i -eq 30 ]]; then
+                echo "::error::SSH never came up on $HOST"
+                exit 1
+              fi
+              sleep 10
+            done
+          done
+
+  # ── Build kividb + vector-db-benchmark, provision both instances, run, compare ─
+  benchmark:
+    needs: launch
+    # arm64, native (GA'd 2026-01 for private repos) -- matches the arm64
+    # (c7gn) EC2 instances `launch` provisions, so `cargo build --release`
+    # below produces binaries that run unmodified on them, no cross-compile
+    # toolchain needed on either instance.
+    runs-on: ubuntu-22.04-arm
+    # Build/provision overhead (~15-20 min) + up to 40 min poll budget per
+    # engine (see the two "Run vector-db-benchmark against ..." steps) +
+    # fetch/compare -- generous margin over the ~100 min worst case.
+    timeout-minutes: 130
+    env:
+      SERVER_HOST: ${{ needs.launch.outputs.server_public_ip }}
+      SERVER_PRIVATE_IP: ${{ needs.launch.outputs.server_private_ip }}
+      CLIENT_HOST: ${{ needs.launch.outputs.client_public_ip }}
+    outputs:
+      regression: ${{ steps.compare.outputs.regression }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Checkout vector-db-benchmark (kividbio fork, pinned -- see top-of-file comment)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.VDB_BENCHMARK_REPO }}
+          ref: ${{ env.VDB_BENCHMARK_REF }}
+          path: vector-db-benchmark
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            vector-db-benchmark
+
+      - name: Install libhdf5-dev (vector-db-benchmark's HDF5 dataset reader needs it to build)
+        # dpkg-dev is for dpkg-architecture, used below to locate HDF5's
+        # multi-arch install path -- matches vector-db-benchmark's own Dockerfile.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libhdf5-dev pkg-config dpkg-dev
+
+      - name: Build kividb (release, default features — matches how it's actually shipped)
+        run: cargo build --release
+
+      - name: Build vector-db-benchmark
+        working-directory: vector-db-benchmark
+        run: |
+          # HDF5_DIR hints hdf5-sys at Debian/Ubuntu's multi-arch HDF5 layout
+          # (matches this repo's own Dockerfile) -- without it, hdf5-sys can't
+          # locate the HDF5 headers/lib even though libhdf5-dev is installed.
+          HDF5_DIR="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/hdf5/serial" \
+            cargo build --release --bin vector-db-benchmark
+
+      - name: Write SSH private key
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+
+      - name: Deploy kividb to server, vector-db-benchmark to client
+        run: |
+          set -euo pipefail
+          SERVER_SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
+          CLIENT_SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$CLIENT_HOST"
+          SERVER_SCP="scp -i $SSH_KEY_PATH -o StrictHostKeyChecking=no"
+          CLIENT_SCP="scp -i $SSH_KEY_PATH -o StrictHostKeyChecking=no"
+
+          $SERVER_SSH "mkdir -p /home/ubuntu/kividb"
+          $SERVER_SCP target/release/kividb ubuntu@$SERVER_HOST:/home/ubuntu/kividb/kividb
+          $SERVER_SSH "chmod +x /home/ubuntu/kividb/kividb"
+
+          $CLIENT_SSH "mkdir -p /home/ubuntu/vdb/datasets"
+          $CLIENT_SCP vector-db-benchmark/target/release/vector-db-benchmark \
+            ubuntu@$CLIENT_HOST:/home/ubuntu/vdb/vector-db-benchmark
+          $CLIENT_SSH "chmod +x /home/ubuntu/vdb/vector-db-benchmark"
+          # datasets/datasets.json must exist relative to wherever the binary
+          # runs (it walks up from CWD looking for it) -- the dataset itself
+          # (glove-25-angular.hdf5) is downloaded straight into datasets/ by
+          # the binary at runtime, no separate download step needed.
+          $CLIENT_SCP vector-db-benchmark/datasets/datasets.json \
+            ubuntu@$CLIENT_HOST:/home/ubuntu/vdb/datasets/datasets.json
+
+      - name: Provision server (redis-stack-server)
+        run: |
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
+          $SSH REDIS_STACK_VERSION="${{ env.REDIS_STACK_VERSION }}" bash << 'REMOTE'
+          set -euo pipefail
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release
+
+          # redis-stack-server, native (no Docker) -- same packages.redis.io
+          # apt repo already used by benchmark.yml's plain-Redis install,
+          # just a different package name. arch=arm64 (this instance is
+          # Graviton) and version-pinned -- see REDIS_STACK_VERSION's
+          # top-of-file comment; do not drop the "=$VERSION" and float on
+          # whatever's latest.
+          curl -fsSL https://packages.redis.io/gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg arch=arm64] \
+            https://packages.redis.io/deb $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/redis.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "redis-stack-server=${REDIS_STACK_VERSION}"
+          # The apt package enables+starts its own systemd service on the
+          # default port (6379); this workflow starts its own instance
+          # explicitly on a chosen port instead (see the next step), so stop
+          # the service-managed one to avoid a port clash or double-counting
+          # its CPU/memory in the benchmark.
+          sudo systemctl disable --now redis-stack-server || true
+          REMOTE
+
+      - name: Provision client (HDF5 runtime lib, engines-files)
+        run: |
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$CLIENT_HOST"
+          $SSH bash << 'REMOTE'
+          set -euo pipefail
+
+          sudo apt-get update -qq
+          # runtime lib for vector-db-benchmark's HDF5 reader; -dev pulls the
+          # matching runtime .so, avoiding a guess at the exact
+          # libhdf5-1xx-x package name for this Ubuntu release.
+          sudo apt-get install -y -qq libhdf5-dev
+
+          # Two SEPARATE single-entry engines-files, not one combined file --
+          # the tool rejects passing --engines together with --engines-file,
+          # and --engines-file alone runs *every* entry in the file with no
+          # name filter, so there is no way to select just one config out of
+          # a shared file. kividb uses the dedicated "kividb" engine (merged
+          # upstream via PR #203 -- see top-of-file comment); Redis Stack
+          # uses the generic "redis" engine. Otherwise identical
+          # (hnsw_config/search_params/upload_params), matching the
+          # methodology behind the reviewed kividb-vs-Redis-Stack comparison
+          # (HNSW M=16, EF_CONSTRUCTION=256; upload 100 threads/batch 64; ef
+          # runtime sweep 64/128/256/512 at parallel=100) -- only `name`
+          # differs, so kividb's and Redis Stack's result files never
+          # collide in the shared results/ dir.
+          cat > /home/ubuntu/vdb/kividb-engine.json << 'ENGINES'
+          [
+            {
+              "name": "kividb-glove25",
+              "engine": "kividb",
+              "connection_params": {},
+              "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 256 } },
+              "search_params": [
+                { "parallel": 100, "search_params": { "ef": 64 } },
+                { "parallel": 100, "search_params": { "ef": 128 } },
+                { "parallel": 100, "search_params": { "ef": 256 } },
+                { "parallel": 100, "search_params": { "ef": 512 } }
+              ],
+              "upload_params": { "parallel": 100, "batch_size": 64 }
+            }
+          ]
+          ENGINES
+
+          cat > /home/ubuntu/vdb/redisstack-engine.json << 'ENGINES'
+          [
+            {
+              "name": "redisstack-glove25",
+              "engine": "redis",
+              "connection_params": {},
+              "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 256 } },
+              "search_params": [
+                { "parallel": 100, "search_params": { "ef": 64 } },
+                { "parallel": 100, "search_params": { "ef": 128 } },
+                { "parallel": 100, "search_params": { "ef": 256 } },
+                { "parallel": 100, "search_params": { "ef": 512 } }
+              ],
+              "upload_params": { "parallel": 100, "batch_size": 64 }
+            }
+          ]
+          ENGINES
+          REMOTE
+
+      # ── One engine resident at a time ───────────────────────────────────────
+      #
+      # This step used to start kividb AND redis-stack-server together and leave
+      # both up for both phases. That quietly biases the published comparison,
+      # and not symmetrically: during redis-stack's phase the neighbour is a
+      # kividb that has just ingested 1.18M vectors, so it is holding the whole
+      # index in RAM with its worker threads and background index compaction
+      # still resident. During kividb's phase the neighbour is a redis-stack
+      # that has done nothing yet. The engine measured second — always
+      # redis-stack — therefore competes for CPU and memory against a far
+      # heavier neighbour than the engine measured first.
+      #
+      # benchmark.yml (memtier vs Dragonfly/Redis) has always done this the
+      # right way: start one engine, run it, stop it, then start the next. This
+      # now mirrors that, and each start asserts the other engine is absent so
+      # the two can never silently overlap again.
+      - name: Start kividb on server
+        run: |
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
+          $SSH bash << 'REMOTE'
+          set -euo pipefail
+
+          # Guard on the listening port, not on `pgrep -f`. Matching process
+          # command lines is unreliable here: the pattern also matches the
+          # shell running this very script (and `pkill -f` then kills it),
+          # which a local dry-run of these scripts caught. The port is the
+          # condition we actually care about — is the other engine serving?
+          if (exec 3<>/dev/tcp/127.0.0.1/6381) 2>/dev/null; then
+            echo "::error::something is already serving on :6381 — redis-stack must be stopped before kividb's phase" >&2
+            exit 1
+          fi
+
+          cd /home/ubuntu/kividb
+          # kividb binds 0.0.0.0 by default.
+          nohup ./kividb --port 6380 --loglevel error > /tmp/kividb.log 2>&1 &
+          echo $! > /tmp/kividb.pid
+
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/6380) 2>/dev/null; then break; fi
+            if [[ $i -eq 30 ]]; then
+              echo "kividb never came up on :6380" >&2
+              cat /tmp/kividb.log >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          REMOTE
+
+      # Both "Run vector-db-benchmark against ..." steps launch the run
+      # detached (nohup + disown) and poll for completion over short-lived
+      # reconnects, rather than keeping one foreground SSH session open for
+      # the whole run. The upload phase (1.18M vectors) can take many
+      # minutes with ~no output over the SSH channel -- indicatif's progress
+      # bar doesn't redraw against a non-tty pipe -- and a long-idle SSH
+      # session like that got its connection silently killed in practice
+      # ("client_loop: send disconnect: Broken pipe", exit 255, no error
+      # from the tool itself) on a real run. ServerAliveInterval alone
+      # wasn't trusted to fix this reliably (the drop could be an
+      # intermediary NAT/idle-connection policy, not just a dead peer), so
+      # this decouples the run's lifetime from the SSH session's entirely.
+      - name: Run vector-db-benchmark against kividb
+        run: |
+          set -euo pipefail
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 ubuntu@$CLIENT_HOST"
+
+          $SSH DATASET="${{ env.DATASET }}" SERVER_IP="$SERVER_PRIVATE_IP" bash << 'REMOTE'
+          set -euo pipefail
+          cd /home/ubuntu/vdb
+          rm -f kividb-run.log kividb-run.exit
+          nohup bash -c '
+            KIVIDB_PORT=6380 ./vector-db-benchmark \
+              --host "'"$SERVER_IP"'" --engines-file kividb-engine.json \
+              --datasets "'"$DATASET"'" --parallels 100 --skip-if-exists false
+            echo $? > kividb-run.exit
+          ' > kividb-run.log 2>&1 < /dev/null &
+          echo $! > kividb-run.pid
+          disown
+          REMOTE
+
+          echo "Polling for completion (up to 40 min)..."
+          DONE=0
+          for i in $(seq 1 160); do
+            sleep 15
+            if [[ "$($SSH 'cd /home/ubuntu/vdb && (kill -0 $(cat kividb-run.pid) 2>/dev/null && echo running) || echo done')" == "done" ]]; then
+              DONE=1
+              break
+            fi
+          done
+          $SSH 'tail -n 100 /home/ubuntu/vdb/kividb-run.log' || true
+          if [[ "$DONE" != "1" ]]; then
+            echo "::error::kividb run did not finish within the poll budget" >&2
+            exit 1
+          fi
+          EXIT_CODE="$($SSH 'cat /home/ubuntu/vdb/kividb-run.exit 2>/dev/null || echo 1')"
+          [[ "$EXIT_CODE" == "0" ]]
+
+      # kividb must be gone before redis-stack starts — not merely idle. It is
+      # holding the whole ingested index in RAM at this point, so leaving it
+      # resident is exactly the bias this ordering exists to remove.
+      - name: Stop kividb on server
+        run: |
+          set -euo pipefail
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
+          $SSH bash << 'REMOTE'
+          set -uo pipefail
+          # Act on the PID recorded at start, not on a command-line pattern —
+          # `pkill -f '/home/ubuntu/kividb/kividb'` also matches the shell
+          # running this script and kills it.
+          PID="$(cat /tmp/kividb.pid 2>/dev/null || true)"
+          if [ -n "$PID" ]; then
+            kill "$PID" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            if kill -0 "$PID" 2>/dev/null; then
+              kill -9 "$PID" 2>/dev/null || true
+              sleep 2
+            fi
+          fi
+          if (exec 3<>/dev/tcp/127.0.0.1/6380) 2>/dev/null; then
+            echo "::error::something is still serving on :6380 after stopping kividb; refusing to benchmark redis-stack alongside it" >&2
+            exit 1
+          fi
+          # Let the freed memory actually settle before the next engine loads a
+          # dataset of the same size into it.
+          sleep 5
+          free -m || true
+          REMOTE
+
+      - name: Start redis-stack-server on server
+        run: |
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
+          $SSH bash << 'REMOTE'
+          set -euo pipefail
+
+          # Port, not `pgrep -f` — see the note on the kividb start step.
+          if (exec 3<>/dev/tcp/127.0.0.1/6380) 2>/dev/null; then
+            echo "::error::something is still serving on :6380 — kividb must be stopped before redis-stack's phase" >&2
+            exit 1
+          fi
+
+          # redis-stack-server needs an explicit --bind override to accept the
+          # client instance's connections (protected-mode off since this is a
+          # security-group-scoped, ephemeral, single-run box).
+          nohup redis-stack-server --port 6381 --bind 0.0.0.0 --protected-mode no \
+            > /tmp/redisstack.log 2>&1 &
+          echo $! > /tmp/redisstack.pid
+
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/6381) 2>/dev/null; then break; fi
+            if [[ $i -eq 30 ]]; then
+              echo "redis-stack-server never came up on :6381" >&2
+              cat /tmp/redisstack.log >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          REMOTE
+
+      - name: Run vector-db-benchmark against redis-stack-server
+        run: |
+          set -euo pipefail
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 ubuntu@$CLIENT_HOST"
+
+          $SSH DATASET="${{ env.DATASET }}" SERVER_IP="$SERVER_PRIVATE_IP" bash << 'REMOTE'
+          set -euo pipefail
+          cd /home/ubuntu/vdb
+          rm -f redisstack-run.log redisstack-run.exit
+          nohup bash -c '
+            REDIS_PORT=6381 ./vector-db-benchmark \
+              --host "'"$SERVER_IP"'" --engines-file redisstack-engine.json \
+              --datasets "'"$DATASET"'" --parallels 100 --skip-if-exists false
+            echo $? > redisstack-run.exit
+          ' > redisstack-run.log 2>&1 < /dev/null &
+          echo $! > redisstack-run.pid
+          disown
+          REMOTE
+
+          echo "Polling for completion (up to 40 min)..."
+          DONE=0
+          for i in $(seq 1 160); do
+            sleep 15
+            if [[ "$($SSH 'cd /home/ubuntu/vdb && (kill -0 $(cat redisstack-run.pid) 2>/dev/null && echo running) || echo done')" == "done" ]]; then
+              DONE=1
+              break
+            fi
+          done
+          $SSH 'tail -n 100 /home/ubuntu/vdb/redisstack-run.log' || true
+          if [[ "$DONE" != "1" ]]; then
+            echo "::error::redis-stack-server run did not finish within the poll budget" >&2
+            exit 1
+          fi
+          EXIT_CODE="$($SSH 'cat /home/ubuntu/vdb/redisstack-run.exit 2>/dev/null || echo 1')"
+          [[ "$EXIT_CODE" == "0" ]]
+
+      # Safety net only. In a clean run kividb is already stopped by its own
+      # step above and redis-stack has just finished; this catches whatever is
+      # left when an earlier step failed part-way. The instances are torn down
+      # afterwards regardless, so this is about not leaving a half-dead server
+      # holding a port if a later step wants to retry.
+      - name: Stop any remaining engines on server
+        if: always()
+        continue-on-error: true
+        run: |
+          SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
+          $SSH 'kill $(cat /tmp/kividb.pid) 2>/dev/null || true; kill $(cat /tmp/redisstack.pid) 2>/dev/null || true'
+
+      - name: Fetch results from client
+        run: |
+          set -euo pipefail
+          SCP="scp -i $SSH_KEY_PATH -o StrictHostKeyChecking=no"
+          # No mkdir + trailing "remote:/path/." here -- that legacy-scp idiom
+          # for "copy the directory's contents into an existing local dir"
+          # fails on the SFTP-based scp this runner ships ("error: unexpected
+          # filename: ."). Instead: destination doesn't exist yet, so `scp -r`
+          # creates it AS the copy of the remote `results` dir, which lands
+          # the files at the same flat path compare_vector_baseline.py expects.
+          rm -rf /tmp/vecbench-results
+          $SCP -r ubuntu@$CLIENT_HOST:/home/ubuntu/vdb/results /tmp/vecbench-results
+
+      - name: Upload raw results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-bench-results-${{ github.run_id }}
+          path: /tmp/vecbench-results/
+
+      - name: Compare against baseline
+        id: compare
+        run: |
+          set +e
+          python3 tests/e2e/benchmarks/compare_vector_baseline.py \
+            --kividb-experiment kividb-glove25 --kividb-results-dir /tmp/vecbench-results \
+            --redis-stack-experiment redisstack-glove25 --redis-stack-results-dir /tmp/vecbench-results \
+            --dataset "${{ env.DATASET }}" \
+            --dump-results-json /tmp/vecbench-results/extracted.json \
+            --summary-out "$GITHUB_STEP_SUMMARY"
+          code=$?
+          set -e
+          if [[ $code -eq 1 ]]; then
+            echo "regression=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "regression=false" >> "$GITHUB_OUTPUT"
+          fi
+          # A missing-file/malformed-JSON error (exit 2) is a harness
+          # problem, not a performance verdict -- always fail loudly on
+          # that. A real regression (exit 1) only fails the job when this
+          # run isn't the deliberate one updating the baseline.
+          if [[ $code -eq 2 ]]; then
+            exit 2
+          fi
+          if [[ $code -eq 1 && "${{ inputs.update_baseline }}" != "true" ]]; then
+            exit 1
+          fi
+          exit 0
+
+      - name: Upload extracted (compact) results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-bench-extracted-${{ github.run_id }}
+          path: /tmp/vecbench-results/extracted.json
+          if-no-files-found: ignore
+
+  # ── Optional: record a new baseline (manual dispatch only) ──────────────
+  update-baseline:
+    needs: benchmark
+    if: ${{ inputs.update_baseline == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vector-bench-extracted-${{ github.run_id }}
+          path: /tmp/extracted
+
+      - name: Rewrite benchmarks/vector-baseline.json from this run's results
+        run: |
+          python3 - << 'PY'
+          import json, pathlib
+          baseline_path = pathlib.Path("benchmarks/vector-baseline.json")
+          extracted = json.loads(pathlib.Path("/tmp/extracted/extracted.json").read_text())
+          baseline = json.loads(baseline_path.read_text())
+
+          # kividb_absolute gate "baseline" values are re-derived from
+          # baseline["kividb"] at compare time (see compare_vector_baseline.py),
+          # not stored per-gate -- so rewriting the two blocks above is
+          # sufficient; nothing else in "gates" needs updating.
+          baseline["kividb"] = extracted["kividb"]
+          baseline["redis_stack"] = extracted["redis_stack"]
+
+          baseline["_provenance"] = (
+              "Updated by .github/workflows/vector-benchmark.yml run "
+              "${{ github.run_id }} (workflow_dispatch, update_baseline=true)."
+          )
+          baseline_path.write_text(json.dumps(baseline, indent=2) + "\n")
+          PY
+
+      - name: Commit updated baseline
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/vector-baseline.json
+          if git diff --cached --quiet; then
+            echo "No change to baseline."
+            exit 0
+          fi
+          git commit -m "Update vector benchmark baseline (run ${{ github.run_id }})"
+          git push
+
+  # ── Always tear down, regardless of benchmark outcome ────────────────────
+  destroy:
+    needs: [launch, benchmark]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_BENCHMARK }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_BENCHMARK }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terminate instances
+        run: |
+          set -euo pipefail
+          IDS=""
+          [[ -n "${{ needs.launch.outputs.server_instance_id }}" ]] && IDS="$IDS ${{ needs.launch.outputs.server_instance_id }}"
+          [[ -n "${{ needs.launch.outputs.client_instance_id }}" ]] && IDS="$IDS ${{ needs.launch.outputs.client_instance_id }}"
+          if [[ -n "$IDS" ]]; then
+            aws ec2 terminate-instances --instance-ids $IDS
+            aws ec2 wait instance-terminated --instance-ids $IDS
+          fi
+
+      - name: Delete placement group
+        # Only possible once both instances are fully terminated -- AWS
+        # rejects deleting a placement group with members still in it.
+        if: needs.launch.outputs.placement_group_name != ''
+        continue-on-error: true
+        run: aws ec2 delete-placement-group --group-name "${{ needs.launch.outputs.placement_group_name }}"
+
+      - name: Delete security group
+        if: needs.launch.outputs.security_group_id != ''
+        continue-on-error: true
+        run: aws ec2 delete-security-group --group-id "${{ needs.launch.outputs.security_group_id }}"
+
+      - name: Delete key pair
+        if: needs.launch.outputs.key_pair_name != ''
+        continue-on-error: true
+        run: aws ec2 delete-key-pair --key-name "${{ needs.launch.outputs.key_pair_name }}"

@@ -1,0 +1,48 @@
+== GAP 1: FT.CREATE rejects per-field options after TEXT / TAG / NUMERIC
+[1] FT.CREATE repro_3f2110_0 ON HASH PREFIX 1 repro_3f2110_0: SCHEMA f TEXT WEIGHT 1
+    -> b'OK'
+[1] FT.CREATE repro_3f2110_1 ON HASH PREFIX 1 repro_3f2110_1: SCHEMA f TAG SEPARATOR ,
+    -> b'OK'
+[1] FT.CREATE repro_3f2110_2 ON HASH PREFIX 1 repro_3f2110_2: SCHEMA f TEXT SORTABLE
+    -> b'OK'
+[1] FT.CREATE repro_3f2110_3 ON HASH PREFIX 1 repro_3f2110_3: SCHEMA f TAG CASESENSITIVE
+    -> b'OK'
+[1] FT.CREATE repro_3f2110_4 ON HASH PREFIX 1 repro_3f2110_4: SCHEMA f NUMERIC SORTABLE
+    -> b'OK'
+[1] FT.CREATE repro_3f2110_rvl ON HASH PREFIX 1 repro_3f2110_rvl SCORE 1.0 SCHEMA prompt TEXT WEIGHT 1 response TEXT WEIGHT 1 inserted_at NUMERIC updated_at NUMERIC prompt_vector VECTOR FLAT 6 TYPE FLOAT32 DIM 4 DISTANCE_METRIC COSINE litellm_cache_key TAG SEPARATOR ,
+    -> b'OK'
+[setup] FT.CREATE repro_3f2110_q ON HASH PREFIX 1 repro_3f2110_q: SCHEMA prompt TEXT k TAG v VECTOR FLAT 6 TYPE FLOAT32 DIM 4 DISTANCE_METRIC COSINE
+    -> b'OK'
+
+== GAP 2: VECTOR_RANGE query returns no results (no error); same doc is found by KNN
+[2] FT.SEARCH repro_3f2110_q @v:[VECTOR_RANGE $r $q]=>{$YIELD_DISTANCE_AS: d} PARAMS 4 r 0.2 q <16-byte vector> RETURN 1 d DIALECT 2
+    -> [1, b'repro_3f2110_q:1', [b'd', b'0.00496286153793']]
+[2] FT.SEARCH repro_3f2110_q *=>[KNN 1 @v $q AS d] PARAMS 2 q <16-byte vector> RETURN 1 d DIALECT 2
+    -> [1, b'repro_3f2110_q:1', [b'd', b'0.00496286153793']]
+
+== GAP 3: non-vector FT.SEARCH returns an empty field list; RETURN / NOCONTENT ignored
+[3] FT.SEARCH repro_3f2110_q @k:{abc} RETURN 1 prompt DIALECT 2
+    -> [1, b'repro_3f2110_q:1', [b'prompt', b'hello']]
+[3] FT.SEARCH repro_3f2110_q * DIALECT 2
+    -> [1, b'repro_3f2110_q:1', [b'prompt', b'hello', b'k', b'abc', b'v', b'\x00\x00\x80?\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00']]
+[3] FT.SEARCH repro_3f2110_q * NOCONTENT DIALECT 2
+    -> [1, b'repro_3f2110_q:1']
+
+== GAPS 4-6: KNN pre-filter expressions (expected: pf:a only, except where noted)
+[setup] FT.CREATE repro_3f2110_f ON HASH PREFIX 1 repro_3f2110_f: SCHEMA k TAG n NUMERIC v VECTOR FLAT 6 TYPE FLOAT32 DIM 2 DISTANCE_METRIC COSINE
+    -> b'OK'
+[4 negation] FT.SEARCH repro_3f2110_f (-@k:{tenantB})=>[KNN 5 @v $q AS d] PARAMS 2 q <8-byte vector> RETURN 1 k SORTBY d DIALECT 2
+    -> [1, b'repro_3f2110_f:a', [b'k', b'tenantA']]
+[5 OR across clauses] FT.SEARCH repro_3f2110_f (@k:{tenantA}|@k:{nobody})=>[KNN 5 @v $q AS d] PARAMS 2 q <8-byte vector> RETURN 1 k SORTBY d DIALECT 2
+    -> [1, b'repro_3f2110_f:a', [b'k', b'tenantA']]
+[6 tag without braces (Redis: no match)] FT.SEARCH repro_3f2110_f (@k:tenantA)=>[KNN 5 @v $q AS d] PARAMS 2 q <8-byte vector> RETURN 1 k SORTBY d DIALECT 2
+    -> [0]
+[ok tag] FT.SEARCH repro_3f2110_f (@k:{tenantA})=>[KNN 5 @v $q AS d] PARAMS 2 q <8-byte vector> RETURN 1 k SORTBY d DIALECT 2
+    -> [1, b'repro_3f2110_f:a', [b'k', b'tenantA']]
+[ok tag AND numeric] FT.SEARCH repro_3f2110_f (@k:{tenantA} @n:[0 10])=>[KNN 5 @v $q AS d] PARAMS 2 q <8-byte vector> RETURN 1 k SORTBY d DIALECT 2
+    -> [1, b'repro_3f2110_f:a', [b'k', b'tenantA']]
+
+== PARITY: FT.SEARCH reply shape under RESP3 (Redis Stack returns a map)
+[resp3] FT.SEARCH repro_3f2110_q *=>[KNN 1 @v $q AS d] PARAMS 2 q <16-byte vector> RETURN 1 d DIALECT 2
+    -> {b'attributes': [], b'format': b'STRING', b'results': [{b'id': b'repro_3f2110_q:1', b'extra_attributes': {b'd': b'0.00496286153793'}, b'values': []}], b'total_results': 1, b'warning': []}
+    reply type under RESP3: dict

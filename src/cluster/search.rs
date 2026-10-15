@@ -1,0 +1,333 @@
+// src/cluster/search.rs
+//
+// Searching a whole cluster.
+//
+// Each master indexes the keys it holds. FT.SEARCH and FT.AGGREGATE sent to
+// a node of a cluster are answered from all of them: the node that receives
+// the command (the coordinator) sends it on to every other master, over the
+// connections and with the credentials replication uses, marked so that the
+// receiving node answers from its own keys rather than sending it on again.
+// The coordinator merges what comes back:
+//
+//   FT.SEARCH     each master is asked for the first offset+count matches,
+//                 with their scores and sort keys; the coordinator orders
+//                 them all as one node would, and takes the page asked for.
+//                 The total is the sum of the masters' totals.
+//   FT.AGGREGATE  each master sends the rows that match the query, before
+//                 any step; the coordinator runs the steps (GROUPBY, REDUCE,
+//                 APPLY, FILTER, SORTBY, LIMIT) over all of them, so every
+//                 reducer is exact. WITHCURSOR keeps the cursor on the
+//                 coordinator.
+//
+// Relevance (BM25) is computed by each master over its own documents, as in
+// RediSearch's coordinator. A node answers only for the slots it serves, so
+// keys part-way through a migration are not counted twice.
+
+use crate::cluster::ClusterState;
+use crate::cluster::node::NodeFlags;
+use std::io::{BufRead, BufReader, Write};
+use std::net::ToSocketAddrs;
+use std::time::Duration;
+
+/// The client name a coordinator's requests are sent under.
+pub const FORWARDED: &str = "kividb-cluster-search";
+
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A reply as read off the wire.
+#[derive(Debug, Clone)]
+pub enum Reply {
+    Int(i64),
+    Bulk(Option<Vec<u8>>),
+    Simple(String),
+    Error(String),
+    Array(Vec<Reply>),
+}
+
+impl Reply {
+    pub fn text(&self) -> Option<String> {
+        match self {
+            Reply::Bulk(Some(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+            Reply::Simple(s) => Some(s.clone()),
+            Reply::Int(n) => Some(n.to_string()),
+            _ => None,
+        }
+    }
+}
+
+/// Read one reply. RESP2, as a coordinator's connections speak it.
+pub fn read_reply(reader: &mut impl BufRead) -> Result<Reply, String> {
+    let mut line = String::new();
+    if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+        return Err("connection closed".into());
+    }
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (kind, rest) = line.split_at(line.len().min(1));
+    let number = || {
+        rest.parse::<i64>()
+            .map_err(|_| format!("bad reply: {line}"))
+    };
+    match kind {
+        "+" => Ok(Reply::Simple(rest.to_string())),
+        "-" => Ok(Reply::Error(rest.to_string())),
+        ":" => Ok(Reply::Int(number()?)),
+        "$" => {
+            let len = number()?;
+            if len < 0 {
+                return Ok(Reply::Bulk(None));
+            }
+            let mut body = vec![0u8; len as usize + 2];
+            reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+            body.truncate(len as usize);
+            Ok(Reply::Bulk(Some(body)))
+        }
+        "*" => {
+            let n = number()?;
+            if n < 0 {
+                return Ok(Reply::Bulk(None));
+            }
+            let mut items = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                items.push(read_reply(reader)?);
+            }
+            Ok(Reply::Array(items))
+        }
+        _ => Err(format!("unexpected reply: {line}")),
+    }
+}
+
+/// Parse a reply this node produced itself.
+pub fn parse_reply(bytes: &[u8]) -> Result<Reply, String> {
+    read_reply(&mut BufReader::new(bytes))
+}
+
+/// Whether this node answers for `key`: its slot is this node's, or, on a
+/// replica, its master's.
+pub fn serves(cluster: &ClusterState, key: &str) -> bool {
+    let owner = cluster.slot_owner(crate::cluster::key_hash_slot(key.as_bytes()));
+    owner.is_some() && (owner == Some(cluster.myself()) || owner == cluster.my_master_id())
+}
+
+/// Whether this command came from a coordinator.
+pub fn is_forwarded(ctx: &crate::commands::ctx::Ctx) -> bool {
+    ctx.cluster.enabled
+        && ctx
+            .client_registry
+            .get(ctx.client_id)
+            .is_some_and(|c| c.name == FORWARDED)
+}
+
+/// The masters, other than the one whose data this node holds, that a
+/// coordinator asks.
+fn others(cluster: &ClusterState) -> Vec<(String, u16)> {
+    let me = cluster.myself();
+    let mine = cluster.my_master_id().unwrap_or(me);
+    cluster
+        .nodes
+        .read()
+        .values()
+        .filter(|n| {
+            n.id != me
+                && n.id != mine
+                && n.flags.contains(NodeFlags::MASTER)
+                && !n.flags.contains(NodeFlags::HANDSHAKE)
+                && !n.ip.is_empty()
+                && n.client_port != 0
+        })
+        .map(|n| (n.ip.clone(), n.client_port))
+        .collect()
+}
+
+/// Whether this node coordinates a search: in a cluster with other masters,
+/// for a client (not a coordinator), and not inside a transaction or a
+/// script, which hold the server's gates (a search there answers from this
+/// node, as before).
+pub fn coordinates(ctx: &crate::commands::ctx::Ctx) -> bool {
+    ctx.cluster.enabled
+        && !crate::write_gate::held_by_this_thread()
+        && !crate::command_gate::alone_on_this_thread()
+        && !is_forwarded(ctx)
+        && !others(ctx.cluster).is_empty()
+}
+
+fn encode(parts: &[&[u8]]) -> Vec<u8> {
+    let owned: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
+    crate::resp::write::encode_resp_command(&owned)
+}
+
+/// [`ask_once`]; and a master that does not have the index (added to the
+/// cluster after it was created) is given it, and asked again.
+fn ask(
+    host: &str,
+    port: u16,
+    credentials: &(String, String),
+    db: usize,
+    cmd: &[Vec<u8>],
+    definition: Option<&[Vec<u8>]>,
+) -> Result<Reply, String> {
+    match ask_once(host, port, credentials, db, cmd) {
+        Err(e) if e.ends_with("no such index") && definition.is_some() => {
+            let create: Vec<&[u8]> = definition.unwrap().iter().map(Vec::as_slice).collect();
+            crate::cluster::ddl::run_on(host, port, &credentials.0, &credentials.1, &create)?;
+            log_info!("Cluster: gave {host}:{port} the definition of an index it lacked");
+            ask_once(host, port, credentials, db, cmd)
+        }
+        other => other,
+    }
+}
+
+fn ask_once(
+    host: &str,
+    port: u16,
+    credentials: &(String, String),
+    db: usize,
+    cmd: &[Vec<u8>],
+) -> Result<Reply, String> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .ok_or("could not resolve")?;
+    let (stream, _) =
+        crate::node_tls::connect_node(host, &addr, TIMEOUT).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let (user, password) = credentials;
+    let mut out = Vec::new();
+    let mut preamble = 0;
+    if !password.is_empty() {
+        out.extend(if user.is_empty() {
+            encode(&[b"AUTH", password.as_bytes()])
+        } else {
+            encode(&[b"AUTH", user.as_bytes(), password.as_bytes()])
+        });
+        preamble += 1;
+    }
+    out.extend(encode(&[b"CLIENT", b"SETNAME", FORWARDED.as_bytes()]));
+    preamble += 1;
+    // A cluster has database 0 only; SELECT would be one more command the
+    // user these connections log in as must be allowed.
+    if db != 0 {
+        out.extend(encode(&[b"SELECT", db.to_string().as_bytes()]));
+        preamble += 1;
+    }
+    let parts: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+    out.extend(encode(&parts));
+    let writer = reader.get_mut();
+    writer
+        .write_all(&out)
+        .and_then(|()| writer.flush())
+        .map_err(|e| e.to_string())?;
+    for _ in 0..preamble {
+        if let Reply::Error(e) = read_reply(&mut reader)? {
+            return Err(e);
+        }
+    }
+    match read_reply(&mut reader)? {
+        Reply::Error(e) => Err(e),
+        reply => Ok(reply),
+    }
+}
+
+/// Send `cmd` to every other master (see [`others`]) and collect their
+/// replies. An error if any of them cannot answer: a search of part of the
+/// data is not one of the whole.
+pub fn fan_out(ctx: &crate::commands::ctx::Ctx, cmd: &[Vec<u8>]) -> Result<Vec<Reply>, String> {
+    let targets = others(ctx.cluster);
+    let credentials = ctx.repl_state.master_credentials();
+    let db = *ctx.selected_db;
+    // The index's definition, for a master that lacks it.
+    let definition: Option<Vec<Vec<u8>>> = cmd.get(1).and_then(|name| {
+        let name = String::from_utf8_lossy(name);
+        let store = ctx.index_store.read();
+        let real = crate::vector::alias_target(&store, &name).unwrap_or(name.to_string());
+        store.get(&real).map(|def| def.create_args())
+    });
+    let definition = definition.as_deref();
+    let results: Vec<Result<Reply, String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|(host, port)| {
+                let credentials = &credentials;
+                scope.spawn(move || {
+                    ask(host, *port, credentials, db, cmd, definition)
+                        .map_err(|e| format!("{host}:{port}: {e}"))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("panicked".into())))
+            .collect()
+    });
+    let mut replies = Vec::with_capacity(results.len());
+    let mut failed = Vec::new();
+    for result in results {
+        match result {
+            Ok(reply) => replies.push(reply),
+            Err(e) => failed.push(e),
+        }
+    }
+    if failed.is_empty() {
+        Ok(replies)
+    } else {
+        Err(format!(
+            "ERR the search could not be answered by {} of the cluster's masters: {}",
+            failed.len(),
+            failed.join("; ")
+        ))
+    }
+}
+
+/// The rows of an aggregation, as a master sends them to its coordinator:
+/// every column of every row.
+pub fn encode_rows(rows: &[ahash::AHashMap<String, String>]) -> Vec<u8> {
+    use crate::resp::write::{resp_array, resp_bulk_str};
+    resp_array(
+        rows.iter()
+            .map(|row| {
+                resp_array(
+                    row.iter()
+                        .flat_map(|(k, v)| [resp_bulk_str(k), resp_bulk_str(v)])
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The rows in a master's reply to [`encode_rows`].
+pub fn decode_rows(reply: Reply) -> Vec<ahash::AHashMap<String, String>> {
+    let Reply::Array(rows) = reply else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|row| match row {
+            Reply::Array(cells) => Some(
+                cells
+                    .chunks(2)
+                    .filter_map(|pair| Some((pair.first()?.text()?, pair.get(1)?.text()?)))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replies_are_read_whole_and_rows_survive_the_trip() {
+        let reply = parse_reply(b"*3\r\n:2\r\n$3\r\nabc\r\n*2\r\n$-1\r\n+OK\r\n").unwrap();
+        let Reply::Array(items) = reply else { panic!() };
+        assert!(matches!(items[0], Reply::Int(2)));
+        assert_eq!(items[1].text().as_deref(), Some("abc"));
+
+        let mut row = ahash::AHashMap::new();
+        row.insert("__key".to_string(), "doc:1".to_string());
+        row.insert("price".to_string(), "10".to_string());
+        let back = decode_rows(parse_reply(&encode_rows(&[row.clone()])).unwrap());
+        assert_eq!(back, vec![row]);
+    }
+}

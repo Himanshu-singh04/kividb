@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Formatting only: it takes seconds, so it can run on every commit. Clippy
+# and the Linux checks run on push (.githooks/pre-push).
+# Skip with `git commit --no-verify` or KIVIDB_SKIP_HOOKS=1.
+
+[ "${KIVIDB_SKIP_HOOKS:-0}" = 1 ] && exit 0
+git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$' || exit 0
+
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+  echo "pre-commit: code is not formatted. Run \`cargo fmt --all\`, then stage and commit again." >&2
+  exit 1
+fi

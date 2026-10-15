@@ -1,0 +1,108 @@
+[lib]
+name = "kividb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kividb"
+path = "src/main.rs"
+
+[package]
+name = "kividb"
+version = "1.1.0"
+edition = "2024"
+description = "A fast Redis®-compatible in-memory store written in Rust"
+license = "AGPL-3.0-only"
+authors = ["KIVIDB PRIVATE LIMITED"]
+homepage = "https://kividb.io"
+readme = "README.md"
+repository = "https://github.com/kividbio/kividb"
+keywords = ["redis", "database", "in-memory", "resp"]
+categories = ["database"]
+
+[package.metadata.deb]
+name = "kividb"
+maintainer = "KiviDB Private Limited"
+section = "database"
+priority = "optional"
+depends = "$auto"
+
+[dependencies]
+memchr = "2"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+ahash = "0.8"
+# Hashes keep their fields in insertion order, as Redis's listpack does.
+indexmap = "2"
+socket2 = { version = "0.5", features = ["all"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2.183"
+rand = "0.8"
+serde_json = { version = "1", features = ["preserve_order"] }
+ordered-float = "4"
+sha2 = "0.10"
+lzf = "0.3"
+bitflags = "2.6"
+either = "1"
+# ARGREP's `RE <pattern>` predicate (Redis 8.8 array commands). Linear-time
+# engine with no backtracking, so a client-supplied pattern can't be turned into
+# a CPU denial-of-service the way a backtracking engine allows.
+#
+# `regex-lite`, not `regex`: the full engine contributed 553 KB of `.text`
+# (65% of this release's total binary growth), and with `lto = "fat"` the hot
+# command path is already ~130 KB against a 64 KB L1i — that much extra code
+# measurably worsens instruction-cache pressure on the benchmark's hot loop.
+# regex-lite has the same `Regex::new` / `is_match` surface and the same
+# linear-time guarantee; it trades match throughput for size, which is the right
+# trade for ARGREP (a scan command, not a hot path).
+regex-lite = "0.1"
+tokio-rustls  = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2",   optional = true }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"], optional = true }
+sha1 = { version = "0.10", optional = true }
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+# The startup update check (src/update_check.rs): one HTTPS request to
+# kividb.io. The provider is aws-lc-rs, the one the `tls` feature's server
+# already uses, so a build with both has a single crypto provider; the roots
+# are compiled in, so it works in images without a CA bundle.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1"
+compact_str = "0.10.0"
+hashbrown = { version = "0.17", default-features = false }
+
+[features]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+# The builds with Lua use mimalloc (on Linux): see `mimalloc` below.
+lua = ["dep:mlua", "dep:sha1", "mimalloc"]
+# `mimalloc`: mimalloc under the counting allocator, on Linux. Part of the
+# builds with Lua, and not of the default build.
+#
+# Scripts are what it is for. A script allocates and frees a few hundred
+# small blocks, and with scripts running on several threads at once
+# (`lua-parallel-scripts`) a block is as a rule freed by another thread than
+# the one that allocated it, which glibc's malloc takes a lock for: four
+# job queues on four cores processed 6,100 jobs a second with glibc and
+# 10,800 with mimalloc, the server's CPU time a third less.
+#
+# For plain commands on one thread it changes little either way (about 60
+# instructions fewer a GET, 640 more a 1 KB SET), and the default build, which
+# is the one measured against other engines, keeps the system allocator until
+# it has been measured there on a machine with many cores.
+mimalloc = ["dep:mimalloc"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = "0.5"
+# Behind the `mimalloc` feature: see there.
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"
+rcgen = "0.13"

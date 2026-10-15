@@ -1,0 +1,9 @@
+{
+  "name": "kividb-bullmq-soak",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "bullmq": "6.3.11",
+    "ioredis": "^5.4.1"
+  }
+}
