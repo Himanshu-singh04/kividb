@@ -1499,7 +1499,17 @@ fn atomic_slot_migration_moves_a_range_under_load() {
         format!("MOVED {slot} 127.0.0.1:{}", dst.port)
     );
 
-    // Both sides report the task, and the cluster is whole.
+    // Both sides report the task, and the cluster is whole. The source records
+    // it completed once its nodes.conf is saved, which on a busy disk is a
+    // moment after it has dropped the keys.
+    wait_until(
+        "the source to record the task completed",
+        Duration::from_secs(10),
+        || {
+            let on_src = s.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ALL"]);
+            task_field(&on_src.array()[0], "state").text() == "completed"
+        },
+    );
     let on_src = s.cmd(&["CLUSTER", "MIGRATION", "STATUS", "ALL"]);
     let task = &on_src.array()[0];
     assert_eq!(task_field(task, "id").text(), task_id);
