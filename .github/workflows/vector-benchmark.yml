@@ -1,12 +1,12 @@
 name: Vector Benchmark
 
 # Regression + competitive gate for vector search performance, using the
-# real methodology behind the published kividb-vs-Redis-Stack comparison:
+# real methodology behind the published kividb-vs-Redis comparison:
 # the official redis/vector-db-benchmark (see below for why upstream, not our
 # fork), glove-25-angular (1.18M vectors), HNSW M=16/EF_CONSTRUCTION=256.
 #
 # Server + client, one virtual network, like the main benchmark: kividb and
-# redis-stack-server run on a dedicated SERVER instance; vector-db-benchmark
+# Redis run on a dedicated SERVER instance; vector-db-benchmark
 # (the driver) runs on a SEPARATE CLIENT instance -- the same topology
 # github.com/kividbio/kivi-benchmark's memtier runbook uses, and for the same
 # reason: co-locating the server and a 100-thread client on one small,
@@ -40,17 +40,18 @@ name: Vector Benchmark
 # Both engines run natively (no Docker) on the SERVER -- kividb as a built
 # binary (both it and vector-db-benchmark are Rust, both built on the same
 # arm64 runner as `launch` provisions -- no cross-compiling, no Rust
-# toolchain needed on either ephemeral instance), redis-stack-server from the
+# toolchain needed on either ephemeral instance), Redis from the
 # same packages.redis.io apt repo benchmark.yml already uses for plain Redis
 # -- on different ports on the SERVER, strictly one resident at a time: each
 # engine is started, benchmarked, and stopped before the next one starts, and
 # each start asserts the other is absent. (This comment claimed "one at a
 # time" while the workflow actually started both up front and left them both
 # running for both phases -- see the ordering comment on the start steps for
-# why that biased the comparison, and in which direction.) redis-stack-server is
-# pinned to 7.4.0-v8 (bundles Redis engine 7.4.7 + RediSearch 2.10.20) -- the
-# exact build used for the public comparison numbers this gate protects; do
-# not float on whatever the apt repo's latest happens to be on a given day.
+# why that biased the comparison, and in which direction.) Redis is
+# pinned to 8.10.2 with its built-in query engine -- the version the README's
+# vector comparison uses (it replaced redis-stack-server 7.4.0-v8 on
+# 2026-10-16); do not float on whatever the apt repo's latest happens to be
+# on a given day.
 #
 # No Python anywhere in this workflow (the old Python v0/ setup needed a
 # venv, a `redis==4.6.0` pin to dodge a RESP3 incompatibility, etc. -- all
@@ -83,7 +84,7 @@ on:
         required: false
         default: ""
       server_size:
-        description: "Azure size for kividb/redis-stack-server (arm64)"
+        description: "Azure size for kividb/Redis (arm64)"
         required: false
         default: "Standard_D32ps_v5"
       client_size:
@@ -121,9 +122,10 @@ env:
   VDB_BENCHMARK_REPO: "redis/vector-db-benchmark"
   VDB_BENCHMARK_REF: "31a28b5ae6d35da96de6d218ada209868a628b42"
   DATASET: "glove-25-angular"
-  # Exact packages.redis.io arm64 build bundling Redis engine 7.4.7 +
-  # RediSearch 2.10.20 -- see the top-of-file comment.
-  REDIS_STACK_VERSION: "7.4.0-v8"
+  # Exact packages.redis.io arm64 build of Redis 8.10.2, whose query engine
+  # (vector search included) ships with Redis itself -- see the top-of-file
+  # comment.
+  REDIS_DEB: "6:8.10.2-1rl1~jammy1"
 
 permissions:
   contents: read
@@ -231,34 +233,41 @@ jobs:
           $CLIENT_SCP vector-db-benchmark/datasets/datasets.json \
             ubuntu@$CLIENT_HOST:/home/ubuntu/vdb/datasets/datasets.json
 
-      - name: Provision server (redis-stack-server)
+      - name: Provision server (Redis 8.10)
         run: |
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
-          $SSH REDIS_STACK_VERSION="${{ env.REDIS_STACK_VERSION }}" bash << 'REMOTE'
+          $SSH REDIS_DEB="${{ env.REDIS_DEB }}" bash << 'REMOTE'
           set -euo pipefail
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq ca-certificates curl gnupg lsb-release
 
-          # redis-stack-server, native (no Docker) -- same packages.redis.io
-          # apt repo already used by benchmark.yml's plain-Redis install,
-          # just a different package name. arch=arm64 (this machine is
-          # arm64) and version-pinned -- see REDIS_STACK_VERSION's
-          # top-of-file comment; do not drop the "=$VERSION" and float on
-          # whatever's latest.
+          # Redis 8.10, native (no Docker), from the same packages.redis.io
+          # apt repo benchmark.yml uses. The `redis` package brings the
+          # query engine module (redisearch.so). arch=arm64 and
+          # version-pinned -- see REDIS_DEB; do not drop the "=$REDIS_DEB"
+          # and float on whatever's latest.
           curl -fsSL https://packages.redis.io/gpg \
             | sudo gpg --yes --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg arch=arm64] \
             https://packages.redis.io/deb $(lsb_release -cs) main" \
             | sudo tee /etc/apt/sources.list.d/redis.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq "redis-stack-server=${REDIS_STACK_VERSION}"
+          sudo apt-get install -y -qq --allow-downgrades \
+            "redis=${REDIS_DEB}" "redis-server=${REDIS_DEB}" "redis-tools=${REDIS_DEB}"
+          MOD=$(dpkg -L redis redis-server redis-tools 2>/dev/null | grep -m1 '/redisearch\.so$' || true)
+          if [[ -z "$MOD" ]]; then
+            echo "::error::the Redis packages did not install redisearch.so" >&2
+            exit 1
+          fi
+          echo "$MOD" > /home/ubuntu/redisearch-path
+          redis-server --version
           # The apt package enables+starts its own systemd service on the
           # default port (6379); this workflow starts its own instance
           # explicitly on a chosen port instead (see the next step), so stop
           # the service-managed one to avoid a port clash or double-counting
           # its CPU/memory in the benchmark.
-          sudo systemctl disable --now redis-stack-server || true
+          sudo systemctl disable --now redis-server || true
           REMOTE
 
       - name: Provision client (HDF5 runtime lib, engines-files)
@@ -278,13 +287,13 @@ jobs:
           # and --engines-file alone runs *every* entry in the file with no
           # name filter, so there is no way to select just one config out of
           # a shared file. kividb uses the dedicated "kividb" engine (merged
-          # upstream via PR #203 -- see top-of-file comment); Redis Stack
+          # upstream via PR #203 -- see top-of-file comment); Redis
           # uses the generic "redis" engine. Otherwise identical
           # (hnsw_config/search_params/upload_params), matching the
-          # methodology behind the reviewed kividb-vs-Redis-Stack comparison
+          # methodology behind the reviewed kividb-vs-Redis comparison
           # (HNSW M=16, EF_CONSTRUCTION=256; upload 100 threads/batch 64; ef
           # runtime sweep 64/128/256/512 at parallel=100) -- only `name`
-          # differs, so kividb's and Redis Stack's result files never
+          # differs, so kividb's and Redis's result files never
           # collide in the shared results/ dir.
           cat > /home/ubuntu/vdb/kividb-engine.json << 'ENGINES'
           [
@@ -304,10 +313,10 @@ jobs:
           ]
           ENGINES
 
-          cat > /home/ubuntu/vdb/redisstack-engine.json << 'ENGINES'
+          cat > /home/ubuntu/vdb/redis-engine.json << 'ENGINES'
           [
             {
-              "name": "redisstack-glove25",
+              "name": "redis-glove25",
               "engine": "redis",
               "connection_params": {},
               "collection_params": { "hnsw_config": { "M": 16, "EF_CONSTRUCTION": 256 } },
@@ -325,14 +334,14 @@ jobs:
 
       # ── One engine resident at a time ───────────────────────────────────────
       #
-      # This step used to start kividb AND redis-stack-server together and leave
+      # This step used to start kividb AND Redis together and leave
       # both up for both phases. That quietly biases the published comparison,
-      # and not symmetrically: during redis-stack's phase the neighbour is a
+      # and not symmetrically: during Redis's phase the neighbour is a
       # kividb that has just ingested 1.18M vectors, so it is holding the whole
       # index in RAM with its worker threads and background index compaction
-      # still resident. During kividb's phase the neighbour is a redis-stack
+      # still resident. During kividb's phase the neighbour is a Redis
       # that has done nothing yet. The engine measured second — always
-      # redis-stack — therefore competes for CPU and memory against a far
+      # Redis — therefore competes for CPU and memory against a far
       # heavier neighbour than the engine measured first.
       #
       # benchmark.yml (memtier vs Dragonfly/Redis) has always done this the
@@ -351,7 +360,7 @@ jobs:
           # which a local dry-run of these scripts caught. The port is the
           # condition we actually care about — is the other engine serving?
           if (exec 3<>/dev/tcp/127.0.0.1/6381) 2>/dev/null; then
-            echo "::error::something is already serving on :6381 — redis-stack must be stopped before kividb's phase" >&2
+            echo "::error::something is already serving on :6381 — Redis must be stopped before kividb's phase" >&2
             exit 1
           fi
 
@@ -420,7 +429,7 @@ jobs:
           EXIT_CODE="$($SSH 'cat /home/ubuntu/vdb/kividb-run.exit 2>/dev/null || echo 1')"
           [[ "$EXIT_CODE" == "0" ]]
 
-      # kividb must be gone before redis-stack starts — not merely idle. It is
+      # kividb must be gone before Redis starts — not merely idle. It is
       # holding the whole ingested index in RAM at this point, so leaving it
       # resident is exactly the bias this ordering exists to remove.
       - name: Stop kividb on server
@@ -445,7 +454,7 @@ jobs:
             fi
           fi
           if (exec 3<>/dev/tcp/127.0.0.1/6380) 2>/dev/null; then
-            echo "::error::something is still serving on :6380 after stopping kividb; refusing to benchmark redis-stack alongside it" >&2
+            echo "::error::something is still serving on :6380 after stopping kividb; refusing to benchmark Redis alongside it" >&2
             exit 1
           fi
           # Let the freed memory actually settle before the next engine loads a
@@ -454,7 +463,7 @@ jobs:
           free -m || true
           REMOTE
 
-      - name: Start redis-stack-server on server
+      - name: Start Redis on server
         run: |
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
           $SSH bash << 'REMOTE'
@@ -462,29 +471,31 @@ jobs:
 
           # Port, not `pgrep -f` — see the note on the kividb start step.
           if (exec 3<>/dev/tcp/127.0.0.1/6380) 2>/dev/null; then
-            echo "::error::something is still serving on :6380 — kividb must be stopped before redis-stack's phase" >&2
+            echo "::error::something is still serving on :6380 — kividb must be stopped before Redis's phase" >&2
             exit 1
           fi
 
-          # redis-stack-server needs an explicit --bind override to accept the
-          # client instance's connections (protected-mode off since this is a
-          # security-group-scoped, ephemeral, single-run box).
-          nohup redis-stack-server --port 6381 --bind 0.0.0.0 --protected-mode no \
-            > /tmp/redisstack.log 2>&1 &
-          echo $! > /tmp/redisstack.pid
+          # --bind to accept the client machine's connections (protected-mode
+          # off: an NSG-scoped, ephemeral, single-run box); no persistence,
+          # like kividb's run; the query engine loaded explicitly.
+          nohup redis-server --port 6381 --bind 0.0.0.0 --protected-mode no \
+            --save '' --appendonly no \
+            --loadmodule "$(cat /home/ubuntu/redisearch-path)" \
+            > /tmp/redis.log 2>&1 &
+          echo $! > /tmp/redis.pid
 
           for i in $(seq 1 30); do
             if (exec 3<>/dev/tcp/127.0.0.1/6381) 2>/dev/null; then break; fi
             if [[ $i -eq 30 ]]; then
-              echo "redis-stack-server never came up on :6381" >&2
-              cat /tmp/redisstack.log >&2
+              echo "Redis never came up on :6381" >&2
+              cat /tmp/redis.log >&2
               exit 1
             fi
             sleep 1
           done
           REMOTE
 
-      - name: Run vector-db-benchmark against redis-stack-server
+      - name: Run vector-db-benchmark against Redis
         run: |
           set -euo pipefail
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 ubuntu@$CLIENT_HOST"
@@ -492,14 +503,14 @@ jobs:
           $SSH DATASET="${{ env.DATASET }}" SERVER_IP="$SERVER_PRIVATE_IP" bash << 'REMOTE'
           set -euo pipefail
           cd /home/ubuntu/vdb
-          rm -f redisstack-run.log redisstack-run.exit
+          rm -f redis-run.log redis-run.exit
           nohup bash -c '
             REDIS_PORT=6381 ./vector-db-benchmark \
-              --host "'"$SERVER_IP"'" --engines-file redisstack-engine.json \
+              --host "'"$SERVER_IP"'" --engines-file redis-engine.json \
               --datasets "'"$DATASET"'" --parallels 100 --skip-if-exists false
-            echo $? > redisstack-run.exit
-          ' > redisstack-run.log 2>&1 < /dev/null &
-          echo $! > redisstack-run.pid
+            echo $? > redis-run.exit
+          ' > redis-run.log 2>&1 < /dev/null &
+          echo $! > redis-run.pid
           disown
           REMOTE
 
@@ -507,21 +518,21 @@ jobs:
           DONE=0
           for i in $(seq 1 160); do
             sleep 15
-            if [[ "$($SSH 'cd /home/ubuntu/vdb && (kill -0 $(cat redisstack-run.pid) 2>/dev/null && echo running) || echo done')" == "done" ]]; then
+            if [[ "$($SSH 'cd /home/ubuntu/vdb && (kill -0 $(cat redis-run.pid) 2>/dev/null && echo running) || echo done')" == "done" ]]; then
               DONE=1
               break
             fi
           done
-          $SSH 'tail -n 100 /home/ubuntu/vdb/redisstack-run.log' || true
+          $SSH 'tail -n 100 /home/ubuntu/vdb/redis-run.log' || true
           if [[ "$DONE" != "1" ]]; then
-            echo "::error::redis-stack-server run did not finish within the poll budget" >&2
+            echo "::error::Redis run did not finish within the poll budget" >&2
             exit 1
           fi
-          EXIT_CODE="$($SSH 'cat /home/ubuntu/vdb/redisstack-run.exit 2>/dev/null || echo 1')"
+          EXIT_CODE="$($SSH 'cat /home/ubuntu/vdb/redis-run.exit 2>/dev/null || echo 1')"
           [[ "$EXIT_CODE" == "0" ]]
 
       # Safety net only. In a clean run kividb is already stopped by its own
-      # step above and redis-stack has just finished; this catches whatever is
+      # step above and Redis has just finished; this catches whatever is
       # left when an earlier step failed part-way. The instances are torn down
       # afterwards regardless, so this is about not leaving a half-dead server
       # holding a port if a later step wants to retry.
@@ -530,7 +541,7 @@ jobs:
         continue-on-error: true
         run: |
           SSH="ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no -o ConnectTimeout=30 ubuntu@$SERVER_HOST"
-          $SSH 'kill $(cat /tmp/kividb.pid) 2>/dev/null || true; kill $(cat /tmp/redisstack.pid) 2>/dev/null || true'
+          $SSH 'kill $(cat /tmp/kividb.pid) 2>/dev/null || true; kill $(cat /tmp/redis.pid) 2>/dev/null || true'
 
       - name: Fetch results from client
         run: |
@@ -557,7 +568,7 @@ jobs:
           set +e
           python3 tests/e2e/benchmarks/compare_vector_baseline.py \
             --kividb-experiment kividb-glove25 --kividb-results-dir /tmp/vecbench-results \
-            --redis-stack-experiment redisstack-glove25 --redis-stack-results-dir /tmp/vecbench-results \
+            --redis-experiment redis-glove25 --redis-results-dir /tmp/vecbench-results \
             --dataset "${{ env.DATASET }}" \
             --dump-results-json /tmp/vecbench-results/extracted.json \
             --summary-out "$GITHUB_STEP_SUMMARY"
@@ -619,7 +630,7 @@ jobs:
           # not stored per-gate -- so rewriting the two blocks above is
           # sufficient; nothing else in "gates" needs updating.
           baseline["kividb"] = extracted["kividb"]
-          baseline["redis_stack"] = extracted["redis_stack"]
+          baseline["redis"] = extracted["redis"]
 
           baseline["_provenance"] = (
               "Updated by .github/workflows/vector-benchmark.yml run "

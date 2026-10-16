@@ -135,10 +135,13 @@ jobs:
           fi
           echo "Dragonfly: $(./dragonfly-aarch64 --version 2>/dev/null || echo 'ready')"
 
-          # ── Redis 8 ──────────────────────────────────────────────────────────
+          # ── Redis 8.10 ───────────────────────────────────────────────────────
+          # Pinned, like Dragonfly: the newest 8.x on a given day is not a
+          # comparison anyone can repeat.
+          REDIS_DEB="6:8.10.2-1rl1~jammy1"
           INSTALLED_REDIS=$(redis-server --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
-          if [[ "$INSTALLED_REDIS" != "8."* ]]; then
-            echo "Installing Redis 8.x..."
+          if [[ "$INSTALLED_REDIS" != "8.10.2" ]]; then
+            echo "Installing Redis 8.10.2..."
             sudo apt-get remove -y redis-server redis-tools || true
             curl -fsSL https://packages.redis.io/gpg \
             | sudo gpg --yes --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
@@ -148,7 +151,7 @@ jobs:
             sudo apt-get update -qq
             # Check what's actually available first
             apt-cache madison redis-server | head -5 || true
-            sudo apt-get install -y redis-server
+            sudo apt-get install -y --allow-downgrades "redis-server=$REDIS_DEB" "redis-tools=$REDIS_DEB"
             sudo systemctl stop redis-server || true
             sudo systemctl disable redis-server || true
           fi
@@ -736,7 +739,7 @@ jobs:
 
           ## Results
 
-          | Test | KiviDB | Dragonfly v2.0.2 | Redis 8 | KiviDB vs Dragonfly | KiviDB vs Redis | KiviDB over TLS |
+          | Test | KiviDB | Dragonfly v2.0.2 | Redis 8.10.2 | KiviDB vs Dragonfly | KiviDB vs Redis | KiviDB over TLS |
           |------|-------|-----------------|----------|---------------------|-----------------|-----------------------|
           | Pipelined write (`--ratio 1:0 -c 5 --pipeline=10`) | {fmt(r['kivi_write_pipelined'])} | {fmt(r['dragonfly_write_pipelined'])} | {fmt(r['redis_write_pipelined'])} | {pct(r['kivi_write_pipelined'],r['dragonfly_write_pipelined'])} | {pct(r['kivi_write_pipelined'],r['redis_write_pipelined'])} | {fmt(r['kivi_write_pipelined_tls'])} |
           | Pipelined read (`--ratio 0:1 -c 5 --pipeline=10`) | {fmt(r['kivi_read_pipelined'])} | {fmt(r['dragonfly_read_pipelined'])} | {fmt(r['redis_read_pipelined'])} | {pct(r['kivi_read_pipelined'],r['dragonfly_read_pipelined'])} | {pct(r['kivi_read_pipelined'],r['redis_read_pipelined'])} | {fmt(r['kivi_read_pipelined_tls'])} |
