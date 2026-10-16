@@ -72,9 +72,12 @@ az network vnet create -g "$RESOURCE_GROUP" -l "$LOCATION" -n "$PREFIX-vnet" \
 
 PPG_ARGS=()
 if [[ "$USE_PROXIMITY_GROUP" == "true" ]]; then
-  # The intended sizes let Azure pick a datacenter that has both.
+  # The intended sizes let Azure pick a datacenter that has both. Each
+  # once: Azure refuses a list that names one size twice.
+  SIZES=("$SERVER_SIZE")
+  if [[ "$CLIENT_SIZE" != "$SERVER_SIZE" ]]; then SIZES+=("$CLIENT_SIZE"); fi
   az ppg create -g "$RESOURCE_GROUP" -l "$LOCATION" -n "$PREFIX-ppg" -t Standard \
-    --intent-vm-sizes "$SERVER_SIZE" "$CLIENT_SIZE" --tags "${TAGS[@]}" -o none
+    --intent-vm-sizes "${SIZES[@]}" --tags "${TAGS[@]}" -o none
   PPG_ARGS=(--ppg "$PREFIX-ppg")
 fi
 
