@@ -1,4 +1,5 @@
 name: Smoke Test
+# Run by hand against a published tag, or called by release.yml after an -rc.
 
 # Independent workflow — callable directly (workflow_dispatch, any published
 # tag including stable releases, for ad-hoc reruns/bisects) or as a reusable
