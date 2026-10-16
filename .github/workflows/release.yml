@@ -304,13 +304,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Quay.io
-        uses: docker/login-action@v3
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
-
       - name: Build and push (${{ matrix.variant.name }}, amd64)
         uses: docker/build-push-action@v6
         with:
@@ -321,7 +314,6 @@ jobs:
             KIVIDB_FEATURES=${{ matrix.variant.features }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
-            quay.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
           cache-from: type=gha,scope=${{ matrix.variant.name }}-amd64
           cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-amd64
 
@@ -353,13 +345,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Quay.io
-        uses: docker/login-action@v3
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
-
       - name: Build and push (${{ matrix.variant.name }}, arm64)
         uses: docker/build-push-action@v6
         with:
@@ -370,7 +355,6 @@ jobs:
             KIVIDB_FEATURES=${{ matrix.variant.features }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
-            quay.io/${{ github.repository }}:${{ env.RELEASE_TAG }}-${{ matrix.variant.arch_tag }}
           cache-from: type=gha,scope=${{ matrix.variant.name }}-arm64
           cache-to: type=gha,mode=max,scope=${{ matrix.variant.name }}-arm64
 
@@ -389,13 +373,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Quay.io
-        uses: docker/login-action@v3
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
-
       - name: Create and push multi-arch manifests
         env:
           TAG: ${{ env.RELEASE_TAG }}
@@ -409,7 +386,7 @@ jobs:
           IS_STABLE=false
           case "${VER}" in *-*) IS_STABLE=false ;; *) IS_STABLE=true ;; esac
 
-          for registry in "ghcr.io/${{ github.repository }}" "quay.io/${{ github.repository }}"; do
+          for registry in "ghcr.io/${{ github.repository }}"; do
             for variant in default lua tls full; do
               # Resolve the per-arch infix used when images were pushed
               if [ "${variant}" = "default" ]; then
@@ -462,7 +439,8 @@ jobs:
           VERSION="${RELEASE_TAG#v}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-          aws s3 cp "s3://kividb-releases/v${VERSION}/SHA256SUMS.txt" /tmp/SHA256SUMS.txt
+          # SHA256SUMS.txt is published as an asset of the GitHub Release.
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/SHA256SUMS.txt" -o /tmp/SHA256SUMS.txt
 
           # Default (no-feature) binaries used by Homebrew
           INTEL_SHA=$(grep "kividb-darwin-x86_64\.tar\.gz$"  /tmp/SHA256SUMS.txt | awk '{print $1}')
@@ -471,10 +449,6 @@ jobs:
           echo "arm_sha=${ARM_SHA}"     >> $GITHUB_OUTPUT
 
           echo "Version: ${VERSION}  Intel: ${INTEL_SHA}  ARM: ${ARM_SHA}"
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_RELEASE }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ACCESS_SECRET_RELEASE }}
-          AWS_DEFAULT_REGION: us-east-1
 
       - name: Update Homebrew formula
         run: |
@@ -489,11 +463,11 @@ jobs:
 
             on_macos do
               on_arm do
-                url "https://releases.kividb.io/v${{ steps.extract.outputs.version }}/kividb-darwin-aarch64.tar.gz"
+                url "https://github.com/${{ github.repository }}/releases/download/v${{ steps.extract.outputs.version }}/kividb-darwin-aarch64.tar.gz"
                 sha256 "${{ steps.extract.outputs.arm_sha }}"
               end
               on_intel do
-                url "https://releases.kividb.io/v${{ steps.extract.outputs.version }}/kividb-darwin-x86_64.tar.gz"
+                url "https://github.com/${{ github.repository }}/releases/download/v${{ steps.extract.outputs.version }}/kividb-darwin-x86_64.tar.gz"
                 sha256 "${{ steps.extract.outputs.intel_sha }}"
               end
             end
@@ -556,25 +530,6 @@ jobs:
           cp artifacts/* release-assets/
           cd release-assets
           find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -exec sha256sum {} \; | sort > SHA256SUMS.txt
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_RELEASE }}
-          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_RELEASE }}
-          aws-region: us-east-1
-
-      - name: Upload versioned release to S3
-        run: |
-          aws s3 sync release-assets/ s3://kividb-releases/${{ env.RELEASE_TAG }}/ \
-            --cache-control "public, max-age=31536000, immutable"
-
-      - name: Update latest pointer in S3
-        if: ${{ !contains(env.RELEASE_TAG, '-') }}
-        run: |
-          aws s3 sync release-assets/ s3://kividb-releases/latest/ \
-            --delete \
-            --cache-control "public, max-age=300"
 
       # The release page: a heading, the release's own notes if it has them
       # (docs/releases/<tag>.md, written for people upgrading), then what

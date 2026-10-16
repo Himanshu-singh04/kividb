@@ -185,11 +185,10 @@ the internet without a password.
 
 ### Docker
 
-Images are published to GitHub Container Registry and Quay.io:
+Images are published to the GitHub Container Registry:
 
 ```bash
 docker pull ghcr.io/kividbio/kividb:latest
-docker pull quay.io/kividbio/kividb:latest
 ```
 
 `latest` and version tags such as `v1.1.0` are the default variant; `v1.1.0-lua`,
@@ -233,22 +232,22 @@ production).
 ### Release binaries
 
 Release binaries for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel) are published
-at [releases.kividb.io](https://releases.kividb.io/) and on
-[GitHub Releases](https://github.com/kividbio/kividb/releases). Replace `latest` with a
-version such as `v1.1.0` to pin one.
+on [GitHub Releases](https://github.com/kividbio/kividb/releases). The `latest/download`
+links below always resolve to the newest release; replace `latest/download` with
+`download/v1.1.0` to pin a version.
 
 ```bash
 # Linux x86_64
-curl -LO https://releases.kividb.io/latest/kividb-linux-x86_64.tar.gz
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-x86_64.tar.gz
 tar xzf kividb-linux-x86_64.tar.gz
 ./kividb
 
 # Linux aarch64 (an ARMv8.1 CPU or newer: Graviton2 and later, Ampere; not a Raspberry Pi 4)
-curl -LO https://releases.kividb.io/latest/kividb-linux-aarch64.tar.gz
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-linux-aarch64.tar.gz
 
 # macOS, Apple silicon / Intel
-curl -LO https://releases.kividb.io/latest/kividb-darwin-aarch64.tar.gz
-curl -LO https://releases.kividb.io/latest/kividb-darwin-x86_64.tar.gz
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-darwin-aarch64.tar.gz
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb-darwin-x86_64.tar.gz
 ```
 
 Each variant other than the default has its name in the file: `kividb-lua-linux-x86_64.tar.gz`,
@@ -259,8 +258,8 @@ built with [nfpm](https://github.com/goreleaser/nfpm) from
 of every file in a release.
 
 ```bash
-curl -LO https://releases.kividb.io/latest/kividb_amd64.deb && sudo dpkg -i kividb_amd64.deb
-curl -LO https://releases.kividb.io/latest/kividb.x86_64.rpm && sudo rpm -i kividb.x86_64.rpm
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb_amd64.deb && sudo dpkg -i kividb_amd64.deb
+curl -LO https://github.com/kividbio/kividb/releases/latest/download/kividb.x86_64.rpm && sudo rpm -i kividb.x86_64.rpm
 ```
 
 ## Configuration
