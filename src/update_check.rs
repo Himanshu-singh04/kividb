@@ -1,32 +1,24 @@
-//! Asking kividb.io, once at startup, whether there is a newer release — and
-//! showing whatever announcement it has.
+//! Asking GitHub, once at startup, whether there is a newer KiviDB release.
 //!
-//! One HTTPS request, made from a thread of its own; what it finds is the
-//! first thing the server prints, above the banner. Startup waits for it at
-//! most `BANNER_WAIT`, and a slower reply is dropped, so a slow or absent
-//! network delays startup by that much at worst and never touches a client.
-//! What is sent is the running version, the OS, the architecture and
-//! the build variant — nothing that identifies the machine or its data. Any
-//! failure (no network, DNS, TLS, a timeout, a malformed reply) is logged at
-//! debug level and otherwise ignored.
+//! One HTTPS request, made from a thread of its own, for
+//! `https://github.com/kividbio/kividb/releases/latest`. GitHub answers it
+//! with a redirect to the newest stable release's page,
+//! `.../releases/tag/v1.1.0`, so the tag is read from the `Location` header:
+//! no API, no token, no rate limit, and no body to parse. If that release is
+//! newer than this build, a notice is the first thing the server prints,
+//! above the banner.
 //!
-//! The reply is JSON; every field is optional:
+//! Startup waits for the reply at most `BANNER_WAIT`, and a slower reply is
+//! dropped, so a slow or absent network delays startup by that much at worst
+//! and never touches a client. Nothing about the machine, its configuration
+//! or its data is sent; the request carries only a `User-Agent` naming the
+//! running version. Any failure (no network, DNS, TLS, a timeout, an
+//! unexpected reply) is logged at debug level and otherwise ignored.
 //!
-//! ```text
-//! {
-//!   "latest":  "1.0.6",                       newest release; a notice is shown
-//!                                             only if it is newer than this build
-//!   "url":     "https://kividb.io/downloads", where to get it
-//!   "message": "one or more lines of text",   shown as is, at most 5 lines
-//!   "art":     "lines of ASCII art"           shown as is, at most 15 lines
-//! }
-//! ```
-//!
-//! Whatever comes back is printed to the operator's terminal or log, so it is
-//! cleaned first: control characters — terminal escape sequences above all —
-//! and bidirectional-text overrides are removed, and every line and the
-//! number of lines are capped. The file can say what it likes; it cannot
-//! move the cursor, recolour, rewrite or flood what the operator sees.
+//! The tag comes from the network and is printed to the operator's terminal
+//! or log, so only a version-shaped tag is accepted: digits and dots, an
+//! optional leading `v` and an optional `-suffix` of letters and digits.
+//! Nothing else from the reply is shown.
 //!
 //! Turned off by `update-check no` in the config file, `--update-check no`,
 //! or `KIVIDB_NO_UPDATE_CHECK=1`; and never made by a debug build, or when
@@ -38,27 +30,25 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// Where the check is made unless `update-check-url` says otherwise.
-pub const DEFAULT_URL: &str = "https://kividb.io/api/release-check";
+pub const DEFAULT_URL: &str = "https://github.com/kividbio/kividb/releases/latest";
 
 /// For each connection attempt, and each read and write after it.
 const TIMEOUT: Duration = Duration::from_secs(4);
 /// How long startup waits for the reply, at most, so the notice is the first
 /// thing printed. The only time the check can hold up startup.
 const BANNER_WAIT: Duration = Duration::from_millis(1500);
-/// A reply larger than this is not an announcement.
+/// Only the head of the reply is wanted; a redirect has no body worth the name.
 const MAX_REPLY: usize = 64 * 1024;
+/// Longer than any real version tag.
+const MAX_TAG: usize = 40;
 
-const MESSAGE_LINES: usize = 5;
-const ART_LINES: usize = 15;
-const LINE_WIDTH: usize = 120;
-
-/// What the server was told, and what it said back.
-#[derive(Debug, Default, PartialEq)]
-pub struct Announcement {
-    pub latest: Option<String>,
-    pub url: Option<String>,
-    pub message: Vec<String>,
-    pub art: Vec<String>,
+/// The newest release, as the redirect named it.
+#[derive(Debug, PartialEq)]
+pub struct Release {
+    /// The tag, e.g. `v1.1.0`.
+    pub tag: String,
+    /// Its page, where the downloads are.
+    pub url: String,
 }
 
 /// Whether the check is to be made at all.
@@ -75,7 +65,7 @@ pub fn enabled(config: &crate::config::Config) -> bool {
 
 /// A check under way: started early, shown by the banner.
 pub struct Pending {
-    reply: mpsc::Receiver<Result<Announcement, String>>,
+    reply: mpsc::Receiver<Result<Option<Release>, String>>,
     deadline: Instant,
 }
 
@@ -104,8 +94,10 @@ pub fn start(config: &crate::config::Config) -> Option<Pending> {
 pub fn show(pending: Pending) {
     let wait = pending.deadline.saturating_duration_since(Instant::now());
     let error = match pending.reply.recv_timeout(wait) {
-        Ok(Ok(announcement)) => {
-            let lines = render(env!("CARGO_PKG_VERSION"), &announcement);
+        Ok(Ok(release)) => {
+            let lines = release
+                .map(|r| render(env!("CARGO_PKG_VERSION"), &r))
+                .unwrap_or_default();
             if !lines.is_empty() {
                 for line in lines {
                     println!("{line}");
@@ -130,7 +122,8 @@ pub fn variant() -> &'static str {
     }
 }
 
-fn check(url: &str) -> Result<Announcement, String> {
+/// `Ok(None)`: the repository has no release yet.
+pub fn check(url: &str) -> Result<Option<Release>, String> {
     let (host, path) = url
         .strip_prefix("https://")
         .map(|rest| {
@@ -146,20 +139,12 @@ fn check(url: &str) -> Result<Announcement, String> {
         ),
         None => (host, 443),
     };
-    let separator = if path.contains('?') { '&' } else { '?' };
-    let path = format!(
-        "{path}{separator}version={}&os={}&arch={}&build={}",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        variant()
-    );
-
-    let body = https_get(host_name, port, &path)?;
-    parse(&body)
+    let head = https_head(host_name, port, &path)?;
+    release_from(&head)
 }
 
-fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, String> {
+/// The status line and headers of the reply to a `GET`.
+fn https_head(host: &str, port: u16, path: &str) -> Result<String, String> {
     let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
@@ -192,18 +177,20 @@ fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
 
     let mut tls = rustls::StreamOwned::new(connection, socket);
-    // HTTP/1.0: the reply is the body to the end of the connection, never
-    // chunked.
     let request = format!(
-        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: kividb/{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: kividb/{}\r\nConnection: close\r\n\r\n",
         env!("CARGO_PKG_VERSION")
     );
     tls.write_all(request.as_bytes())
         .map_err(|e| format!("sending: {e}"))?;
 
+    // Read until the end of the headers; the body is not wanted.
     let mut reply = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
+        if let Some(end) = reply.windows(4).position(|w| w == b"\r\n\r\n") {
+            return Ok(String::from_utf8_lossy(&reply[..end]).into_owned());
+        }
         match tls.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -212,73 +199,62 @@ fn https_get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, String> {
                     return Err("reply too large".into());
                 }
             }
-            // A server that closes without TLS's close_notify: what has
-            // arrived is the reply.
+            // A server that closes without TLS's close_notify.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(format!("reading: {e}")),
         }
     }
+    Err("no HTTP header in the reply".into())
+}
 
-    let head_end = reply
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("no HTTP header in the reply")?;
-    let head = String::from_utf8_lossy(&reply[..head_end]);
+/// Read the release out of the reply's head: a redirect whose `Location`
+/// ends in `/releases/tag/<tag>`. A redirect anywhere else (GitHub sends
+/// `/releases` when there is no release) means there is none.
+pub fn release_from(head: &str) -> Result<Option<Release>, String> {
     let status = head
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or("no HTTP status in the reply")?;
-    if status != 200 {
-        return Err(format!("HTTP {status}"));
+    if !(300..400).contains(&status) {
+        return Err(format!("HTTP {status}, not a redirect"));
     }
-    Ok(reply[head_end + 4..].to_vec())
-}
-
-/// Read the reply. Fields that are missing, or of the wrong type, are
-/// treated as not given.
-pub fn parse(body: &[u8]) -> Result<Announcement, String> {
-    let json: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| format!("not JSON: {e}"))?;
-    let text = |key: &str| json.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    let one_line = |value: Option<String>| {
-        value
-            .map(|v| clean_line(v.lines().next().unwrap_or_default()))
-            .filter(|v| !v.is_empty())
+    let location = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("location"))
+        .map(|(_, value)| value.trim())
+        .ok_or("a redirect without a Location")?;
+    let Some((page, tag)) = location.rsplit_once("/releases/tag/") else {
+        return Ok(None);
     };
-    Ok(Announcement {
-        latest: one_line(text("latest")),
-        url: one_line(text("url")),
-        message: clean_block(
-            text("message").as_deref().unwrap_or_default(),
-            MESSAGE_LINES,
-        ),
-        art: clean_block(text("art").as_deref().unwrap_or_default(), ART_LINES),
-    })
-}
-
-/// A line as it may be shown: no control characters (so no terminal escape
-/// sequences), no bidirectional-text overrides, tabs as spaces, trailing
-/// spaces removed, at most `LINE_WIDTH` characters.
-fn clean_line(line: &str) -> String {
-    let cleaned: String = line
-        .chars()
-        .map(|c| if c == '\t' { ' ' } else { c })
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(*c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
-        })
-        .take(LINE_WIDTH)
-        .collect();
-    cleaned.trim_end().to_string()
-}
-
-fn clean_block(text: &str, max_lines: usize) -> Vec<String> {
-    let mut lines: Vec<String> = text.lines().take(max_lines).map(clean_line).collect();
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
+    if !is_version_tag(tag) {
+        return Err(format!("'{}' is not a version tag", tag.escape_debug()));
     }
-    lines
+    if !page.starts_with("https://") || page.chars().any(|c| c.is_control() || c == ' ') {
+        return Err("an unexpected Location".into());
+    }
+    Ok(Some(Release {
+        tag: tag.to_string(),
+        url: location.to_string(),
+    }))
+}
+
+/// `v1.2.3`, `1.2`, `v1.2.3-rc1`: nothing that could carry anything else.
+fn is_version_tag(tag: &str) -> bool {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (version, None),
+    };
+    tag.len() <= MAX_TAG
+        && core
+            .split('.')
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        && pre.is_none_or(|p| {
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+        })
 }
 
 /// A version as numbers, and whether it is a pre-release (`1.0.5-rc1`).
@@ -319,43 +295,23 @@ pub fn is_newer(latest: &str, running: &str) -> bool {
     }
 }
 
-/// What is printed, line by line; nothing if there is nothing to say.
-pub fn render(running: &str, announcement: &Announcement) -> Vec<String> {
-    let mut body: Vec<String> = Vec::new();
-    if let Some(latest) = announcement
-        .latest
-        .as_deref()
-        .filter(|l| is_newer(l, running))
-    {
-        body.push(format!(
-            "A new KiviDB release is available: {latest} (you are running {running})."
-        ));
-        match announcement.url.as_deref() {
-            Some(url) => body.push(format!("Download it from {url}")),
-            None => body.push("Download it from https://kividb.io/downloads".to_string()),
-        }
+/// What is printed, line by line; nothing if this build is up to date.
+pub fn render(running: &str, release: &Release) -> Vec<String> {
+    if !is_newer(&release.tag, running) {
+        return Vec::new();
     }
-    if !announcement.message.is_empty() {
-        if !body.is_empty() {
-            body.push(String::new());
-        }
-        body.extend(announcement.message.iter().cloned());
+    let latest = release.tag.trim_start_matches('v');
+    let body = [
+        format!("A new KiviDB release is available: {latest} (you are running {running})."),
+        format!("Download it from {}", release.url),
+    ];
+    let width = body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let mut out = vec![String::new(), format!("  +{}+", "-".repeat(width + 2))];
+    for line in &body {
+        let pad = width - line.chars().count();
+        out.push(format!("  | {line}{} |", " ".repeat(pad)));
     }
-    let mut out = Vec::new();
-    if body.is_empty() && announcement.art.is_empty() {
-        return out;
-    }
-    out.push(String::new());
-    out.extend(announcement.art.iter().map(|l| format!("  {l}")));
-    if !body.is_empty() {
-        let width = body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-        out.push(format!("  +{}+", "-".repeat(width + 2)));
-        for line in &body {
-            let pad = width - line.chars().count();
-            out.push(format!("  | {line}{} |", " ".repeat(pad)));
-        }
-        out.push(format!("  +{}+", "-".repeat(width + 2)));
-    }
+    out.push(format!("  +{}+", "-".repeat(width + 2)));
     out.push(String::new());
     out
 }
@@ -363,6 +319,9 @@ pub fn render(running: &str, announcement: &Announcement) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REDIRECT: &str = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\
+        location: https://github.com/kividbio/kividb/releases/tag/v1.1.0";
 
     #[test]
     fn versions_compare_as_releases_do() {
@@ -380,59 +339,62 @@ mod tests {
     }
 
     #[test]
-    fn what_comes_back_cannot_reach_the_terminal() {
-        let body = br#"{
-            "latest": "1.0.6\u001b[2J",
-            "url": "https://kividb.io/downloads\nsecond line",
-            "message": "Hello\u001b[31m red\u0007\nline two\tend   \n\u202eevil",
-            "art": "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq"
-        }"#;
-        let a = parse(body).unwrap();
-        assert_eq!(a.latest.as_deref(), Some("1.0.6[2J"));
-        assert_eq!(a.url.as_deref(), Some("https://kividb.io/downloads"));
-        assert_eq!(a.message, ["Hello[31m red", "line two end", "evil"]);
-        assert_eq!(a.art.len(), ART_LINES);
-        for line in render("1.0.5", &a) {
+    fn the_release_is_read_from_the_redirect() {
+        let release = release_from(REDIRECT).unwrap().unwrap();
+        assert_eq!(release.tag, "v1.1.0");
+        assert_eq!(
+            release.url,
+            "https://github.com/kividbio/kividb/releases/tag/v1.1.0"
+        );
+        // No release yet: GitHub sends the releases list instead.
+        let none = "HTTP/1.1 302 Found\r\nLocation: https://github.com/kividbio/kividb/releases";
+        assert_eq!(release_from(none).unwrap(), None);
+        assert!(release_from("HTTP/1.1 404 Not Found").is_err());
+        assert!(release_from("HTTP/1.1 200 OK\r\nLocation: x").is_err());
+        assert!(release_from("HTTP/1.1 302 Found").is_err());
+    }
+
+    #[test]
+    fn only_a_version_shaped_tag_is_accepted() {
+        for good in ["v1.1.0", "1.1.0", "v2.0", "v1.1.0-rc1", "v1.1.0-beta.2"] {
+            assert!(is_version_tag(good), "{good}");
+        }
+        for bad in [
+            "",
+            "v",
+            "latest",
+            "v1..0",
+            "v1.1.0-",
+            "v1.1.0\u{1b}[2J",
+            "v1.1.0 hello",
+            "v1.1.0-rc1<script>",
+            "v1.1.0\u{202e}",
+        ] {
+            assert!(!is_version_tag(bad), "{bad:?}");
+        }
+        let head =
+            "HTTP/1.1 302 Found\r\nLocation: https://github.com/x/y/releases/tag/v1.1.0\u{1b}[31m";
+        assert!(release_from(head).is_err());
+    }
+
+    #[test]
+    fn a_newer_release_is_announced_and_a_current_one_is_not() {
+        let release = release_from(REDIRECT).unwrap().unwrap();
+        let shown = render("1.0.6", &release).join("\n");
+        assert!(
+            shown.contains("A new KiviDB release is available: 1.1.0 (you are running 1.0.6)."),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "Download it from https://github.com/kividbio/kividb/releases/tag/v1.1.0"
+            ),
+            "{shown}"
+        );
+        assert!(render("1.1.0", &release).is_empty());
+        assert!(!render("1.1.0-rc1", &release).is_empty());
+        for line in render("1.0.6", &release) {
             assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
         }
-        let long = format!(r#"{{"message": "{}"}}"#, "x".repeat(500));
-        assert_eq!(parse(long.as_bytes()).unwrap().message[0].len(), LINE_WIDTH);
-    }
-
-    #[test]
-    fn nothing_is_shown_when_there_is_nothing_to_say() {
-        let current = parse(br#"{"latest": "1.0.5"}"#).unwrap();
-        assert!(render("1.0.5", &current).is_empty());
-        assert!(render("1.0.5", &parse(b"{}").unwrap()).is_empty());
-        assert!(parse(b"<html>").is_err());
-        // Wrong types are as if not given.
-        assert_eq!(
-            parse(br#"{"latest": 7, "message": ["x"]}"#).unwrap(),
-            Announcement::default()
-        );
-    }
-
-    #[test]
-    fn a_newer_release_is_announced_with_the_message() {
-        let a =
-            parse(br#"{"latest":"1.0.6","url":"https://kividb.io/d","message":"Try the cloud"}"#)
-                .unwrap();
-        let shown = render("1.0.5", &a).join("\n");
-        assert!(
-            shown.contains("A new KiviDB release is available: 1.0.6 (you are running 1.0.5)."),
-            "{shown}"
-        );
-        assert!(
-            shown.contains("Download it from https://kividb.io/d"),
-            "{shown}"
-        );
-        assert!(shown.contains("Try the cloud"), "{shown}");
-        // A message alone, with the build up to date, is still shown.
-        let only = parse(br#"{"latest":"1.0.5","message":"Try the cloud"}"#).unwrap();
-        let shown = render("1.0.5", &only).join("\n");
-        assert!(
-            shown.contains("Try the cloud") && !shown.contains("new KiviDB release"),
-            "{shown}"
-        );
     }
 }

@@ -345,9 +345,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Whether a newer release is out, and kividb.io's announcement, if it has
-    // one: the first thing printed. Waits for kividb.io at most 1.5 s; a later
-    // reply is dropped. See src/update_check.rs.
+    // Whether a newer release is out on GitHub: the first thing printed.
+    // Waits for the reply at most 1.5 s; a later one is dropped. See
+    // src/update_check.rs.
     if let Some(pending) = update_check::start(&config) {
         update_check::show(pending);
     }

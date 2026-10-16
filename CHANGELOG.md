@@ -85,11 +85,11 @@ people upgrading, are in
   protocol errors. Warnings and errors say what to do; repeating ones are
   throttled. `docs/LOGGING.md` and `docs/ERRORS.md` document the log and every
   error.
-- **Startup update check.** At startup the server asks kividb.io whether a
-  newer release is out, and shows the answer with any announcement
-  kividb.io has, above the banner (waiting at most 1.5 seconds). It sends the version, OS,
-  architecture and build variant, and nothing else. What comes back is
-  stripped of control characters and capped in size before it is printed.
+- **Startup update check.** At startup the server asks GitHub
+  (`https://github.com/kividbio/kividb/releases/latest`) whether a newer
+  release is out and, if one is, says so above the banner (waiting at most
+  1.5 seconds). Nothing is sent but the request; only a version-shaped tag
+  is read from the reply.
   Turn it off with `update-check no`, `--update-check no` or
   `KIVIDB_NO_UPDATE_CHECK=1`. See `docs/UPDATE_CHECK.md`.
 - **Cluster: `min-replicas-to-write` and `min-replicas-max-lag`**, as in
