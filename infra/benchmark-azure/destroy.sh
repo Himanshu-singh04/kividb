@@ -10,6 +10,18 @@ RESOURCE_GROUP="${RESOURCE_GROUP:-kividb-benchmark}"
 MATCH="kvb-$RUN_PREFIX-"
 export AZURE_CORE_ONLY_SHOW_ERRORS=true
 
+# The Azure CLI on GitHub's runners sometimes dies on its own import race
+# ("deadlock detected by _ModuleLock"). Every call here is safe to repeat.
+az() {
+  local i
+  for i in 1 2 3; do
+    command az "$@" && return 0
+    echo "az $1 $2 failed (attempt $i of 3)" >&2
+    sleep 10
+  done
+  return 1
+}
+
 # Dependents before what they depend on: a machine holds its card, a card its
 # address and subnet, a subnet its security group.
 ORDER=(
