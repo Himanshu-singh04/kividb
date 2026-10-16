@@ -32,6 +32,15 @@
 // then counts the slots; the thread takes its slot and then looks for
 // takers. One of them sees the other.
 //
+// A late thread goes through `LATE` without queueing behind a taker that is
+// waiting for it, so a few of them running command after command, their
+// turns overlapping, could keep it from a taker for ever — and every taker
+// after that one queues behind it. So a taker that cannot have `LATE` within
+// `RECOUNT` counts the slots again and takes the ones it missed: the late
+// threads then wait at their own slots, `LATE` empties, and the taker gets
+// it. Slots only ever get added, at most `SLOTS` of them, so the counting
+// ends.
+//
 // It is a different gate from `write_gate`, which exists so that a snapshot
 // can be cut between two whole writes. A cut can last as long as the dataset
 // takes to write out, and must not stop reads; this gate is held alone only
@@ -45,6 +54,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// More slots than worker threads on any machine this runs on; threads beyond
 /// that share slots, which is correct, just slightly less cache-friendly.
 const SLOTS: usize = 128;
+
+/// How long a taker waits for `LATE` before it counts the slots again. See
+/// the top.
+const RECOUNT: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Padded so neighbouring slots never share a cache line.
 #[repr(align(128))]
@@ -307,12 +320,7 @@ pub fn enter_alone() -> AloneGuard {
     }
     // Said first, and the slots counted after: see the top.
     let taking = Taking::begin();
-    let in_use = IN_USE.load(Ordering::SeqCst).min(SLOTS);
-    let slots = GATE[..in_use]
-        .iter()
-        .chain(std::iter::once(&LATE))
-        .map(|slot| slot.0.write())
-        .collect();
+    let slots = close(None).expect("a taker without a way to give up gets the gate");
     ALONE.with(|a| a.set(true));
     AloneGuard {
         _slots: slots,
@@ -332,23 +340,8 @@ pub fn enter_alone_unless(
         return Some(enter_alone());
     }
     let taking = Taking::begin();
-    let in_use = IN_USE.load(Ordering::SeqCst).min(SLOTS);
-    let mut slots = Vec::with_capacity(in_use + 1);
-    for slot in GATE[..in_use].iter().chain(std::iter::once(&LATE)) {
-        let held = match slot.0.try_write() {
-            Some(held) => held,
-            None => loop {
-                if let Some(held) = slot.0.try_write_for(slice) {
-                    break held;
-                }
-                // The slots taken so far are let go of with `slots`.
-                if give_up() {
-                    return None;
-                }
-            },
-        };
-        slots.push(held);
-    }
+    // On giving up, the slots taken so far are let go of inside.
+    let slots = close(Some((slice, &mut give_up)))?;
     DEPTH.with(|d| d.set(d.get() + 1));
     ALONE.with(|a| a.set(true));
     Some(AloneGuard {
@@ -357,6 +350,48 @@ pub fn enter_alone_unless(
         outermost: true,
         _not_send: PhantomData,
     })
+}
+
+/// Take every slot in use, in index order, and then `LATE`; count again and
+/// take the slots added meanwhile whenever `LATE` cannot be had within
+/// `RECOUNT` (see the top). With `patience`, a slot that is not free is
+/// waited for a `slice` at a time, and `give_up` is asked after each slice,
+/// and after each wait for `LATE`: `None` if it said yes, with everything
+/// taken let go of again.
+fn close(
+    mut patience: Option<(std::time::Duration, &mut dyn FnMut() -> bool)>,
+) -> Option<Vec<RwLockWriteGuard<'static, ()>>> {
+    let mut slots = Vec::with_capacity(IN_USE.load(Ordering::SeqCst).min(SLOTS) + 1);
+    loop {
+        // Only goes up, so never below what is already held.
+        let in_use = IN_USE.load(Ordering::SeqCst).min(SLOTS);
+        for slot in &GATE[slots.len()..in_use] {
+            let held = match &mut patience {
+                None => slot.0.write(),
+                Some((slice, give_up)) => match slot.0.try_write() {
+                    Some(held) => held,
+                    None => loop {
+                        if let Some(held) = slot.0.try_write_for(*slice) {
+                            break held;
+                        }
+                        if give_up() {
+                            return None;
+                        }
+                    },
+                },
+            };
+            slots.push(held);
+        }
+        if let Some(late) = LATE.0.try_write_for(RECOUNT) {
+            slots.push(late);
+            return Some(slots);
+        }
+        if let Some((_, give_up)) = &mut patience
+            && give_up()
+        {
+            return None;
+        }
+    }
 }
 
 /// Whether the calling thread holds the gate alone — whether what it is
@@ -528,6 +563,58 @@ mod late_threads {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::Duration;
+
+    /// Threads that arrive while a taker is on its way, and then run command
+    /// after command, do not keep `LATE` from it for ever. They used to: the
+    /// taker had counted the slots before they had any, their turns through
+    /// `LATE` overlapped, and every taker after it queued behind it.
+    #[test]
+    fn late_threads_running_commands_back_to_back_do_not_starve_a_taker() {
+        // A command under way: the taker below counts its slot, and waits for
+        // it. While the taker waits, threads that arrive are late.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _command = enter();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        held_rx.recv().unwrap();
+
+        let (got_tx, got_rx) = std::sync::mpsc::channel();
+        let taker = std::thread::spawn(move || {
+            let _alone = enter_alone();
+            got_tx.send(()).unwrap();
+        });
+        // Let it count the slots and queue behind the holder.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let crowd: Vec<_> = (0..6)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _command = enter();
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        // Running command after command through `LATE` by now.
+        std::thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let got_in = got_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        for thread in crowd {
+            thread.join().unwrap();
+        }
+        assert!(got_in, "the taker never got the gate");
+        taker.join().unwrap();
+    }
 
     /// Threads that run their first command while the gate is being taken
     /// alone are kept out as well as the ones that were there before: the
