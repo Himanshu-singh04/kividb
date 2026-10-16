@@ -20,35 +20,66 @@ Repository: [github.com/kividbio/kividb](https://github.com/kividbio/kividb) · 
 
 ## Performance
 
-**Bare metal, AWS Graviton3** (October 2026): KiviDB and Garnet 2.2.1 on a `c7gn.metal`
-(64 vCPU), driven by memtier_benchmark from a second `c7gn.metal` in the same Availability
-Zone; 10 million keys, 100-byte values, pipeline 16, 300 connections, the server confined to
-32 cores. Mean of two rounds (KiviDB's rounds were within 3% of each other, Garnet's
-within 7%).
+<a href="assets/benchmarks/kividb-benchmarks.mp4">
+  <img src="assets/benchmarks/kividb-benchmarks.webp" alt="KiviDB benchmarks: throughput, latency, vector search and vector ingest" width="720">
+</a>
 
-| 32 cores | KiviDB 1.1.0 (pre-release build) | KiviDB 1.0.5 | Garnet 2.2.1 |
-|----------|------:|------:|------:|
-| GET | 21.1M ops/s | 19.5M ops/s | 21.4M ops/s |
-| SET | 19.3M ops/s | 16.8M ops/s | 20.9M ops/s |
+*Throughput, latency, vector search and vector ingest. Click for the full-resolution video.*
 
-Given more cores, every engine reached 21-23M ops/s, the most the single load generator
-could send, so those runs do not tell the engines apart.
+All figures below are from one session in October 2026 on AWS Graviton3 bare metal: the
+server on a `c7gn.metal` (64 vCPU), confined to 32 cores, and the load generator on a
+second `c7gn.metal` in the same placement group. Each engine ran alone on the server,
+one after another.
 
-**Azure Ampere** (October 2026, KiviDB 1.1.0): a `D32ps_v5` (32 vCPU) server and a second
-one as client, in one proximity placement group; 10 million keys, 100-byte values,
-kivi-benchmark's `run-matrix.sh`.
+### Key-value
 
-| | KiviDB 1.1.0 | Garnet 2.2.1 | Dragonfly 1.37 | Redis Cluster (30 shards) |
+memtier_benchmark through kivi-benchmark's `run-matrix.sh`: 10 million keys, 100-byte
+values, 30 s a scenario, mean of two rounds; 300 connections pipelined, 1,200 without
+pipelining.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/throughput-pipelined-dark.png">
+  <img src="assets/benchmarks/throughput-pipelined-light.png" alt="Pipelined throughput: KiviDB, Dragonfly, Redis, Redis Cluster" width="720">
+</picture>
+
+| ops/s | KiviDB 1.1.0 | Dragonfly 2.0.2 | Redis 8.10 | Redis Cluster (32 shards) |
 |---|------:|------:|------:|------:|
-| GET, no pipelining | 1.78M | 1.11M | 1.67M | 0.85M |
-| SET, no pipelining | 1.80M | 1.09M | 1.62M | 0.91M |
-| GET, pipeline 16, 16 cores | 7.37M | 5.62M | | |
-| SET, pipeline 16, 16 cores | 5.80M | 5.13M | | |
-| GET, pipeline 16, whole machine | 9.68M | 10.35M | 3.73M | 5.14M |
-| SET, pipeline 16, whole machine | 8.27M | 9.70M | 3.65M | 5.31M |
+| GET, pipeline 16 | **21.2M** | 9.1M | 2.4M | 4.7M |
+| SET, pipeline 16 | **19.2M** | 8.5M | 2.0M | 4.7M |
+| GET, no pipelining | 3.07M | **3.35M** | 1.32M | 1.46M |
+| SET, no pipelining | 3.12M | **3.38M** | 1.54M | 1.46M |
+| p99 latency, GET / SET, pipeline 16 | **0.36 / 0.42 ms** | 0.88 / 1.07 ms | 2.2 / 2.7 ms | |
+| Memory per key | 177 B | **134 B** | 178 B | 183 B |
 
-Memory per key, 10 million keys with 100-byte values: KiviDB 177 bytes, Redis 183,
-Dragonfly 131.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/latency-p99-pipelined-dark.png">
+  <img src="assets/benchmarks/latency-p99-pipelined-light.png" alt="p99 latency, pipelined" width="720">
+</picture>
+
+### Vector search
+
+[redis/vector-db-benchmark](https://github.com/redis/vector-db-benchmark) on
+glove-25-angular (1.18M vectors, 25 dimensions): HNSW with M=16 and EF_CONSTRUCTION=256,
+100 clients uploading in batches of 64, then queries at ef 64, 128, 256 and 512.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/vector-qps-recall-dark.png">
+  <img src="assets/benchmarks/vector-qps-recall-light.png" alt="Vector search: queries per second against recall" width="720">
+</picture>
+
+| | KiviDB 1.1.0 | Dragonfly 2.0.2 | Redis 8.10 (query engine) |
+|---|------:|------:|------:|
+| Queries/s at ef 64 (recall@10) | **59.3k** (0.943) | 41.3k (0.912) | 31.8k (0.912) |
+| Queries/s at ef 128 | **50.7k** (0.961) | 40.3k (0.937) | 28.9k (0.937) |
+| Queries/s at ef 256 | 31.5k (0.989) | **36.2k** (0.979) | 21.1k (0.979) |
+| Queries/s at ef 512 | 18.7k (**0.998**) | **29.8k** (0.995) | 13.7k (0.995) |
+| Ingest and index build | 31 s | **13 s** | 38 s |
+| Memory after ingest | 1.66 GB | 1.13 GB | **1.07 GB** |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/vector-ingest-dark.png">
+  <img src="assets/benchmarks/vector-ingest-light.png" alt="Vector ingest time" width="720">
+</picture>
 
 - Methodology and scripts: [kivi-benchmark](https://github.com/kividbio/kivi-benchmark)
 - The most recent automated run: [benchmarks/LATEST.md](benchmarks/LATEST.md)
