@@ -515,6 +515,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/kividb.rb
+          # A re-run after the formula was already pushed has nothing to add.
+          if git diff --cached --quiet; then
+            echo "The tap already has kividb ${{ steps.extract.outputs.version }}."
+            exit 0
+          fi
           git commit -m "chore: update kividb to ${{ steps.extract.outputs.version }}"
           git push
 
@@ -530,6 +535,10 @@ jobs:
           && needs.docker-manifest.result == 'success'
           && (needs.darwin.result == 'success' || needs.darwin.result == 'skipped') }}
     runs-on: ubuntu-latest
+    # pull-requests: read for the list of merged PRs on the release page.
+    permissions:
+      contents: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -552,7 +561,7 @@ jobs:
 
       # The release page: a heading, the release's own notes if it has them
       # (docs/releases/<tag>.md, written for people upgrading), then what
-      # every release says. GitHub appends the list of merged PRs.
+      # every release says, then the merged PRs (the next step).
       - name: Write release notes
         env:
           REPO_URL: https://github.com/${{ github.repository }}
@@ -593,13 +602,50 @@ jobs:
           } > release-body.md
           echo "release-body.md: $(wc -l < release-body.md) lines"
 
+      # What GitHub would append on its own is the PRs since the newest tag
+      # before this one, and for a stable release that is its last release
+      # candidate: v1.1.0's page listed one PR. A stable release lists what
+      # was merged since the previous *stable* release; a candidate, since
+      # the tag before it. With no earlier stable release, everything.
+      - name: List the merged pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet
+          # Every tag older than this one, oldest first. versionsort.suffix:
+          # v1.1.0-rc2 sorts before v1.1.0, not after.
+          older=$(git -c versionsort.suffix=- tag --list 'v*' --sort=v:refname \
+            | awk -v t="${RELEASE_TAG}" '$0 == t { exit } { print }')
+          case "${RELEASE_TAG}" in
+            *-*) previous=$(printf '%s\n' "$older" | tail -n 1) ;;
+            *)   previous=$(printf '%s\n' "$older" | grep -v -- - | tail -n 1 || true) ;;
+          esac
+          {
+            echo
+            if [ -n "$previous" ]; then
+              echo "Changes since ${previous}:"
+              gh api "repos/${REPO}/releases/generate-notes" \
+                -f tag_name="${RELEASE_TAG}" -f previous_tag_name="${previous}" --jq .body
+            else
+              echo "## What's Changed"
+              gh pr list -R "${REPO}" --state merged --limit 1000 \
+                --json number,title,author,url \
+                --jq 'sort_by(.number) | .[] | "* \(.title) by @\(.author.login) in \(.url)"'
+              echo
+              echo "**Full Changelog**: every commit up to this release: https://github.com/${REPO}/commits/${RELEASE_TAG}"
+            fi
+          } >> release-body.md
+          echo "previous release: ${previous:-none}"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
-          generate_release_notes: true
+          generate_release_notes: false
           body_path: release-body.md
           files: |
             release-assets/*
