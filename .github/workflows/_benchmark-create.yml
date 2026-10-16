@@ -1,22 +1,36 @@
-name: (reusable) Create benchmark instances
+name: (reusable) Create benchmark machines
 
+# Two arm64 Azure VMs (server + client) in the kividb-benchmark resource
+# group, created by infra/benchmark-azure/create.sh. Signs in to Azure with
+# GitHub's OIDC token: no Azure secret is stored. The app registration trusts
+# runs on master only, so dispatch benchmark workflows from master and pick
+# the branch to measure with their `ref` input.
 on:
   workflow_call:
     inputs:
-      aws_region:
+      location:
         type: string
-        default: "us-east-1"
-      availability_zone:
+        default: "centralindia"
+      server_size:
         type: string
-        default: ""
-      use_placement_group:
+        default: "Standard_D32ps_v5"
+      client_size:
+        type: string
+        default: "Standard_D32ps_v5"
+      use_proximity_group:
+        type: boolean
+        default: false
+      # true: the server warms Dragonfly/Redis, the client builds memtier and
+      # Rust and registers as this run's self-hosted runner. false: bare
+      # Ubuntu, reached over SSH from GitHub-hosted runners.
+      bootstrap:
         type: boolean
         default: true
     outputs:
-      server_instance_id:
-        value: ${{ jobs.create.outputs.server_instance_id }}
-      client_instance_id:
-        value: ${{ jobs.create.outputs.client_instance_id }}
+      run_id:
+        value: ${{ jobs.create.outputs.run_id }}
+      resource_group:
+        value: ${{ jobs.create.outputs.resource_group }}
       server_private_ip:
         value: ${{ jobs.create.outputs.server_private_ip }}
       server_public_ip:
@@ -27,59 +41,41 @@ on:
         value: ${{ jobs.create.outputs.ssh_user }}
       ssh_key_path:
         value: ${{ jobs.create.outputs.ssh_key_path }}
-      key_pair_name:
-        value: ${{ jobs.create.outputs.key_pair_name }}
-      security_group_id:
-        value: ${{ jobs.create.outputs.security_group_id }}
-      placement_group_name:
-        value: ${{ jobs.create.outputs.placement_group_name }}
-      region:
-        value: ${{ jobs.create.outputs.region }}
       runner_label:
         value: ${{ jobs.create.outputs.runner_label }}
 
 permissions:
   contents: read
+  id-token: write
 
 env:
-  # Fixed on purpose: every job across every workflow that needs to SSH
-  # writes the same secret to this same path, so no SSH command's `-i`
-  # argument ever has to change between a persistent-runner-era workflow
-  # and this ephemeral one.
+  # Fixed on purpose: every job that SSHes writes the same secret to this
+  # same path, so no `-i` argument differs between jobs.
   SSH_KEY_PATH: /tmp/kividb_benchmark_ssh_key
-  TF_DIR: infra/benchmark-ec2/terraform
+  RESOURCE_GROUP: kividb-benchmark
 
 jobs:
   create:
     runs-on: ubuntu-latest
     timeout-minutes: 50
     outputs:
-      server_instance_id: ${{ steps.tfout.outputs.server_instance_id }}
-      client_instance_id: ${{ steps.tfout.outputs.client_instance_id }}
-      server_private_ip: ${{ steps.tfout.outputs.server_private_ip }}
-      server_public_ip: ${{ steps.tfout.outputs.server_public_ip }}
-      client_public_ip: ${{ steps.tfout.outputs.client_public_ip }}
-      ssh_user: ${{ steps.tfout.outputs.ssh_user }}
+      run_id: ${{ steps.create.outputs.run_id }}
+      resource_group: ${{ steps.create.outputs.resource_group }}
+      server_private_ip: ${{ steps.create.outputs.server_private_ip }}
+      server_public_ip: ${{ steps.create.outputs.server_public_ip }}
+      client_public_ip: ${{ steps.create.outputs.client_public_ip }}
+      ssh_user: ${{ steps.create.outputs.ssh_user }}
       ssh_key_path: ${{ env.SSH_KEY_PATH }}
-      key_pair_name: ${{ steps.tfout.outputs.key_pair_name }}
-      security_group_id: ${{ steps.tfout.outputs.security_group_id }}
-      placement_group_name: ${{ steps.tfout.outputs.placement_group_name }}
-      region: ${{ steps.tfout.outputs.region }}
       runner_label: run-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: azure/login@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_BENCHMARK }}
-          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_BENCHMARK }}
-          aws-region: ${{ inputs.aws_region }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_wrapper: false
-
-      # ── SSH key: same secret, same path, every run ───────────────────────────
       - name: Write SSH private key and derive its public half
         id: ssh
         env:
@@ -93,12 +89,13 @@ jobs:
           umask 077
           printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
-          PUB="$(ssh-keygen -y -f "$SSH_KEY_PATH")"
-          echo "public_key=$PUB" >> "$GITHUB_OUTPUT"
+          echo "public_key=$(ssh-keygen -y -f "$SSH_KEY_PATH")" >> "$GITHUB_OUTPUT"
 
-      # ── GitHub runner registration token (short-lived, minted just-in-time) ──
+      # Short-lived, minted just in time. The default GITHUB_TOKEN cannot call
+      # this endpoint: it needs a PAT with Administration: write on the repo.
       - name: Mint runner registration token
         id: reg
+        if: inputs.bootstrap
         env:
           GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
         run: |
@@ -119,75 +116,55 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
-      - name: Terraform init
-        working-directory: ${{ env.TF_DIR }}
-        run: terraform init -input=false
-
-      - name: Terraform apply
-        id: apply
-        working-directory: ${{ env.TF_DIR }}
+      - name: Create server and client
+        id: create
         env:
-          # main.tf builds the runner label as "run-<run_id>" itself; keep this
-          # bare so it matches the `runner_label` job output used in `runs-on:`.
-          TF_VAR_run_id: ${{ github.run_id }}
-          TF_VAR_ssh_public_key: ${{ steps.ssh.outputs.public_key }}
-          TF_VAR_aws_region: ${{ inputs.aws_region }}
-          TF_VAR_availability_zone: ${{ inputs.availability_zone }}
-          TF_VAR_use_placement_group: ${{ inputs.use_placement_group }}
-          TF_VAR_register_github_runner: "true"
-          TF_VAR_github_repository: ${{ github.repository }}
-          TF_VAR_github_runner_registration_token: ${{ steps.reg.outputs.token }}
-          TF_VAR_github_runner_labels: "benchmark,client"
+          # The attempt number keeps a re-run's machines apart from what an
+          # earlier attempt may have left; destroy clears every attempt.
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          SSH_PUBLIC_KEY: ${{ steps.ssh.outputs.public_key }}
+          LOCATION: ${{ inputs.location }}
+          SERVER_SIZE: ${{ inputs.server_size }}
+          CLIENT_SIZE: ${{ inputs.client_size }}
+          USE_PROXIMITY_GROUP: ${{ inputs.use_proximity_group }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          REGISTER_RUNNER: ${{ inputs.bootstrap }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUNNER_TOKEN: ${{ steps.reg.outputs.token }}
+          RUNNER_LABELS: self-hosted,benchmark,client,run-${{ github.run_id }}
+        run: bash infra/benchmark-azure/create.sh
+
+      - name: Wait for SSH on both machines
+        if: ${{ !inputs.bootstrap }}
+        env:
+          HOSTS: ${{ steps.create.outputs.server_public_ip }} ${{ steps.create.outputs.client_public_ip }}
         run: |
           set -euo pipefail
-          if [[ -z "$TF_VAR_availability_zone" ]]; then
-            unset TF_VAR_availability_zone
-          fi
-          terraform apply -auto-approve -input=false
+          for host in $HOSTS; do
+            for i in $(seq 1 30); do
+              if ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                   ubuntu@"$host" 'echo ready' 2>/dev/null; then
+                break
+              fi
+              if [[ $i -eq 30 ]]; then
+                echo "::error::SSH never came up on $host"
+                exit 1
+              fi
+              sleep 10
+            done
+          done
 
-      - name: Dump instance pending reason if apply failed
-        if: failure()
-        env:
-          AWS_REGION: ${{ inputs.aws_region }}
-        run: |
-          set -euo pipefail
-          echo "::error::terraform apply failed. These instances live in the AWS account for secrets.AWS_ACCESS_KEY_BENCHMARK, not your laptop CLI profile."
-          aws ec2 describe-instances \
-            --filters "Name=tag:RunId,Values=${{ github.run_id }}" \
-            --query 'Reservations[].Instances[].{Id:InstanceId,Type:InstanceType,State:State.Name,Reason:StateReason.Message,AZ:Placement.AvailabilityZone,PG:Placement.GroupName}' \
-            --output table || true
-
-      - name: Export instance details
-        id: tfout
-        working-directory: ${{ env.TF_DIR }}
-        run: |
-          {
-            echo "server_instance_id=$(terraform output -raw server_instance_id)"
-            echo "client_instance_id=$(terraform output -raw client_instance_id)"
-            echo "server_private_ip=$(terraform output -raw server_private_ip)"
-            echo "server_public_ip=$(terraform output -raw server_public_ip)"
-            echo "client_public_ip=$(terraform output -raw client_public_ip)"
-            echo "ssh_user=$(terraform output -raw ssh_user)"
-            echo "key_pair_name=$(terraform output -raw key_pair_name)"
-            echo "security_group_id=$(terraform output -raw security_group_id)"
-            echo "placement_group_name=$(terraform output -raw placement_group_name)"
-            echo "region=$(terraform output -raw region)"
-          } >> "$GITHUB_OUTPUT"
-
-      # ── The runner has to show up ────────────────────────────────────────────
-      # The jobs that follow run on the client instance, on a runner its
-      # startup script registers. If that script fails — the runner release
-      # it installs has been retired by GitHub, a package mirror is down —
-      # no runner ever registers, and a job waiting for one waits in the queue
-      # for as long as GitHub lets it: hours, with both instances running.
-      # So this job does not succeed until the runner is there, and says what
-      # the instance printed if it is not.
+      # The benchmark job runs on the runner the client's startup script
+      # registers. If that script fails, no runner ever registers and the job
+      # waits in the queue for hours with both machines running. So this job
+      # does not succeed until the runner is there, and prints the end of the
+      # client's startup log if it is not.
       - name: Wait for the runner to register
+        if: inputs.bootstrap
         env:
           GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
           RUNNER_LABEL: run-${{ github.run_id }}
-          CLIENT_INSTANCE_ID: ${{ steps.tfout.outputs.client_instance_id }}
-          AWS_REGION: ${{ inputs.aws_region }}
+          CLIENT_NAME: ${{ steps.create.outputs.client_name }}
         run: |
           set -euo pipefail
           deadline=$(( $(date +%s) + 20 * 60 ))
@@ -209,7 +186,8 @@ jobs:
             echo "Runner $RUNNER_LABEL: $status; waiting."
             sleep 20
           done
-          echo "::error::The client instance did not register a runner within 20 minutes (last seen: $status). The end of its console output follows; the whole of it is in /var/log/user-data-client.log on the instance."
-          aws ec2 get-console-output --instance-id "$CLIENT_INSTANCE_ID" --latest \
-            --query Output --output text | tail -n 80 || true
+          echo "::error::The client did not register a runner within 20 minutes (last seen: $status). The end of its startup log follows."
+          az vm run-command invoke -g "$RESOURCE_GROUP" -n "$CLIENT_NAME" \
+            --command-id RunShellScript --scripts "tail -n 80 /var/log/user-data-client.log" \
+            --query 'value[0].message' -o tsv || true
           exit 1

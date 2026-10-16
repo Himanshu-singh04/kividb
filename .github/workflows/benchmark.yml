@@ -1,6 +1,7 @@
 name: Benchmark
 
-# Run by hand only: it starts paid EC2 instances.
+# Run by hand only, from master (the Azure sign-in trusts master runs only;
+# pick the branch to measure with `ref`): it starts paid Azure machines.
 on:
   workflow_dispatch:
     inputs:
@@ -19,12 +20,13 @@ env:
 
 jobs:
 
-  # ── Create instances (Terraform, self-contained under infra/benchmark-ec2) ───
+  # ── Create machines (Azure, infra/benchmark-azure) ────────────────────────────
   create-instances:
     uses: ./.github/workflows/_benchmark-create.yml
     secrets: inherit
-    with:
-      aws_region: us-east-1
+    permissions:
+      contents: read
+      id-token: write
 
   # ── Benchmark (single job on client runner) ──────────────────────────────────
   benchmark:
@@ -296,7 +298,7 @@ jobs:
                echo "=== listeners ==="; ss -tlnp 2>/dev/null | grep -E "6380|kividb" || true
                echo "=== process ==="; pgrep -a kividb || true'
           }
-          # Wait from the server — avoids false negatives when SG blocks bench-client→EC2 (SSH still works).
+          # Wait from the server — avoids false negatives when the network blocks client→server (SSH still works).
           ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
             ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
             'python3 /tmp/wait_redis_ready.py 127.0.0.1 6380 --label "KiviDB (plaintext, localhost)"' \
@@ -721,8 +723,8 @@ jobs:
 
           **Branch:** `{ref}` | **Commit:** `{sha}` | **Run:** [{run}](https://github.com/{repo}/actions/runs/{run}) | **Generated:** {now}
 
-          > Methodology: [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) on AWS Graviton3 c7gn.12xlarge (48 vCPU).
-          > Client on separate c7gn.16xlarge, same AZ. Stores benchmarked sequentially.
+          > Methodology: [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) on an Azure Standard_D32ps_v5 (32 vCPU, arm64).
+          > Client on a separate Standard_D32ps_v5 in the same virtual network. Stores benchmarked sequentially.
           > Full runbook: [kivi-benchmark](https://github.com/kividbio/kivi-benchmark)
 
           ## Results
@@ -753,11 +755,6 @@ jobs:
     if: always()
     uses: ./.github/workflows/_benchmark-destroy.yml
     secrets: inherit
-    with:
-      aws_region: us-east-1
-      server_instance_id: ${{ needs.create-instances.outputs.server_instance_id }}
-      client_instance_id: ${{ needs.create-instances.outputs.client_instance_id }}
-      key_pair_name: ${{ needs.create-instances.outputs.key_pair_name }}
-      security_group_id: ${{ needs.create-instances.outputs.security_group_id }}
-      placement_group_name: ${{ needs.create-instances.outputs.placement_group_name }}
-      run_id: ${{ github.run_id }}
+    permissions:
+      contents: read
+      id-token: write
