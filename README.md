@@ -185,9 +185,12 @@ the internet without a password.
 
 ### Docker
 
-Images are published to the GitHub Container Registry:
+Images are published to Docker Hub and the GitHub Container Registry, with
+the same tags in both:
 
 ```bash
+docker pull kividb/kividb:latest
+# or
 docker pull ghcr.io/kividbio/kividb:latest
 ```
 
@@ -195,7 +198,7 @@ docker pull ghcr.io/kividbio/kividb:latest
 `v1.1.0-tls` and `v1.1.0-full` are the others. Images are built for `amd64` and `arm64`.
 
 ```bash
-docker run -p 6380:6380 ghcr.io/kividbio/kividb
+docker run -p 6380:6380 kividb/kividb
 ```
 
 A container is reached through its network, never from loopback, so the image's default
