@@ -9,6 +9,9 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
+  # By hand, from the Actions tab: the full build and test of a branch, e.g.
+  # master before a release tag. Skips the change detection below.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,6 +22,7 @@ jobs:
   # editing ci.yml still gets a real check -- but without this job, every
   # such edit also re-runs the full build+test+e2e+redis-compat cycle.
   detect-changes:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # dorny/paths-filter fetches the PR's changed-files list from the
@@ -56,7 +60,11 @@ jobs:
 
   rust:
     needs: detect-changes
-    if: needs.detect-changes.outputs.run_ci == 'true'
+    # always(): on a manual run detect-changes is skipped, which would
+    # otherwise skip this job too.
+    if: >-
+      always() && needs.detect-changes.result != 'failure' &&
+      (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.run_ci == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
