@@ -160,6 +160,15 @@ people upgrading, are in
 
 ### Changed
 
+- **Vector ingest is about six times faster.** Each HNSW node has its own
+  lock, so inserts no longer take the whole graph's: 1.18 million vectors
+  (glove-25-angular, `M 16`, `EF_CONSTRUCTION 256`, 100 clients) took 197 s
+  and take 31 s on a 64-core server (Redis 8.10: 38 s). A search no longer
+  holds back the inserts beside it either.
+- **Images are on Docker Hub as `kividb/kividb`**, as well as on GHCR as
+  `ghcr.io/kividbio/kividb`, with the same tags. They are no longer
+  published to Quay, and the release binaries are downloaded from GitHub
+  Releases rather than `releases.kividb.io`.
 - **Memory per key is lower.** A key of up to 24 bytes is kept inside its
   table entry, and a string value is one pointer with eight bytes in front
   of it: ten million keys of 16 bytes with 100-byte values take 177 bytes a
@@ -203,6 +212,18 @@ people upgrading, are in
 
 ### Fixed
 
+- **`REPLICAOF NO ONE` during a full sync lost the promoted node's data.**
+  A replica promoted while a full-sync payload was still arriving read the
+  rest of it, dropped its own dataset and loaded the old master's, and only
+  then stopped replicating. The sync now stops at once and the node keeps
+  its dataset; a promotion that arrives while the dataset is being replaced
+  waits for that to finish, as on Redis. Found in a failover test of
+  1.1.0-rc1.
+- **A transaction or a script could wait for ever.** A thread that ran its
+  first command while a transaction or script was starting did not queue
+  behind it. A few such threads running command after command could keep it
+  waiting indefinitely, and every transaction and script after it queued
+  behind it. It now makes those threads wait too once it has waited 2 ms.
 - **A manual failover could fail with every vote given.** A master saves
   its vote before it answers, and on a busy disk that took longer than the
   two seconds the replica waited: "timed out with 0 of 2 votes", about one
