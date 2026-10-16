@@ -1,149 +1,38 @@
-name: (reusable) Destroy benchmark instances
+name: (reusable) Destroy benchmark machines
 
-# Deliberately does not use `terraform destroy`: teardown is AWS CLI by resource
-# IDs (when create finished) plus tag:RunId (when create was cancelled mid-apply
-# and never exported IDs). That avoids handing a .tfstate file between jobs.
+# Deletes every resource infra/benchmark-azure/create.sh made for this run,
+# found by name ("kvb-<run id>-..."), so it works whether create finished,
+# failed half way or was cancelled, and needs nothing handed over from it.
 on:
   workflow_call:
-    inputs:
-      aws_region:
-        type: string
-        default: "us-east-1"
-      server_instance_id:
-        type: string
-        default: ""
-      client_instance_id:
-        type: string
-        default: ""
-      key_pair_name:
-        type: string
-        default: ""
-      security_group_id:
-        type: string
-        default: ""
-      placement_group_name:
-        type: string
-        default: ""
-      run_id:
-        description: "github.run_id of the caller. Used to find leftovers when create was cancelled before Terraform exported IDs."
-        type: string
-        default: ""
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   destroy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_BENCHMARK }}
-          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_BENCHMARK }}
-          aws-region: ${{ inputs.aws_region }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Terminate instances
-        if: inputs.server_instance_id != '' || inputs.client_instance_id != '' || inputs.run_id != ''
+      - name: Delete server, client and their network
         env:
-          RUN_ID: ${{ inputs.run_id }}
-          SERVER_ID: ${{ inputs.server_instance_id }}
-          CLIENT_ID: ${{ inputs.client_instance_id }}
-        run: |
-          set -euo pipefail
-          ids=""
-          [[ -n "$SERVER_ID" ]] && ids="$ids $SERVER_ID"
-          [[ -n "$CLIENT_ID" ]] && ids="$ids $CLIENT_ID"
-          if [[ -n "$RUN_ID" ]]; then
-            tagged=$(aws ec2 describe-instances \
-              --filters "Name=tag:RunId,Values=$RUN_ID" \
-                        "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
-              --query 'Reservations[].Instances[].InstanceId' \
-              --output text || true)
-            ids="$ids $tagged"
-          fi
-          ids=$(printf '%s\n' $ids | awk 'NF && !seen[$0]++')
-          if [[ -z "$ids" ]]; then
-            echo "No instances to terminate (create likely never reached RunInstances)."
-            exit 0
-          fi
-          echo "Terminating: $ids"
-          # shellcheck disable=SC2086
-          aws ec2 terminate-instances --instance-ids $ids
-          # shellcheck disable=SC2086
-          aws ec2 wait instance-terminated --instance-ids $ids
-
-      - name: Delete security group
-        if: always() && (inputs.security_group_id != '' || inputs.run_id != '')
-        continue-on-error: true
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          SG_ID: ${{ inputs.security_group_id }}
-        run: |
-          set -euo pipefail
-          ids="$SG_ID"
-          if [[ -n "$RUN_ID" ]]; then
-            tagged=$(aws ec2 describe-security-groups \
-              --filters "Name=tag:RunId,Values=$RUN_ID" \
-              --query 'SecurityGroups[].GroupId' \
-              --output text || true)
-            ids="$ids $tagged"
-          fi
-          ids=$(printf '%s\n' $ids | awk 'NF && !seen[$0]++')
-          for id in $ids; do
-            echo "Deleting security group $id"
-            aws ec2 delete-security-group --group-id "$id" || true
-          done
-
-      - name: Delete key pair
-        if: always() && (inputs.key_pair_name != '' || inputs.run_id != '')
-        continue-on-error: true
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          KEY_NAME: ${{ inputs.key_pair_name }}
-        run: |
-          set -euo pipefail
-          names="$KEY_NAME"
-          if [[ -n "$RUN_ID" ]]; then
-            tagged=$(aws ec2 describe-key-pairs \
-              --filters "Name=tag:RunId,Values=$RUN_ID" \
-              --query 'KeyPairs[].KeyName' \
-              --output text || true)
-            names="$names $tagged"
-          fi
-          names=$(printf '%s\n' $names | awk 'NF && !seen[$0]++')
-          for name in $names; do
-            echo "Deleting key pair $name"
-            aws ec2 delete-key-pair --key-name "$name" || true
-          done
-
-      - name: Delete placement group
-        if: always() && (inputs.placement_group_name != '' || inputs.run_id != '')
-        continue-on-error: true
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          PG_NAME: ${{ inputs.placement_group_name }}
-        run: |
-          set -euo pipefail
-          names="$PG_NAME"
-          if [[ -n "$RUN_ID" ]]; then
-            tagged=$(aws ec2 describe-placement-groups \
-              --filters "Name=tag:RunId,Values=$RUN_ID" \
-              --query 'PlacementGroups[].GroupName' \
-              --output text || true)
-            names="$names $tagged"
-          fi
-          names=$(printf '%s\n' $names | awk 'NF && !seen[$0]++')
-          for name in $names; do
-            echo "Deleting placement group $name"
-            aws ec2 delete-placement-group --group-name "$name" || true
-          done
+          RUN_PREFIX: ${{ github.run_id }}
+          RESOURCE_GROUP: kividb-benchmark
+        run: bash infra/benchmark-azure/destroy.sh
 
       - name: Deregister any lingering runner (safety net)
         # Normal path: the client's --ephemeral runner deregisters itself
-        # after completing its one job. This only matters if the instance
-        # never got that far (e.g. create succeeded but benchmark never ran).
-        if: always() && (inputs.server_instance_id != '' || inputs.client_instance_id != '' || inputs.run_id != '')
+        # after its one job. This only matters if it never got that far.
+        if: always()
         continue-on-error: true
         env:
           GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}

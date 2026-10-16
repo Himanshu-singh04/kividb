@@ -7,30 +7,33 @@ on:
         description: "Branch to benchmark (leave empty for current)"
         required: false
         default: ""
-      availability_zone:
-        description: "AZ for both instances. Change this if that AZ is out of c7gn capacity."
+      location:
+        description: "Azure region for both machines (the arm64 quota is in centralindia)."
         required: false
-        default: "us-east-1a"
-      use_placement_group:
-        description: "Cluster PG (lowest latency). Off by default — packing c7gn.12xlarge + c7gn.16xlarge on one rack often leaves the server pending forever."
+        default: "centralindia"
+      use_proximity_group:
+        description: "Proximity placement group (lowest latency). Off by default: it can fail to place two large machines together."
         type: boolean
         default: false
 
+# Same group as the other benchmarks: two pairs do not fit the region's
+# 65-vCPU quota at once.
 concurrency:
-  group: solo-benchmark-global
+  group: benchmark-global
   cancel-in-progress: false
 
 jobs:
 
-  # ── Create instances (Terraform, self-contained under infra/benchmark-ec2) ───
+  # ── Create machines (Azure, infra/benchmark-azure) ────────────────────────────
   create-instances:
     uses: ./.github/workflows/_benchmark-create.yml
     secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
     with:
-      aws_region: us-east-1
-      availability_zone: ${{ inputs.availability_zone }}
-      # workflow_dispatch booleans are strings; reusable workflow inputs are real booleans
-      use_placement_group: ${{ fromJSON(inputs.use_placement_group) }}
+      location: ${{ inputs.location }}
+      use_proximity_group: ${{ inputs.use_proximity_group }}
 
   # ── Benchmark (single job on client runner) ──────────────────────────────────
   benchmark:
@@ -302,7 +305,7 @@ jobs:
                echo "=== listeners ==="; ss -tlnp 2>/dev/null | grep -E "6380|kividb" || true
                echo "=== process ==="; pgrep -a kividb || true'
           }
-          # Wait from the server — avoids false negatives when SG blocks bench-client→EC2 (SSH still works).
+          # Wait from the server — avoids false negatives when the network blocks client→server (SSH still works).
           ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
             ${{ env.SERVER_USER }}@${{ env.SERVER_IP }} \
             'python3 /tmp/wait_redis_ready.py 127.0.0.1 6380 --label "KiviDB (plaintext, localhost)"' \
@@ -364,11 +367,6 @@ jobs:
     if: always()
     uses: ./.github/workflows/_benchmark-destroy.yml
     secrets: inherit
-    with:
-      aws_region: us-east-1
-      server_instance_id: ${{ needs.create-instances.outputs.server_instance_id }}
-      client_instance_id: ${{ needs.create-instances.outputs.client_instance_id }}
-      key_pair_name: ${{ needs.create-instances.outputs.key_pair_name }}
-      security_group_id: ${{ needs.create-instances.outputs.security_group_id }}
-      placement_group_name: ${{ needs.create-instances.outputs.placement_group_name }}
-      run_id: ${{ github.run_id }}
+    permissions:
+      contents: read
+      id-token: write

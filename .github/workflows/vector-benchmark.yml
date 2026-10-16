@@ -5,10 +5,9 @@ name: Vector Benchmark
 # the official redis/vector-db-benchmark (see below for why upstream, not our
 # fork), glove-25-angular (1.18M vectors), HNSW M=16/EF_CONSTRUCTION=256.
 #
-# Server + client, same placement group, like the main benchmark: kividb and
+# Server + client, one virtual network, like the main benchmark: kividb and
 # redis-stack-server run on a dedicated SERVER instance; vector-db-benchmark
-# (the driver) runs on a SEPARATE CLIENT instance, both in one cluster
-# placement group for lowest latency -- the same topology
+# (the driver) runs on a SEPARATE CLIENT instance -- the same topology
 # github.com/kividbio/kivi-benchmark's memtier runbook uses, and for the same
 # reason: co-locating the server and a 100-thread client on one small,
 # burstable box (this workflow's original design) starves the server of CPU
@@ -33,10 +32,10 @@ name: Vector Benchmark
 # deliberately when re-validating against a newer upstream commit, rather
 # than tracking `master` and letting the pin drift silently.
 #
-# ARM/Graviton, not x86: matches kividb-benchmark's own memtier runbook, and
+# arm64, not x86: matches kividb-benchmark's own memtier runbook, and
 # lets `benchmark` build on a native GitHub-hosted ubuntu-*-arm runner (GA'd
-# 2026-01) instead of cross-compiling -- see that job below. c7gn is
-# Graviton (arm64) + network-optimized, same family the memtier runbook uses.
+# 2026-01) instead of cross-compiling -- see that job below. The machines
+# are Azure Dpsv5 (arm64), the same as the memtier benchmark's.
 #
 # Both engines run natively (no Docker) on the SERVER -- kividb as a built
 # binary (both it and vector-db-benchmark are Rust, both built on the same
@@ -62,13 +61,14 @@ name: Vector Benchmark
 # ingest took ~27 min on a throttled/thread-starved t4g.xlarge (735 rec/s
 # average, degrading over the run -- see the topology comment above) vs.
 # ~7 min (2,899 rec/s) on an unconstrained machine. Expect the dedicated
-# c7gn server to land close to the latter; budget accordingly -- see
+# server to land close to the latter; budget accordingly -- see
 # timeout-minutes -- and recalibrate via update_baseline once a real run
 # lands on this topology instead of trusting the pre-existing numbers in
 # benchmarks/vector-baseline.json, which predate this topology entirely.
 
 on:
-  # Manual only. This provisions two real EC2 instances (c7gn server + client)
+  # Manual only, from master (the Azure sign-in trusts master runs only; pick
+  # the branch with `ref`). This provisions two real Azure machines
   # and ingests 1.18M vectors, so it costs real money and tens of minutes per
   # run -- too much to fire automatically on every merge that happens to touch
   # a vector file. It is a deliberate regression/competitive gate: run it when
@@ -82,18 +82,18 @@ on:
         description: "Branch/tag/SHA to benchmark (leave empty for current)"
         required: false
         default: ""
-      server_instance_type:
-        description: "EC2 instance type for kividb/redis-stack-server (ARM/Graviton; matches kivi-benchmark's memtier runbook default)"
+      server_size:
+        description: "Azure size for kividb/redis-stack-server (arm64)"
         required: false
-        default: "c7gn.12xlarge"
-      client_instance_type:
-        description: "EC2 instance type for the vector-db-benchmark driver (ARM/Graviton; matches kivi-benchmark's memtier runbook default)"
+        default: "Standard_D32ps_v5"
+      client_size:
+        description: "Azure size for the vector-db-benchmark driver (arm64)"
         required: false
-        default: "c7gn.16xlarge"
-      availability_zone:
-        description: "AZ for both instances + the placement group (c7gn capacity varies by AZ -- see kivi-benchmark's README if this fails to launch)"
+        default: "Standard_D32ps_v5"
+      location:
+        description: "Azure region for both machines (the arm64 quota is in centralindia)"
         required: false
-        default: "us-east-1a"
+        default: "centralindia"
       update_baseline:
         description: "After a run (regressed or not), overwrite benchmarks/vector-baseline.json with these results and commit. Only use after deliberately reviewing why numbers changed."
         type: boolean
@@ -101,17 +101,16 @@ on:
         default: false
 
 # Shared group name with .github/workflows/benchmark.yml ("Benchmark",
-# the memtier/general benchmark -- also c7gn.12xlarge/c7gn.16xlarge, also
-# provisioned in AWS): a run of either workflow queues behind a run of the
-# other, rather than both racing for the same account's c7gn capacity/vCPU
+# the memtier/general benchmark -- also an Azure pair in the same
+# region): a run of either workflow queues behind a run of the
+# other, rather than both racing for the same subscription's vCPU
 # quota simultaneously. cancel-in-progress: false to match benchmark.yml --
-# queue, don't cancel a run that's already paying for real EC2 time.
+# queue, don't cancel a run that's already paying for real machine time.
 concurrency:
   group: benchmark-global
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
   SSH_KEY_PATH: /tmp/kividb_vector_bench_ssh_key
   RUN_TAG: vecbench-${{ github.run_id }}
   # The official upstream repo -- see the top-of-file comment for the fork
@@ -130,172 +129,26 @@ permissions:
   contents: read
 
 jobs:
-  # ── Launch server + client, same placement group ─────────────────────────
+  # ── Launch server + client (Azure, infra/benchmark-azure) ─────────────────
   launch:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    outputs:
-      server_instance_id: ${{ steps.launch.outputs.server_instance_id }}
-      client_instance_id: ${{ steps.launch.outputs.client_instance_id }}
-      server_public_ip: ${{ steps.launch.outputs.server_public_ip }}
-      server_private_ip: ${{ steps.launch.outputs.server_private_ip }}
-      client_public_ip: ${{ steps.launch.outputs.client_public_ip }}
-      security_group_id: ${{ steps.launch.outputs.security_group_id }}
-      placement_group_name: ${{ steps.launch.outputs.placement_group_name }}
-      key_pair_name: ${{ steps.launch.outputs.key_pair_name }}
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_BENCHMARK }}
-          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_BENCHMARK }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Write SSH private key and derive its public half
-        id: ssh
-        env:
-          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          if [[ -z "$BENCHMARK_SSH_PRIVATE_KEY" ]]; then
-            echo "::error::secrets.BENCHMARK_SSH_PRIVATE_KEY is not set."
-            exit 1
-          fi
-          umask 077
-          printf '%s\n' "$BENCHMARK_SSH_PRIVATE_KEY" > "$SSH_KEY_PATH"
-          chmod 600 "$SSH_KEY_PATH"
-          echo "public_key=$(ssh-keygen -y -f "$SSH_KEY_PATH")" >> "$GITHUB_OUTPUT"
-
-      - name: Launch server + client instances
-        id: launch
-        run: |
-          set -euo pipefail
-
-          SERVER_TYPE="${{ inputs.server_instance_type }}"
-          CLIENT_TYPE="${{ inputs.client_instance_type }}"
-          AZ="${{ inputs.availability_zone }}"
-          [[ -z "$SERVER_TYPE" ]] && SERVER_TYPE="c7gn.12xlarge"
-          [[ -z "$CLIENT_TYPE" ]] && CLIENT_TYPE="c7gn.16xlarge"
-          [[ -z "$AZ" ]] && AZ="us-east-1a"
-          echo "Server: $SERVER_TYPE / Client: $CLIENT_TYPE / AZ: $AZ"
-
-          # Same distro/owner and arm64 image family as kivi-benchmark's own
-          # Terraform (Canonical's official owner ID) -- c7gn is Graviton
-          # (arm64), and the `benchmark` job below builds both kividb and
-          # vector-db-benchmark on a native arm64 GitHub-hosted runner and
-          # scp's them over, so no cross-compilation or Rust toolchain is
-          # needed on either ephemeral instance.
-          AMI_ID=$(aws ec2 describe-images \
-            --owners 099720109477 \
-            --filters \
-              "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*" \
-              "Name=virtualization-type,Values=hvm" \
-              "Name=architecture,Values=arm64" \
-            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
-            --output text)
-          echo "AMI: $AMI_ID"
-
-          # One subnet, explicitly, for BOTH instances -- a cluster placement
-          # group requires everything in it to share an AZ, and letting AWS
-          # pick a default subnet per-instance doesn't guarantee that.
-          SUBNET_ID=$(aws ec2 describe-subnets \
-            --filters "Name=availability-zone,Values=$AZ" "Name=default-for-az,Values=true" \
-            --query 'Subnets[0].SubnetId' --output text)
-          if [[ "$SUBNET_ID" == "None" || -z "$SUBNET_ID" ]]; then
-            echo "::error::No default subnet found in $AZ -- pick a different availability_zone input."
-            exit 1
-          fi
-          VPC_ID=$(aws ec2 describe-subnets --subnet-ids "$SUBNET_ID" --query 'Subnets[0].VpcId' --output text)
-          echo "Subnet: $SUBNET_ID (VPC $VPC_ID)"
-
-          KEY_NAME="kividb-vecbench-${{ github.run_id }}"
-          printf '%s\n' '${{ steps.ssh.outputs.public_key }}' > /tmp/vecbench_key.pub
-          aws ec2 import-key-pair \
-            --key-name "$KEY_NAME" \
-            --public-key-material fileb:///tmp/vecbench_key.pub
-
-          # One security group, self-referencing: SSH from anywhere (the
-          # runner needs to reach both instances), plus 6380-6381 (kividb /
-          # redis-stack-server) open only between members of this SG --
-          # i.e. server<->client, not the internet -- mirroring
-          # kivi-benchmark's Terraform ingress rules for the memtier pair.
-          SG_ID=$(aws ec2 create-security-group \
-            --group-name "kividb-vecbench-${{ github.run_id }}" \
-            --description "Ephemeral, single-run: SSH + kividb/redis-stack ports, for ${{ env.RUN_TAG }}" \
-            --vpc-id "$VPC_ID" \
-            --query 'GroupId' --output text)
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$SG_ID" --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null
-          aws ec2 authorize-security-group-ingress \
-            --group-id "$SG_ID" --protocol tcp --port 6380-6381 \
-            --source-group "$SG_ID" >/dev/null
-
-          PG_NAME="kividb-vecbench-${{ github.run_id }}"
-          aws ec2 create-placement-group \
-            --group-name "$PG_NAME" --strategy cluster >/dev/null
-          echo "Placement group: $PG_NAME"
-
-          RUN_ARGS=(--image-id "$AMI_ID" --key-name "$KEY_NAME"
-            --security-group-ids "$SG_ID" --subnet-id "$SUBNET_ID"
-            --placement "GroupName=$PG_NAME,AvailabilityZone=$AZ"
-            --instance-initiated-shutdown-behavior terminate)
-
-          SERVER_ID=$(aws ec2 run-instances "${RUN_ARGS[@]}" \
-            --instance-type "$SERVER_TYPE" \
-            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
-            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.RUN_TAG }}-server},{Key=purpose,Value=kividb-vector-benchmark}]" \
-            --query 'Instances[0].InstanceId' --output text)
-          echo "Server instance: $SERVER_ID"
-
-          CLIENT_ID=$(aws ec2 run-instances "${RUN_ARGS[@]}" \
-            --instance-type "$CLIENT_TYPE" \
-            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":50,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
-            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${{ env.RUN_TAG }}-client},{Key=purpose,Value=kividb-vector-benchmark}]" \
-            --query 'Instances[0].InstanceId' --output text)
-          echo "Client instance: $CLIENT_ID"
-
-          aws ec2 wait instance-running --instance-ids "$SERVER_ID" "$CLIENT_ID"
-
-          SERVER_PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$SERVER_ID" \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          SERVER_PRIVATE_IP=$(aws ec2 describe-instances --instance-ids "$SERVER_ID" \
-            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
-          CLIENT_PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$CLIENT_ID" \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-          echo "Server: $SERVER_PUBLIC_IP (private $SERVER_PRIVATE_IP) / Client: $CLIENT_PUBLIC_IP"
-
-          {
-            echo "server_instance_id=$SERVER_ID"
-            echo "client_instance_id=$CLIENT_ID"
-            echo "server_public_ip=$SERVER_PUBLIC_IP"
-            echo "server_private_ip=$SERVER_PRIVATE_IP"
-            echo "client_public_ip=$CLIENT_PUBLIC_IP"
-            echo "security_group_id=$SG_ID"
-            echo "placement_group_name=$PG_NAME"
-            echo "key_pair_name=$KEY_NAME"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Wait for SSH to come up on both instances
-        run: |
-          set -euo pipefail
-          for HOST in "${{ steps.launch.outputs.server_public_ip }}" "${{ steps.launch.outputs.client_public_ip }}"; do
-            for i in $(seq 1 30); do
-              if ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-                   ubuntu@"$HOST" 'echo ready' 2>/dev/null; then
-                break
-              fi
-              if [[ $i -eq 30 ]]; then
-                echo "::error::SSH never came up on $HOST"
-                exit 1
-              fi
-              sleep 10
-            done
-          done
+    uses: ./.github/workflows/_benchmark-create.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      location: ${{ inputs.location }}
+      server_size: ${{ inputs.server_size }}
+      client_size: ${{ inputs.client_size }}
+      # Bare Ubuntu: this workflow ships its own binaries over SSH, and a
+      # startup script running apt would fight its apt-get for the lock.
+      bootstrap: false
 
   # ── Build kividb + vector-db-benchmark, provision both instances, run, compare ─
   benchmark:
     needs: launch
     # arm64, native (GA'd 2026-01 for private repos) -- matches the arm64
-    # (c7gn) EC2 instances `launch` provisions, so `cargo build --release`
+    # Azure machines `launch` provisions, so `cargo build --release`
     # below produces binaries that run unmodified on them, no cross-compile
     # toolchain needed on either instance.
     runs-on: ubuntu-22.04-arm
@@ -387,8 +240,8 @@ jobs:
 
           # redis-stack-server, native (no Docker) -- same packages.redis.io
           # apt repo already used by benchmark.yml's plain-Redis install,
-          # just a different package name. arch=arm64 (this instance is
-          # Graviton) and version-pinned -- see REDIS_STACK_VERSION's
+          # just a different package name. arch=arm64 (this machine is
+          # arm64) and version-pinned -- see REDIS_STACK_VERSION's
           # top-of-file comment; do not drop the "=$VERSION" and float on
           # whatever's latest.
           curl -fsSL https://packages.redis.io/gpg \
@@ -789,39 +642,8 @@ jobs:
   destroy:
     needs: [launch, benchmark]
     if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_BENCHMARK }}
-          aws-secret-access-key: ${{ secrets.AWS_ACCESS_SECRET_BENCHMARK }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terminate instances
-        run: |
-          set -euo pipefail
-          IDS=""
-          [[ -n "${{ needs.launch.outputs.server_instance_id }}" ]] && IDS="$IDS ${{ needs.launch.outputs.server_instance_id }}"
-          [[ -n "${{ needs.launch.outputs.client_instance_id }}" ]] && IDS="$IDS ${{ needs.launch.outputs.client_instance_id }}"
-          if [[ -n "$IDS" ]]; then
-            aws ec2 terminate-instances --instance-ids $IDS
-            aws ec2 wait instance-terminated --instance-ids $IDS
-          fi
-
-      - name: Delete placement group
-        # Only possible once both instances are fully terminated -- AWS
-        # rejects deleting a placement group with members still in it.
-        if: needs.launch.outputs.placement_group_name != ''
-        continue-on-error: true
-        run: aws ec2 delete-placement-group --group-name "${{ needs.launch.outputs.placement_group_name }}"
-
-      - name: Delete security group
-        if: needs.launch.outputs.security_group_id != ''
-        continue-on-error: true
-        run: aws ec2 delete-security-group --group-id "${{ needs.launch.outputs.security_group_id }}"
-
-      - name: Delete key pair
-        if: needs.launch.outputs.key_pair_name != ''
-        continue-on-error: true
-        run: aws ec2 delete-key-pair --key-name "${{ needs.launch.outputs.key_pair_name }}"
+    uses: ./.github/workflows/_benchmark-destroy.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
