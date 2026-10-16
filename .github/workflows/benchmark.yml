@@ -16,7 +16,7 @@ concurrency:
 
 env:
   KIVIDB_VERSION: "latest"
-  DRAGONFLY_VERSION: "v1.37.0"
+  DRAGONFLY_VERSION: "v2.0.2"
 
 jobs:
 
@@ -27,6 +27,10 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    with:
+      # Same datacenter, not just the same region: keeps the network out of
+      # the latency numbers.
+      use_proximity_group: true
 
   # ── Benchmark (single job on client runner) ──────────────────────────────────
   benchmark:
@@ -113,7 +117,7 @@ jobs:
           cd /home/ubuntu
 
           # ── Dragonfly ───────────────────────────────────────────────────────
-          DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v1.37.0}"
+          DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v2.0.2}"
           INSTALLED_DF=""
           if [[ -x ./dragonfly-aarch64 ]]; then
             INSTALLED_DF=$(./dragonfly-aarch64 --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
@@ -131,7 +135,7 @@ jobs:
           fi
           echo "Dragonfly: $(./dragonfly-aarch64 --version 2>/dev/null || echo 'ready')"
 
-          # ── Redis 8.6 ────────────────────────────────────────────────────────
+          # ── Redis 8 ──────────────────────────────────────────────────────────
           INSTALLED_REDIS=$(redis-server --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
           if [[ "$INSTALLED_REDIS" != "8."* ]]; then
             echo "Installing Redis 8.x..."
@@ -280,7 +284,7 @@ jobs:
           sleep 1
           ulimit -n 65535
           nohup /home/ubuntu/kividb/kividb \
-            --bind 0.0.0.0 --port 6380 --threads 48 --loglevel error \
+            --bind 0.0.0.0 --port 6380 --threads "$(nproc)" --loglevel error \
             > /tmp/kividb.log 2>&1 &
           echo $! > /tmp/kividb.pid
           disown
@@ -325,7 +329,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6380 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:0 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:0 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_write_pipelined.txt 2>&1
           echo "=== KiviDB pipelined write ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_write_pipelined.txt
 
@@ -334,7 +338,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6380 \
             --distinct-client-seed --hide-histogram \
-            --ratio 0:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 0:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_read_pipelined.txt 2>&1
           echo "=== KiviDB pipelined read ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_read_pipelined.txt
 
@@ -343,7 +347,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6380 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_mixed.txt 2>&1
           echo "=== KiviDB mixed ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_mixed.txt
 
@@ -407,7 +411,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6379 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:0 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:0 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/dragonfly_write_pipelined.txt 2>&1
           echo "=== Dragonfly pipelined write ===" && grep -A10 "ALL STATS" /tmp/bench-results/dragonfly_write_pipelined.txt
 
@@ -416,7 +420,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6379 \
             --distinct-client-seed --hide-histogram \
-            --ratio 0:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 0:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/dragonfly_read_pipelined.txt 2>&1
           echo "=== Dragonfly pipelined read ===" && grep -A10 "ALL STATS" /tmp/bench-results/dragonfly_read_pipelined.txt
 
@@ -425,7 +429,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6379 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/dragonfly_mixed.txt 2>&1
           echo "=== Dragonfly mixed ===" && grep -A10 "ALL STATS" /tmp/bench-results/dragonfly_mixed.txt
 
@@ -491,7 +495,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6379 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:0 -t 60 -c 5 -n 20000 --pipeline=10 \
+            --ratio 1:0 -t "$(nproc)" -c 5 -n 20000 --pipeline=10 \
             > /tmp/bench-results/redis_write_pipelined.txt 2>&1
           echo "=== Redis pipelined write ===" && grep -A10 "ALL STATS" /tmp/bench-results/redis_write_pipelined.txt
 
@@ -500,7 +504,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6379 \
             --distinct-client-seed --hide-histogram \
-            --ratio 0:1 -t 60 -c 5 -n 20000 --pipeline=10 \
+            --ratio 0:1 -t "$(nproc)" -c 5 -n 20000 --pipeline=10 \
             > /tmp/bench-results/redis_read_pipelined.txt 2>&1
           echo "=== Redis pipelined read ===" && grep -A10 "ALL STATS" /tmp/bench-results/redis_read_pipelined.txt
 
@@ -509,7 +513,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6379 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:1 -t 60 -c 5 -n 20000 --pipeline=10 \
+            --ratio 1:1 -t "$(nproc)" -c 5 -n 20000 --pipeline=10 \
             > /tmp/bench-results/redis_mixed.txt 2>&1
           echo "=== Redis mixed ===" && grep -A10 "ALL STATS" /tmp/bench-results/redis_mixed.txt
 
@@ -562,7 +566,7 @@ jobs:
           sleep 1
           ulimit -n 65535
           nohup /home/ubuntu/kividb/kividb \
-            --bind 0.0.0.0 --port 6380 --threads 48 \
+            --bind 0.0.0.0 --port 6380 --threads "$(nproc)" \
             --loglevel error \
             --lua-parallel-scripts true \
             --tls-port 6379 \
@@ -617,7 +621,7 @@ jobs:
             -s ${{ env.SERVER_IP }} -p 6379 \
             --tls --tls-skip-verify \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:0 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:0 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_write_pipelined_tls.txt 2>&1
           echo "=== KiviDB pipelined write with all features ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_write_pipelined_tls.txt
 
@@ -627,7 +631,7 @@ jobs:
             -s ${{ env.SERVER_IP }} -p 6379 \
             --tls --tls-skip-verify \
             --distinct-client-seed --hide-histogram \
-            --ratio 0:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 0:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_read_pipelined_tls.txt 2>&1
           echo "=== KiviDB pipelined read with all features ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_read_pipelined_tls.txt
 
@@ -637,7 +641,7 @@ jobs:
             -s ${{ env.SERVER_IP }} -p 6379 \
             --tls --tls-skip-verify \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_mixed_tls.txt 2>&1
           echo "=== KiviDB mixed with all features ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_mixed_tls.txt
 
@@ -663,6 +667,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - name: Resolve ref
         id: ref
@@ -724,12 +729,14 @@ jobs:
           **Branch:** `{ref}` | **Commit:** `{sha}` | **Run:** [{run}](https://github.com/{repo}/actions/runs/{run}) | **Generated:** {now}
 
           > Methodology: [memtier_benchmark](https://github.com/RedisLabs/memtier_benchmark) on an Azure Standard_D32ps_v5 (32 vCPU, arm64).
-          > Client on a separate Standard_D32ps_v5 in the same virtual network. Stores benchmarked sequentially.
+          > Client on a separate Standard_D32ps_v5 in the same proximity placement group. Stores benchmarked sequentially,
+          > each using every core; memtier runs one thread per client core, 5 connections each.
+          > "KiviDB over TLS" is the `lua,tls` build measured over TLS.
           > Full runbook: [kivi-benchmark](https://github.com/kividbio/kivi-benchmark)
 
           ## Results
 
-          | Test | KiviDB | Dragonfly v1.37 | Redis 8.6 | KiviDB vs Dragonfly | KiviDB vs Redis | KiviDB with all features |
+          | Test | KiviDB | Dragonfly v2.0.2 | Redis 8 | KiviDB vs Dragonfly | KiviDB vs Redis | KiviDB over TLS |
           |------|-------|-----------------|----------|---------------------|-----------------|-----------------------|
           | Pipelined write (`--ratio 1:0 -c 5 --pipeline=10`) | {fmt(r['kivi_write_pipelined'])} | {fmt(r['dragonfly_write_pipelined'])} | {fmt(r['redis_write_pipelined'])} | {pct(r['kivi_write_pipelined'],r['dragonfly_write_pipelined'])} | {pct(r['kivi_write_pipelined'],r['redis_write_pipelined'])} | {fmt(r['kivi_write_pipelined_tls'])} |
           | Pipelined read (`--ratio 0:1 -c 5 --pipeline=10`) | {fmt(r['kivi_read_pipelined'])} | {fmt(r['dragonfly_read_pipelined'])} | {fmt(r['redis_read_pipelined'])} | {pct(r['kivi_read_pipelined'],r['dragonfly_read_pipelined'])} | {pct(r['kivi_read_pipelined'],r['redis_read_pipelined'])} | {fmt(r['kivi_read_pipelined_tls'])} |
@@ -740,14 +747,27 @@ jobs:
           print(md)
           EOF
 
-      - name: Commit results
+      - name: Open a pull request with the results
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE: ${{ steps.ref.outputs.ref }}
         run: |
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add benchmarks/LATEST.md
-          git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: benchmark results $(date -u +%Y-%m-%d) [skip ci]"
-          git push
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          # A pull request, not a push: master changes only through review.
+          BRANCH="benchmark-results/${{ github.run_id }}"
+          git switch -c "$BRANCH"
+          git commit -m "Benchmark results $(date -u +%Y-%m-%d) [skip ci]"
+          git push origin "$BRANCH"
+          gh pr create --base "$BASE" --head "$BRANCH" \
+            --title "Benchmark results $(date -u +%Y-%m-%d)" \
+            --body "From run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
 
   # ── Destroy instances (always) ────────────────────────────────────────────────
   destroy-instances:

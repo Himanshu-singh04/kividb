@@ -17,9 +17,11 @@ on:
       client_size:
         type: string
         default: "Standard_D32ps_v5"
+      # Both machines in one datacenter: the lowest latency between them.
+      # Turn off if Azure cannot place the pair together.
       use_proximity_group:
         type: boolean
-        default: false
+        default: true
       # true: the server warms Dragonfly/Redis, the client builds memtier and
       # Rust and registers as this run's self-hosted runner. false: bare
       # Ubuntu, reached over SSH from GitHub-hosted runners.

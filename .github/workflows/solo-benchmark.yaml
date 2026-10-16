@@ -12,9 +12,9 @@ on:
         required: false
         default: "centralindia"
       use_proximity_group:
-        description: "Proximity placement group (lowest latency). Off by default: it can fail to place two large machines together."
+        description: "Proximity placement group: both machines in one datacenter, for the lowest latency. Turn off if Azure cannot place the pair together."
         type: boolean
-        default: false
+        default: true
 
 # Same group as the other benchmarks: two pairs do not fit the region's
 # 65-vCPU quota at once.
@@ -120,7 +120,7 @@ jobs:
           cd /home/ubuntu
 
           # ── Dragonfly ───────────────────────────────────────────────────────
-          DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v1.37.0}"
+          DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v2.0.2}"
           INSTALLED_DF=""
           if [[ -x ./dragonfly-aarch64 ]]; then
             INSTALLED_DF=$(./dragonfly-aarch64 --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
@@ -138,7 +138,7 @@ jobs:
           fi
           echo "Dragonfly: $(./dragonfly-aarch64 --version 2>/dev/null || echo 'ready')"
 
-          # ── Redis 8.6 ────────────────────────────────────────────────────────
+          # ── Redis 8 ──────────────────────────────────────────────────────────
           INSTALLED_REDIS=$(redis-server --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
           if [[ "$INSTALLED_REDIS" != "8."* ]]; then
             echo "Installing Redis 8.x..."
@@ -287,7 +287,7 @@ jobs:
           sleep 1
           ulimit -n 65535
           nohup /home/ubuntu/kividb/kividb \
-            --bind 0.0.0.0 --port 6380 --threads 48 --loglevel error \
+            --bind 0.0.0.0 --port 6380 --threads "$(nproc)" --loglevel error \
             > /tmp/kividb.log 2>&1 &
           echo $! > /tmp/kividb.pid
           disown
@@ -332,7 +332,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6380 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:0 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:0 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_write_pipelined.txt 2>&1
           echo "=== KiviDB pipelined write ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_write_pipelined.txt
 
@@ -341,7 +341,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6380 \
             --distinct-client-seed --hide-histogram \
-            --ratio 0:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 0:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_read_pipelined.txt 2>&1
           echo "=== KiviDB pipelined read ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_read_pipelined.txt
 
@@ -350,7 +350,7 @@ jobs:
           memtier_benchmark \
             -s ${{ env.SERVER_IP }} -p 6380 \
             --distinct-client-seed --hide-histogram \
-            --ratio 1:1 -t 60 -c 5 -n 200000 --pipeline=10 \
+            --ratio 1:1 -t "$(nproc)" -c 5 -n 200000 --pipeline=10 \
             > /tmp/bench-results/kivi_mixed.txt 2>&1
           echo "=== KiviDB mixed ===" && grep -A10 "ALL STATS" /tmp/bench-results/kivi_mixed.txt
 

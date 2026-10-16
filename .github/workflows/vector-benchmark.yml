@@ -143,6 +143,8 @@ jobs:
       # Bare Ubuntu: this workflow ships its own binaries over SSH, and a
       # startup script running apt would fight its apt-get for the lock.
       bootstrap: false
+      # Same datacenter, not just the same region.
+      use_proximity_group: true
 
   # ── Build kividb + vector-db-benchmark, provision both instances, run, compare ─
   benchmark:
@@ -589,14 +591,15 @@ jobs:
   # ── Optional: record a new baseline (manual dispatch only) ──────────────
   update-baseline:
     needs: benchmark
-    if: ${{ inputs.update_baseline == 'true' }}
+    if: ${{ inputs.update_baseline }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.ref_name }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -625,18 +628,27 @@ jobs:
           baseline_path.write_text(json.dumps(baseline, indent=2) + "\n")
           PY
 
-      - name: Commit updated baseline
+      - name: Open a pull request with the new baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE: ${{ inputs.ref || github.ref_name }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add benchmarks/vector-baseline.json
           if git diff --cached --quiet; then
-            echo "No change to baseline."
+            echo "No changes to commit."
             exit 0
           fi
-          git commit -m "Update vector benchmark baseline (run ${{ github.run_id }})"
-          git push
+          # A pull request, not a push: master changes only through review.
+          BRANCH="benchmark-results/${{ github.run_id }}"
+          git switch -c "$BRANCH"
+          git commit -m "Vector benchmark baseline from run ${{ github.run_id }}"
+          git push origin "$BRANCH"
+          gh pr create --base "$BASE" --head "$BRANCH" \
+            --title "Vector benchmark baseline from run ${{ github.run_id }}" \
+            --body "From run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
 
   # ── Always tear down, regardless of benchmark outcome ────────────────────
   destroy:

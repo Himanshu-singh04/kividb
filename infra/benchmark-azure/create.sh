@@ -20,7 +20,7 @@ USE_PROXIMITY_GROUP="${USE_PROXIMITY_GROUP:-false}"
 # "true": the server warms Dragonfly/Redis and the client builds memtier and
 # Rust. "false": bare Ubuntu, for workflows that ship everything themselves.
 BOOTSTRAP="${BOOTSTRAP:-true}"
-DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v1.37.0}"
+DRAGONFLY_VERSION="${DRAGONFLY_VERSION:-v2.0.2}"
 # Set REGISTER_RUNNER=true with GITHUB_REPOSITORY and RUNNER_TOKEN to have the
 # client register itself as an ephemeral self-hosted runner.
 REGISTER_RUNNER="${REGISTER_RUNNER:-false}"
@@ -72,8 +72,9 @@ az network vnet create -g "$RESOURCE_GROUP" -l "$LOCATION" -n "$PREFIX-vnet" \
 
 PPG_ARGS=()
 if [[ "$USE_PROXIMITY_GROUP" == "true" ]]; then
+  # The intended sizes let Azure pick a datacenter that has both.
   az ppg create -g "$RESOURCE_GROUP" -l "$LOCATION" -n "$PREFIX-ppg" -t Standard \
-    --tags "${TAGS[@]}" -o none
+    --intent-vm-sizes "$SERVER_SIZE" "$CLIENT_SIZE" --tags "${TAGS[@]}" -o none
   PPG_ARGS=(--ppg "$PREFIX-ppg")
 fi
 

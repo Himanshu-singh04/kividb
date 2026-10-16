@@ -24,8 +24,12 @@ All in the resource group `kividb-benchmark` (`centralindia`), all named
   two machines is open by the group's default rules.
 - a server VM (default `Standard_D32ps_v5`, 32 vCPU) and a client VM
   (default `Standard_D32ps_v5`), Ubuntu 22.04 arm64, accelerated networking,
-  each with a static public IP. Optionally (`USE_PROXIMITY_GROUP=true`) in a
-  proximity placement group.
+  each with a static public IP. The workflows put both in a proximity
+  placement group (`use_proximity_group`, on by default; `create.sh` alone
+  needs `USE_PROXIMITY_GROUP=true`): one datacenter rather than anywhere in
+  the region, so the network adds as little as it can to the latency
+  numbers. If Azure cannot place the pair together, the create step fails
+  with an allocation error; rerun, or turn the input off.
 - an auto-shutdown schedule on each VM, five hours out, in case teardown
   never runs. Shut down is not deleted: the disks and IPs still cost a
   little until `destroy.sh` runs.
