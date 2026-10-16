@@ -331,16 +331,16 @@ replies, and what to do about each.
 ### Startup update check
 
 When it starts, a release build of KiviDB makes **one HTTPS request** to
-`https://kividb.io/api/release-check` to learn whether a newer release is out, and prints the
-reply's notice, if any, before the startup banner. The request carries four query parameters
-and nothing else: the running **version**, the **OS**, the **CPU architecture** and the
-**build variant** (`default`, `lua`, `tls` or `full`). The `User-Agent` is `kividb/<version>`. No
-host name, configuration, keys, data or identifier is sent; kividb.io sees the request's
-source IP address, as any web server would.
+`https://github.com/kividbio/kividb/releases/latest`, the same page you would open to find
+the newest release. GitHub answers with a redirect to that release's tag; if it is newer
+than the running build, KiviDB prints a short notice with the link before the startup
+banner. Nothing is sent but the request itself, with a `User-Agent` of `kividb/<version>`:
+no host name, configuration, keys, data or identifier. GitHub sees the request's source IP
+address, as any web server would.
 
 Startup waits at most 1.5 seconds for the reply; a failure is logged at debug level only and
-never affects clients. What the reply says is cleaned of control and escape characters, and
-cut to a few short lines, before it is printed.
+never affects clients. Only a version-shaped tag is accepted from the reply, and nothing
+else from it is printed.
 
 Any one of these turns it off:
 

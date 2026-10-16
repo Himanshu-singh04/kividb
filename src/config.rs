@@ -220,13 +220,14 @@ pub struct Config {
     #[arg(long, default_value = "")]
     pub tls_client_key_file: String,
 
-    /// Whether to ask kividb.io at startup for the latest release and its
-    /// announcements, and show what it says (see docs/UPDATE_CHECK.md).
+    /// Whether to ask GitHub at startup for the latest release, and say so
+    /// when it is newer than this build (see docs/UPDATE_CHECK.md).
     /// `--update-check no` turns it off, as does KIVIDB_NO_UPDATE_CHECK=1.
     #[arg(long, default_value = "yes", value_parser = parse_yes_no, num_args = 1)]
     pub update_check: bool,
 
-    /// Where the update check asks (https:// only).
+    /// Where the update check asks: a releases/latest page that redirects to
+    /// the newest release's tag (https:// only).
     #[arg(long, default_value = crate::update_check::DEFAULT_URL)]
     pub update_check_url: String,
 
