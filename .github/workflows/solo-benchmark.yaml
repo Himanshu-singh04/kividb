@@ -40,6 +40,10 @@ jobs:
     needs: create-instances
     runs-on: [self-hosted, benchmark, client, "${{ needs.create-instances.outputs.runner_label }}"]
     env:
+      # Built as the arm64 release binaries and images are (release.yml,
+      # Dockerfile): atomics as single LSE instructions. Without it the
+      # benchmark measures a build nobody downloads.
+      RUSTFLAGS: "-C target-feature=+lse"
       SERVER_IP: ${{ needs.create-instances.outputs.server_private_ip }}
       SERVER_USER: ${{ needs.create-instances.outputs.ssh_user }}
       SSH_KEY_PATH: ${{ needs.create-instances.outputs.ssh_key_path }}

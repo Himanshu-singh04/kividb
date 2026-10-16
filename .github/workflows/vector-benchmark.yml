@@ -161,6 +161,10 @@ jobs:
     # fetch/compare -- generous margin over the ~100 min worst case.
     timeout-minutes: 130
     env:
+      # Built as the arm64 release binaries and images are (release.yml,
+      # Dockerfile): atomics as single LSE instructions. Without it the
+      # benchmark measures a build nobody downloads.
+      RUSTFLAGS: "-C target-feature=+lse"
       SERVER_HOST: ${{ needs.launch.outputs.server_public_ip }}
       SERVER_PRIVATE_IP: ${{ needs.launch.outputs.server_private_ip }}
       CLIENT_HOST: ${{ needs.launch.outputs.client_public_ip }}
