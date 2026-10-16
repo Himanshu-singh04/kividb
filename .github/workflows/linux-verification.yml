@@ -1,4 +1,5 @@
 name: Linux Verification
+# Also runnable by hand (workflow_dispatch), e.g. on master before a release tag.
 
 # Everything that cannot be verified on a Windows dev machine.
 #
