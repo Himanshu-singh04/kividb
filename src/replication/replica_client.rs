@@ -345,6 +345,12 @@ async fn guarded<T, E: std::fmt::Display>(
     my_generation: u64,
     what: &str,
 ) -> Result<T, SessionError> {
+    // Checked before each wait as well as during it: on a link that keeps
+    // delivering, the timer below never fires, and a session that had been
+    // superseded would read a whole payload before noticing.
+    if repl_state.generation() != my_generation {
+        return Err(SessionError::Superseded);
+    }
     tokio::pin!(fut);
     let deadline = Instant::now() + timeout;
     loop {
@@ -734,6 +740,15 @@ async fn run_replication_session(
         // here, with the old dataset still in place. Either way the replica
         // carries on serving what it had. (v1.0.4 did not: a full sync that
         // failed part-way left the replica with no keys at all.)
+        // The last look at the epoch before the live dataset is touched, and
+        // the lock that keeps the epoch from changing until the master's
+        // dataset is in place (see `ReplState::dataset_commit`). A session
+        // superseded by a promotion or a re-point stops here, with the local
+        // dataset as it was.
+        let commit = repl_state.dataset_commit.lock();
+        if repl_state.generation() != my_generation || !repl_state.is_slave() {
+            return Err(SessionError::Superseded);
+        }
         let local_keys = count_keys(store);
         let is_kdb = rdb_bytes.len() >= 8 && rdb_bytes[..8] == *crate::snapshot::KDB_MAGIC;
         let verified_keys =
@@ -830,6 +845,9 @@ async fn run_replication_session(
             offset: master_offset,
             db: 0,
         }));
+        // The dataset is the master's from here on; a promotion now finds it
+        // whole and stops this session at its next look at the epoch.
+        drop(commit);
 
         // Rebuild what the payload describes but does not contain: search indexes
         // are sent as definitions and rebuilt here from the values. That can take

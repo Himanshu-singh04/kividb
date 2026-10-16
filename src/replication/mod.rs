@@ -84,6 +84,14 @@ pub struct ReplState {
     /// The stale task kept applying its old master's writes and the new one never
     /// took effect, so a replica whose master died could never be re-pointed.
     repl_generation: AtomicU64,
+    /// Held by a replication session from its last look at the epoch until
+    /// the master's dataset is in place, and by every epoch change. A
+    /// promotion that arrives while a full sync is replacing the dataset
+    /// waits for it to finish, rather than racing it; and a session that was
+    /// superseded before it got here leaves the dataset alone. Without it a
+    /// node promoted while a payload was still arriving threw its own data
+    /// away and loaded the old master's.
+    pub dataset_commit: parking_lot::Mutex<()>,
     /// Live replication target — `Some((host, port))` while this node is following
     /// a master, `None` once promoted. Authoritative for `INFO replication`'s
     /// `master_host`/`master_port` and `ROLE`.
@@ -371,6 +379,7 @@ impl ReplState {
             stream_taps: std::sync::atomic::AtomicUsize::new(0),
             taps: RwLock::new(Vec::new()),
             repl_generation: AtomicU64::new(0),
+            dataset_commit: parking_lot::Mutex::new(()),
             master_addr: RwLock::new(None),
             replica_progress: parking_lot::Mutex::new(std::collections::HashMap::new()),
             slave_link_state: AtomicU8::new(LinkState::Connect as u8),
@@ -773,13 +782,17 @@ impl ReplState {
     /// previous task without each call site having to remember to do it.
     #[inline]
     pub fn begin_replication_epoch(&self) -> u64 {
+        let _commit = self.dataset_commit.lock();
         self.repl_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     #[inline]
     pub fn become_master(&self) {
         // Promotion supersedes any in-flight replication task, including one
-        // blocked mid-stream on a master that no longer exists.
+        // blocked mid-stream on a master that no longer exists. Not while a
+        // full sync is putting the master's dataset in place: see
+        // `dataset_commit`.
+        let _commit = self.dataset_commit.lock();
         self.repl_generation.fetch_add(1, Ordering::AcqRel);
         self.slave_mode.store(false, Ordering::Release);
         *self.master_addr.write() = None;

@@ -1316,3 +1316,137 @@ fn a_master_without_enough_good_replicas_refuses_writes() {
         "a lag of 0 turns it off"
     );
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PROMOTION DURING A FULL SYNC
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Read one CRLF-terminated line from `r`, without the CRLF.
+fn read_line_raw(r: &mut impl BufRead) -> String {
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    line.trim_end().to_string()
+}
+
+/// A real full-sync payload: what `master_port` sends a new replica.
+fn full_sync_payload_of(master_port: u16) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", master_port)).unwrap();
+    stream
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let greeting = read_line_raw(&mut reader);
+    assert!(greeting.starts_with("+FULLRESYNC"), "{greeting}");
+    let header = read_line_raw(&mut reader);
+    let len: usize = header.trim_start_matches('$').parse().unwrap();
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).unwrap();
+    payload
+}
+
+/// A stand-in master that answers the handshake and then sends `payload` a
+/// little at a time, never pausing long enough for the replica's idle-link
+/// timer to fire — a large payload on a busy link, made slow enough to promote
+/// the replica in the middle of it. `started` gets a message once the payload
+/// has begun. Returns its port.
+fn spawn_master_trickling(payload: Vec<u8>, started: std::sync::mpsc::Sender<()>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Some(Ok(mut stream)) = listener.incoming().next() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let line = read_line_raw(&mut reader);
+            let argc: usize = line.trim_start_matches('*').parse().unwrap_or(0);
+            if argc == 0 {
+                return;
+            }
+            let mut args = Vec::new();
+            for _ in 0..argc {
+                let len: usize = read_line_raw(&mut reader)
+                    .trim_start_matches('$')
+                    .parse()
+                    .unwrap();
+                let mut data = vec![0u8; len + 2];
+                reader.read_exact(&mut data).unwrap();
+                data.truncate(len);
+                args.push(String::from_utf8_lossy(&data).to_ascii_uppercase());
+            }
+            match args[0].as_str() {
+                "PING" => stream.write_all(b"+PONG\r\n").unwrap(),
+                "REPLCONF" => stream.write_all(b"+OK\r\n").unwrap(),
+                "PSYNC" => break,
+                _ => return,
+            }
+        }
+        stream
+            .write_all(b"+FULLRESYNC 0123456789012345678901234567890123456789 0\r\n")
+            .unwrap();
+        stream
+            .write_all(format!("${}\r\n", payload.len()).as_bytes())
+            .unwrap();
+        let _ = started.send(());
+        for chunk in payload.chunks(64) {
+            if stream.write_all(chunk).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(15));
+        }
+        let _ = stream.write_all(b"*1\r\n$4\r\nPING\r\n");
+        let mut sink = [0u8; 256];
+        while reader.read(&mut sink).unwrap_or(0) > 0 {}
+    });
+    port
+}
+
+/// `REPLICAOF NO ONE` while a full-sync payload is still arriving. The node is
+/// a master from then on, with its own dataset: the session it superseded must
+/// stop without touching it. It used to read the payload to the end, drop the
+/// promoted node's keys and load the old master's — found in a staging
+/// failover, where the promoted node also lost every write since its sync.
+#[test]
+fn test_promotion_during_a_full_sync_keeps_the_promoted_nodes_dataset() {
+    let source = spawn_server(Config::default());
+    let mut s = Conn::connect(source);
+    for i in 0..300 {
+        assert!(s.cmds(&["SET", &format!("from-master:{i}"), "x"]).is_ok());
+    }
+    let payload = full_sync_payload_of(source);
+    assert!(
+        payload.len() > 64 * 20,
+        "the payload must take a while to trickle: {} bytes",
+        payload.len()
+    );
+
+    let node = spawn_server(Config::default());
+    let mut c = Conn::connect(node);
+    for i in 0..50 {
+        assert!(c.cmds(&["SET", &format!("mine:{i}"), "v"]).is_ok());
+    }
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let old_master = spawn_master_trickling(payload, started_tx);
+    assert!(
+        c.cmds(&["REPLICAOF", "127.0.0.1", &old_master.to_string()])
+            .is_ok()
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the full sync never started");
+    thread::sleep(Duration::from_millis(100));
+    assert!(c.cmds(&["REPLICAOF", "NO", "ONE"]).is_ok());
+
+    // Long enough for the rest of the payload to have arrived, been loaded and
+    // swapped in, had the old session not stopped.
+    thread::sleep(Duration::from_secs(4));
+    assert_eq!(repl_info(&mut c, "role").as_deref(), Some("master"));
+    assert_eq!(
+        c.cmds(&["DBSIZE"]).as_int(),
+        50,
+        "the promoted node's dataset was replaced"
+    );
+    assert_eq!(c.cmds(&["GET", "mine:0"]).as_str(), "v");
+    assert!(c.cmds(&["SET", "after-promotion", "1"]).is_ok());
+}
