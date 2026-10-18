@@ -4,10 +4,22 @@
   <img src="assets/kiwi.png" alt="KiviDB" width="180">
 </p>
 
-**KiviDB** is a fast, Redis-compatible in-memory store written in Rust. It speaks the Redis
-RESP protocol, uses a sharded in-memory key-value design, and supports persistence via
-snapshots and an optional append-only file, aimed at workloads where throughput and
-predictable latency matter.
+**KiviDB** is a fast, multi-threaded alternative to Redis® and Valkey, written in Rust. It
+speaks the Redis protocol (RESP2 and RESP3), so existing Redis clients, `redis-cli` and
+libraries work unchanged, and it has full-text and vector search built in. It runs every
+core on a sharded in-memory key-value design, and persists to snapshots and an optional
+append-only file.
+
+On the same 32 cores, KiviDB serves **21 million pipelined GETs per second: about 9× Redis 8
+and 2.3× Dragonfly**, with under half Dragonfly's p99 latency ([benchmarks](#performance)).
+
+```bash
+docker run -d -p 6380:6380 kividb/kividb
+redis-cli -p 6380 PING        # PONG
+```
+
+KiviDB listens on **6380**, not Redis's 6379, so the two can run side by side; point your
+client at that port, or pass `--port 6379`.
 
 - **Protocol**: Redis-compatible command surface (see [COMMANDS.md](COMMANDS.md) for the supported commands)
 - **Search and vectors**: Redis Stack–style `FT.*` commands for full-text, tag, numeric and vector (FLAT / HNSW) search
@@ -17,6 +29,18 @@ predictable latency matter.
 - **License**: [GNU Affero General Public License v3](LICENSE) (AGPL-3.0-only), open source; using KiviDB does not put your application under the AGPL; see [License](#license)
 
 Repository: [github.com/kividbio/kividb](https://github.com/kividbio/kividb) · Website: [kividb.io](https://kividb.io)
+
+### How it compares
+
+| | KiviDB | Redis 8 | Valkey 8 | Dragonfly | KeyDB |
+|---|---|---|---|---|---|
+| License | AGPL-3.0 | RSALv2, SSPLv1 or AGPL-3.0 | BSD-3-Clause | BSL 1.1 | BSD-3-Clause |
+| Language | Rust | C | C | C++ | C++ |
+| Commands run on | every core (sharded) | one thread (I/O threads) | one thread (I/O threads) | every core (shared-nothing) | several threads |
+| Full-text and vector search (`FT.*`) | built in | built in (Query Engine) | separate module | built in | no |
+| Lua scripting | `lua` build | yes | yes | yes | yes |
+
+As of October 2026. Something out of date or wrong? Please [open an issue](https://github.com/kividbio/kividb/issues/new/choose).
 
 ## Performance
 
