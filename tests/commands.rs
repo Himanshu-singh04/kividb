@@ -927,6 +927,35 @@ fn test_command_list_filterby_module_empty() {
     assert_eq!(result.as_array().len(), 0);
 }
 
+// COMMAND LIST FILTERBY MODULE names a built-in module's commands, as Redis
+// lists FT.* under `search` and the vector set commands under `vectorset`.
+#[test]
+fn test_command_list_filterby_module_built_in() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let names = |c: &mut Conn, module: &str| -> Vec<String> {
+        c.cmds(&["COMMAND", "LIST", "FILTERBY", "MODULE", module])
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect()
+    };
+    let search = names(&mut c, "search");
+    assert!(search.contains(&"ft.search".to_string()), "{search:?}");
+    assert!(
+        search
+            .iter()
+            .all(|n| n.starts_with("ft.") || n.starts_with("_ft."))
+    );
+    assert!(names(&mut c, "ReJSON").contains(&"json.set".to_string()));
+    assert!(names(&mut c, "timeseries").contains(&"ts.add".to_string()));
+    let vset = names(&mut c, "vectorset");
+    assert!(vset.contains(&"vadd".to_string()) && vset.contains(&"vsim".to_string()));
+    assert!(names(&mut c, "bf").is_empty());
+}
+
 // COMMAND LIST FILTERBY ACLCAT returns commands in that category.
 #[test]
 fn test_command_list_filterby_aclcat() {

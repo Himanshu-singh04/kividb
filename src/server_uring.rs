@@ -1952,7 +1952,7 @@ pub async fn handle_client(
                         resp_bulk_str("role"),
                         resp_bulk_str(&role),
                         resp_bulk_str("modules"),
-                        resp_array(vec![]),
+                        commands::server::module_list_reply(proto_reply as u8),
                     ];
                     let response = if proto_reply == 3 {
                         resp_map(kv)

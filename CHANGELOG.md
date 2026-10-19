@@ -22,6 +22,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`MODULE LIST` names the built-in module families.** It lists `search`,
   `ReJSON`, `timeseries` and `vectorset` with the versions Redis 8.10
   reports and an empty path, as Redis lists its own built-in `vectorset`.
+  `HELLO` reports the same list under `modules`, and
+  `COMMAND LIST FILTERBY MODULE search` (or `ReJSON`, `timeseries`,
+  `vectorset`) lists that family's commands.
   It was empty, and clients that check it before using FT.* refused to
   connect: redisvl 0.4, which LlamaIndex's Redis vector store requires,
   raised `RedisModuleVersionError` on `RedisVectorStore(redis_url=...)`.

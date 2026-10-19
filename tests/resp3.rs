@@ -967,3 +967,17 @@ fn module_list_names_the_built_in_families_in_both_protocols() {
         "RESP3 MODULE LIST"
     );
 }
+
+/// HELLO's `modules` is the list MODULE LIST gives, as in Redis.
+#[test]
+fn hello_reports_the_built_in_modules() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    let hello = s(&c.raw(&["HELLO", "2"]));
+    let list = s(&c.raw(&["MODULE", "LIST"]));
+    assert!(
+        hello.ends_with(&format!("$7\\r\\nmodules\\r\\n{list}")),
+        "HELLO must end with the module list:\n  hello: {hello}\n  list:  {list}"
+    );
+}

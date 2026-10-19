@@ -2109,6 +2109,57 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
 /// Given a command invocation (cmd[0] = command name, cmd[1..] = args),
 /// return RESP-encoded key entries. Each entry is either a bulk string (GETKEYS)
 /// or a 2-element array [key, [flags...]] (GETKEYSANDFLAGS).
+/// The module families KiviDB has built in, as Redis 8.10 names and numbers
+/// them. No module can be loaded, but clients look for these before they use
+/// the commands (redisvl 0.4, which LlamaIndex's vector store pins, refuses
+/// to connect without `search`), so `MODULE LIST`, `HELLO` and
+/// `COMMAND LIST FILTERBY MODULE` report them as Redis reports its own
+/// built-in `vectorset`: an empty path and no args.
+const BUILT_IN_MODULES: [(&str, i64); 4] = [
+    ("search", 81001),
+    ("ReJSON", 81000),
+    ("timeseries", 81001),
+    ("vectorset", 1),
+];
+
+/// One entry per built-in module family, as `MODULE LIST` and `HELLO`'s
+/// `modules` give them: a map under RESP3, a flat array under RESP2.
+pub(crate) fn module_list_reply(resp: u8) -> Vec<u8> {
+    resp_array(
+        BUILT_IN_MODULES
+            .iter()
+            .map(|(name, ver)| {
+                resp_map_for(
+                    resp,
+                    vec![
+                        resp_bulk(b"name"),
+                        resp_bulk(name.as_bytes()),
+                        resp_bulk(b"ver"),
+                        resp_integer(*ver),
+                        resp_bulk(b"path"),
+                        resp_bulk(b""),
+                        resp_bulk(b"args"),
+                        resp_array(vec![]),
+                    ],
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Whether the lower-cased command `name` belongs to the built-in module
+/// family `module`, for `COMMAND LIST FILTERBY MODULE`.
+fn in_module(module: &str, name: &str) -> bool {
+    match module {
+        "search" => name.starts_with("ft.") || name.starts_with("_ft."),
+        "rejson" => name.starts_with("json."),
+        "timeseries" => name.starts_with("ts."),
+        // The vector set commands are the only ones that begin with `v`.
+        "vectorset" => name.starts_with('v'),
+        _ => false,
+    }
+}
+
 pub(crate) fn extract_keys(args: &[&[u8]], with_flags: bool) -> Result<Vec<Vec<u8>>, String> {
     use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str};
 
@@ -3359,8 +3410,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             5 if cmd[2].eq_ignore_ascii_case(b"FILTERBY") => {
                                 let by = String::from_utf8_lossy(cmd[4]).to_ascii_lowercase();
                                 if cmd[3].eq_ignore_ascii_case(b"MODULE") {
-                                    // There are no modules.
-                                    Vec::new()
+                                    names()
+                                        .into_iter()
+                                        .filter(|name| in_module(&by, name))
+                                        .collect()
                                 } else if cmd[3].eq_ignore_ascii_case(b"PATTERN") {
                                     names()
                                         .into_iter()
@@ -4231,7 +4284,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 resp_bulk_str("role"),
                 resp_bulk_str("master"),
                 resp_bulk_str("modules"),
-                resp_array(vec![]),
+                module_list_reply(2),
             ]))
         }
 
@@ -4403,43 +4456,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
         }
 
-        // No module can be loaded, but the command families Redis gets from
-        // its modules are built in, and clients look for them here before
-        // they use them (redisvl 0.4, which LlamaIndex's vector store pins,
-        // refuses to connect without `search`). They are listed as Redis
-        // lists its own built-in `vectorset`: an empty path, no args, and the
-        // versions Redis 8.10 reports.
+        // The built-in module families; see `BUILT_IN_MODULES`.
         "MODULE"
             if cmd
                 .get(1)
                 .is_some_and(|sub| sub.eq_ignore_ascii_case(b"LIST")) =>
         {
-            let resp = crate::commands::handler::effective_resp_for_reply(ctx);
-            let modules = [
-                ("search", 81001),
-                ("ReJSON", 81000),
-                ("timeseries", 81001),
-                ("vectorset", 1),
-            ];
-            Some(resp_array(
-                modules
-                    .iter()
-                    .map(|(name, ver)| {
-                        resp_map_for(
-                            resp,
-                            vec![
-                                resp_bulk(b"name"),
-                                resp_bulk(name.as_bytes()),
-                                resp_bulk(b"ver"),
-                                resp_integer(*ver),
-                                resp_bulk(b"path"),
-                                resp_bulk(b""),
-                                resp_bulk(b"args"),
-                                resp_array(vec![]),
-                            ],
-                        )
-                    })
-                    .collect(),
+            Some(module_list_reply(
+                crate::commands::handler::effective_resp_for_reply(ctx),
             ))
         }
         "MODULE"
