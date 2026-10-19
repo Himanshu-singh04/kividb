@@ -1430,7 +1430,7 @@ Scripting (`EVAL`, `SCRIPT`, `FUNCTION`, `FCALL`, …) is **supported when built
 
 | Command | Reason |
 |---------|--------|
-| `MODULE LOAD/LOADEX/UNLOAD` | Requires `dlopen`, ABI versioning, and runtime command-table mutation. The Redis Modules C ABI is incompatible with KiviDB's safety model. (`MODULE LIST` returns an empty list.) |
+| `MODULE LOAD/LOADEX/UNLOAD` | Requires `dlopen`, ABI versioning, and runtime command-table mutation. The Redis Modules C ABI is incompatible with KiviDB's safety model. `MODULE LIST` names the built-in families clients check for (`search`, `ReJSON`, `timeseries`, `vectorset`) with Redis 8.10's versions and an empty path, as Redis lists its built-in `vectorset`. |
 | `FAILOVER` | Only meaningful in a Sentinel topology, which KiviDB does not implement. |
 | `CLUSTER SLAVES` | Deprecated by Redis in favour of `CLUSTER REPLICAS`. Use `CLUSTER REPLICAS` instead. |
 

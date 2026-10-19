@@ -17,6 +17,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `delete` on a namespace could reach an item in a namespace under it. TEXT
   indexes are rebuilt from the data when the server starts, so no reindex is
   needed after upgrading.
+- **`MODULE LIST` names the built-in module families.** It lists `search`,
+  `ReJSON`, `timeseries` and `vectorset` with the versions Redis 8.10
+  reports and an empty path, as Redis lists its own built-in `vectorset`.
+  It was empty, and clients that check it before using FT.* refused to
+  connect: redisvl 0.4, which LlamaIndex's Redis vector store requires,
+  raised `RedisModuleVersionError` on `RedisVectorStore(redis_url=...)`.
 
 ## [1.1.0]
 

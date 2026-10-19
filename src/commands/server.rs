@@ -4403,14 +4403,44 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
         }
 
-        // There are no modules: there are none to list, and asking what
-        // `MODULE` can do is answered.
+        // No module can be loaded, but the command families Redis gets from
+        // its modules are built in, and clients look for them here before
+        // they use them (redisvl 0.4, which LlamaIndex's vector store pins,
+        // refuses to connect without `search`). They are listed as Redis
+        // lists its own built-in `vectorset`: an empty path, no args, and the
+        // versions Redis 8.10 reports.
         "MODULE"
             if cmd
                 .get(1)
                 .is_some_and(|sub| sub.eq_ignore_ascii_case(b"LIST")) =>
         {
-            Some(resp_array(vec![]))
+            let resp = crate::commands::handler::effective_resp_for_reply(ctx);
+            let modules = [
+                ("search", 81001),
+                ("ReJSON", 81000),
+                ("timeseries", 81001),
+                ("vectorset", 1),
+            ];
+            Some(resp_array(
+                modules
+                    .iter()
+                    .map(|(name, ver)| {
+                        resp_map_for(
+                            resp,
+                            vec![
+                                resp_bulk(b"name"),
+                                resp_bulk(name.as_bytes()),
+                                resp_bulk(b"ver"),
+                                resp_integer(*ver),
+                                resp_bulk(b"path"),
+                                resp_bulk(b""),
+                                resp_bulk(b"args"),
+                                resp_array(vec![]),
+                            ],
+                        )
+                    })
+                    .collect(),
+            ))
         }
         "MODULE"
             if cmd
