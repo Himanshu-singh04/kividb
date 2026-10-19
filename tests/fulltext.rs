@@ -904,3 +904,132 @@ fn test_match_all_returns_all_docs() {
     let r = c.cmds(&["FT.SEARCH", "idx", "*", "LIMIT", "0", "10"]);
     assert_eq!(r.ft_search_total(), 3, "match-all must return all 3 docs");
 }
+
+// ── Backslash escapes ─────────────────────────────────────────────────────────
+
+/// Sorted keys of an FT.SEARCH reply, or the error text.
+fn search_keys(c: &mut Conn, index: &str, query: &str) -> Result<Vec<String>, String> {
+    match c.cmds(&["FT.SEARCH", index, query, "NOCONTENT", "DIALECT", "2"]) {
+        RespValue::Error(e) => Err(e),
+        r => {
+            let mut keys: Vec<String> = r.as_array()[1..]
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect();
+            keys.sort();
+            Ok(keys)
+        }
+    }
+}
+
+/// A backslash makes the next character part of the word, in a document and
+/// in a query, as in Redis. LangGraph's RedisStore depends on it: it stores a
+/// namespace such as `users\.u_ab12` and finds it, and the namespaces under
+/// it, with `@prefix:users\.u_ab12` and `@prefix:users\.u_ab12*`. Expected
+/// results are what Redis 8.10.2 returns for the same data.
+#[test]
+fn test_backslash_escape_keeps_punctuation_in_the_word() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "e:", "p");
+    c.cmds(&["HSET", "e:1", "p", r"users\.u_ab12"]);
+    c.cmds(&["HSET", "e:2", "p", r"users\.u_ab12\.sub"]);
+    c.cmds(&["HSET", "e:3", "p", r"docs\.v_zz"]);
+    c.cmds(&["HSET", "e:4", "p", "users.plain"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let cases: &[(&str, &[&str])] = &[
+        (r"@p:users\.u_ab12", &["e:1"]),
+        (r"@p:users\.u_ab12*", &["e:1", "e:2"]),
+        (r"@p:users\.u*", &["e:1", "e:2"]),
+        (r"@p:users\.u_ab12\.sub", &["e:2"]),
+        (r"@p:users\.u_ab12\.*", &["e:2"]),
+        (r"@p:(users\.u_ab12*)", &["e:1", "e:2"]),
+        ("@p:users*", &["e:1", "e:2", "e:4"]),
+        ("@p:users", &["e:4"]),
+        ("@p:u_ab12", &[]),
+        ("@p:plain", &["e:4"]),
+    ];
+    for (query, want) in cases {
+        let want: Vec<String> = want.iter().map(|k| k.to_string()).collect();
+        assert_eq!(search_keys(&mut c, "idx", query), Ok(want), "query {query}");
+    }
+}
+
+/// An escaped separator in a query does not match the two words it separates
+/// in a document that did not escape it: `users\.plain` is one word, and the
+/// document holds `users` and `plain`. Redis returns nothing.
+#[test]
+fn test_escaped_query_word_does_not_match_unescaped_document() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "e:", "p");
+    c.cmds(&["HSET", "e:1", "p", "users.plain"]);
+    c.cmds(&["HSET", "e:2", "p", "us-er"]);
+    thread::sleep(Duration::from_millis(50));
+
+    for query in [r"users\.plain", r"users\.pl*", r"us\-er*", r"users\.*"] {
+        assert_eq!(
+            search_keys(&mut c, "idx", query),
+            Ok(vec![]),
+            "query {query}"
+        );
+    }
+}
+
+/// The LangGraph RedisStore shape: a JSON index with the escaped namespace in
+/// a TEXT field and the item key in a TAG. A parent namespace's query must
+/// not return the child namespace's item with the same key.
+#[test]
+fn test_escaped_namespace_on_json_index_keeps_parent_and_child_apart() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&[
+        "FT.CREATE",
+        "store",
+        "ON",
+        "JSON",
+        "PREFIX",
+        "1",
+        "store:",
+        "SCHEMA",
+        "$.prefix",
+        "AS",
+        "prefix",
+        "TEXT",
+        "$.key",
+        "AS",
+        "key",
+        "TAG",
+    ]);
+    c.cmds(&[
+        "JSON.SET",
+        "store:1",
+        "$",
+        r#"{"prefix":"org\\.t1","key":"profile"}"#,
+    ]);
+    c.cmds(&[
+        "JSON.SET",
+        "store:2",
+        "$",
+        r#"{"prefix":"org\\.t1\\.private","key":"profile"}"#,
+    ]);
+    thread::sleep(Duration::from_millis(50));
+
+    let both = || Ok(vec!["store:1".to_string(), "store:2".to_string()]);
+    assert_eq!(
+        search_keys(&mut c, "store", r"(@prefix:(org\.t1) @key:{profile})"),
+        Ok(vec!["store:1".to_string()])
+    );
+    assert_eq!(
+        search_keys(&mut c, "store", r"@prefix:org\.t1\.private @key:{profile}"),
+        Ok(vec!["store:2".to_string()])
+    );
+    assert_eq!(search_keys(&mut c, "store", r"@prefix:org\.t1*"), both());
+}

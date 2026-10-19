@@ -1093,7 +1093,8 @@ fn highlight(value: &str, terms: &AHashSet<String>, open: &str, close: &str) -> 
         if word.is_empty() {
             return;
         }
-        if terms.contains(&word.to_lowercase()) {
+        let token = crate::vector::tokenize_for_vocab(word).next();
+        if token.is_some_and(|t| terms.contains(&t)) {
             out.push_str(open);
             out.push_str(word);
             out.push_str(close);
@@ -1102,8 +1103,15 @@ fn highlight(value: &str, terms: &AHashSet<String>, open: &str, close: &str) -> 
         }
         word.clear();
     };
-    for c in value.chars() {
-        if crate::vector::is_token_separator(c) {
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        // An escaped character belongs to the word, as the tokenizer has it.
+        if c == '\\' {
+            word.push(c);
+            if let Some(escaped) = chars.next() {
+                word.push(escaped);
+            }
+        } else if crate::vector::is_token_separator(c) {
             flush(&mut word, &mut out);
             out.push(c);
         } else {

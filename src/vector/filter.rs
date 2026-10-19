@@ -803,8 +803,11 @@ impl<'a> Parser<'a> {
             match self.bump() {
                 None => return Err(self.syntax_error_at(start)),
                 Some('"') => break,
+                // The escape is kept: the tokenizer reads it, so that `\.`
+                // stays inside its word as it does in the document.
                 Some('\\') => {
                     if let Some(escaped) = self.bump() {
+                        text.push('\\');
                         text.push(escaped);
                     }
                 }
@@ -834,8 +837,10 @@ impl<'a> Parser<'a> {
         let mut raw = String::new();
         while let Some(c) = self.peek() {
             if c == '\\' {
+                // Kept for the tokenizer, as in a phrase.
                 self.bump();
                 if let Some(escaped) = self.bump() {
+                    raw.push('\\');
                     raw.push(escaped);
                 }
             } else if is_word_end(c) || (c == '=' && self.rest().starts_with("=>")) {
@@ -867,9 +872,18 @@ impl<'a> Parser<'a> {
             }));
         }
 
+        // An escaped `*` (`\*`) is a character of the word, not a wildcard.
         let leading = raw.starts_with('*');
-        let trailing = raw.len() > 1 && raw.ends_with('*');
-        let core = raw.trim_matches('*');
+        let trailing = raw.len() > 1
+            && raw.ends_with('*')
+            && raw[..raw.len() - 1]
+                .chars()
+                .rev()
+                .take_while(|c| *c == '\\')
+                .count()
+                % 2
+                == 0;
+        let core = &raw[usize::from(leading)..raw.len() - usize::from(trailing)];
         let mut tokens: Vec<String> = super::tokenize_for_vocab(core).collect();
         if leading || trailing {
             let [token] = tokens.as_slice() else {

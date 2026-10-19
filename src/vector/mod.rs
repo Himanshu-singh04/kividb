@@ -421,10 +421,29 @@ pub(crate) fn is_token_separator(c: char) -> bool {
 /// It used to split at whitespace only and then drop the punctuation, which
 /// made `wi-fi` the word `wifi` and `red,green` the word `redgreen`: a search
 /// for `green` found nothing. Punctuation separates words, as in Redis.
+///
+/// A backslash makes the character after it part of the word, separator or
+/// not, and is itself dropped: `users\.u_1` is the one word `users.u_1`, in a
+/// document as in a query, as in Redis. LangGraph's store keeps namespaces
+/// apart this way; splitting there made a namespace match the ones under it.
 pub fn tokenize_for_vocab(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(is_token_separator)
-        .filter(|word| !word.is_empty())
-        .map(|word| word.to_lowercase())
+    let mut chars = text.chars();
+    std::iter::from_fn(move || {
+        let mut word = String::new();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some(escaped) => word.push(escaped),
+                    None => break,
+                }
+            } else if !is_token_separator(c) {
+                word.push(c);
+            } else if !word.is_empty() {
+                break;
+            }
+        }
+        (!word.is_empty()).then(|| word.to_lowercase())
+    })
 }
 
 /// Returns true if the token is a common English stopword that should not
