@@ -404,8 +404,10 @@ Full hybrid query example:
 
 | Algorithm | Option | Description |
 |-----------|--------|-------------|
-| `FLAT` | `TYPE FLOAT32 DIM n DISTANCE_METRIC L2\|COSINE\|IP` | Brute-force exact search; O(n) per query; best for < 50k vectors |
-| `HNSW` | `TYPE FLOAT32 DIM n DISTANCE_METRIC L2\|COSINE\|IP M n EF_CONSTRUCTION n` | Approximate graph-based search; O(log n) per query; best for > 50k vectors |
+| `FLAT` | `TYPE FLOAT32\|FLOAT64\|FLOAT16\|BFLOAT16 DIM n DISTANCE_METRIC L2\|COSINE\|IP` | Brute-force exact search; O(n) per query; best for < 50k vectors |
+| `HNSW` | `TYPE FLOAT32\|FLOAT64\|FLOAT16\|BFLOAT16 DIM n DISTANCE_METRIC L2\|COSINE\|IP M n EF_CONSTRUCTION n` | Approximate graph-based search; O(log n) per query; best for > 50k vectors |
+
+`TYPE` is the element type of the field's blobs: a hash holds `DIM` little-endian elements of it, and so does a query's vector parameter, as in Redis. A JSON document holds a number array whatever the type. The index keeps every vector as 32-bit floats, so a FLOAT16 or BFLOAT16 field takes as much memory as a FLOAT32 one. `INT8` and `UINT8` (Redis 8.2) are not supported.
 
 HNSW indexes auto-compact when tombstone ratio exceeds 20% (and tombstone count exceeds 64). Compaction runs in a background thread using a shadow-index pattern — readers and writers see no pause. Manual triggers via `FT.DEBUG COMPACT index field` are also supported.
 

@@ -23,7 +23,7 @@
 // `(-@k:{tenantB})=>[KNN …]` returned tenant B's documents, and a
 // `VECTOR_RANGE` query returned nothing at all without saying why.
 
-use super::{DistanceMetric, FieldType, IndexDef, SchemaField};
+use super::{DistanceMetric, FieldType, IndexDef, SchemaField, VectorType};
 use ahash::AHashMap;
 
 /// `PARAMS` of a query: name → value.
@@ -116,6 +116,8 @@ pub enum Filter {
         radius: f64,
         vector: Vec<f32>,
         metric: DistanceMetric,
+        /// The element type of the field's blobs, to read a document's.
+        data_type: VectorType,
         /// `$YIELD_DISTANCE_AS`: the name to report the distance under.
         yield_as: Option<String>,
     },
@@ -656,7 +658,13 @@ impl<'a> Parser<'a> {
             let [_, radius, vector] = tokens.as_slice() else {
                 return Err(self.syntax_error_at(inner_start));
             };
-            let FieldType::Vector { dim, metric, .. } = &field.field_type else {
+            let FieldType::Vector {
+                dim,
+                metric,
+                data_type,
+                ..
+            } = &field.field_type
+            else {
                 return Err(format!(
                     "Error parsing vector similarity query: '{}' is not a vector field",
                     field.attribute()
@@ -672,8 +680,9 @@ impl<'a> Parser<'a> {
             return Ok(Filter::VectorRange {
                 field: field.name.clone(),
                 radius,
-                vector: self.vector_param(name, *dim)?,
+                vector: self.vector_param(name, *dim, *data_type)?,
                 metric: metric.clone(),
+                data_type: *data_type,
                 yield_as: None,
             });
         }
@@ -760,23 +769,18 @@ impl<'a> Parser<'a> {
             .map_err(|_| format!("Parameter `{name}` is not text"))
     }
 
-    /// A vector given as a parameter: `dim` little-endian 32-bit floats.
-    fn vector_param(&self, name: &str, dim: usize) -> Result<Vec<f32>, String> {
+    /// A vector given as a parameter: `dim` little-endian elements of the
+    /// field's type.
+    fn vector_param(&self, name: &str, dim: usize, ty: VectorType) -> Result<Vec<f32>, String> {
         let raw = self.param(name)?;
-        if raw.len() != dim * 4 {
-            return Err(format!(
+        ty.decode(raw, dim).ok_or_else(|| {
+            format!(
                 "Error parsing vector similarity query: query vector blob size ({}) does not \
                  match index's expected size ({}).",
                 raw.len(),
-                dim * 4
-            ));
-        }
-        Ok(raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect())
+                dim * ty.size()
+            )
+        })
     }
 
     /// The TEXT fields a word is looked for in: the ones in scope, or all of
@@ -961,7 +965,7 @@ impl<'a> Parser<'a> {
         let Some(schema_field) = self.def.field_by_attribute(attribute) else {
             return Err(format!("Unknown field at offset {start} near {attribute}"));
         };
-        let FieldType::Vector { dim, .. } = &schema_field.field_type else {
+        let FieldType::Vector { dim, data_type, .. } = &schema_field.field_type else {
             return Err(format!(
                 "Error parsing vector similarity query: '{attribute}' is not a vector field"
             ));
@@ -969,7 +973,7 @@ impl<'a> Parser<'a> {
         let mut clause = Knn {
             k,
             field: schema_field.name.clone(),
-            vector: self.vector_param(vector_name, *dim)?,
+            vector: self.vector_param(vector_name, *dim, *data_type)?,
             alias: format!("__{attribute}_score"),
             ef_runtime: None,
         };
@@ -1043,16 +1047,9 @@ fn within_edits(a: &str, b: &str, max: usize) -> bool {
     prev[b.len()] <= max
 }
 
-/// The vector a document holds in `field`, if it is one of `dim` floats.
-pub fn doc_vector(doc: &dyn Doc, field: &str, dim: usize) -> Option<Vec<f32>> {
-    let raw = doc.field_bytes(field)?;
-    (raw.len() == dim * 4).then(|| {
-        raw.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect()
-    })
+/// The vector a document holds in `field`, if it is `dim` elements of `ty`.
+pub fn doc_vector(doc: &dyn Doc, field: &str, dim: usize, ty: VectorType) -> Option<Vec<f32>> {
+    ty.decode(doc.field_bytes(field)?, dim)
 }
 
 /// The distance a `VECTOR_RANGE` clause measures for this document, if the
@@ -1062,12 +1059,13 @@ pub fn range_distance(filter: &Filter, doc: &dyn Doc) -> Option<f32> {
         field,
         vector,
         metric,
+        data_type,
         ..
     } = filter
     else {
         return None;
     };
-    let stored = doc_vector(doc, field, vector.len())?;
+    let stored = doc_vector(doc, field, vector.len(), *data_type)?;
     Some(super::distance(metric, vector, &stored))
 }
 
@@ -1204,6 +1202,7 @@ mod tests {
                         algo: VectorAlgo::Flat,
                         dim: 2,
                         metric: DistanceMetric::L2,
+                        data_type: VectorType::Float32,
                     },
                 ),
             ],

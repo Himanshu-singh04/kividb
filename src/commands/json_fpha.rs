@@ -86,7 +86,7 @@ pub(super) fn apply(value: &mut Value, ty: FpType) -> Result<(), ()> {
 }
 
 /// Single precision to half precision, rounding to nearest, ties to even.
-fn f32_to_f16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exponent = ((bits >> 23) & 0xff) as i32;
@@ -126,7 +126,7 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     }
 }
 
-fn f16_bits_to_f32(half: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(half: u16) -> f32 {
     let sign = ((half & 0x8000) as u32) << 16;
     let exponent = (half & 0x7c00) as u32;
     let mantissa = (half & 0x03ff) as u32;
@@ -154,7 +154,7 @@ fn f16_bits_to_f32(half: u16) -> f32 {
 
 /// Single precision rounded to bfloat16 (nearest, ties to even), returned as
 /// the single-precision value those 16 bits stand for.
-fn f32_to_bf16(value: f32) -> f32 {
+pub(crate) fn f32_to_bf16(value: f32) -> f32 {
     let bits = value.to_bits();
     let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
     f32::from_bits(rounded & 0xffff_0000)

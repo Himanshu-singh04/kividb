@@ -13,7 +13,7 @@ use crate::types::KiviDBValue;
 use crate::vector::filter::{self, Filter, Params, TextMatch};
 use crate::vector::{
     DistanceMetric, FieldOptions, FieldType, IndexDef, IndexOn, IndexSchema, LiveIndex,
-    SchemaField, VectorAlgo,
+    SchemaField, VectorAlgo, VectorType,
 };
 
 use crate::vector::Fields;
@@ -52,6 +52,7 @@ fn parse_vector_spec(field: &str, cmd: &[&[u8]], i: &mut usize) -> Result<FieldT
 
     let mut dim: Option<usize> = None;
     let mut metric: Option<DistanceMetric> = None;
+    let mut data_type = VectorType::Float32;
     let mut m = 16usize;
     let mut ef_construction = 200usize;
     let mut ef_runtime = 10usize;
@@ -65,11 +66,12 @@ fn parse_vector_spec(field: &str, cmd: &[&[u8]], i: &mut usize) -> Result<FieldT
         };
         match key.as_str() {
             "TYPE" => {
-                if value != "FLOAT32" {
-                    return Err(format!(
-                        "VECTOR field `{field}`: only TYPE FLOAT32 is supported, got `{value}`"
-                    ));
-                }
+                data_type = VectorType::parse(&value).ok_or_else(|| {
+                    format!(
+                        "VECTOR field `{field}`: unknown TYPE `{value}` (use FLOAT32, FLOAT64, \
+                         FLOAT16 or BFLOAT16)"
+                    )
+                })?;
             }
             "DIM" => dim = Some(number()?),
             "DISTANCE_METRIC" => {
@@ -109,6 +111,7 @@ fn parse_vector_spec(field: &str, cmd: &[&[u8]], i: &mut usize) -> Result<FieldT
         algo,
         dim,
         metric: metric.unwrap_or(DistanceMetric::L2),
+        data_type,
     })
 }
 
@@ -199,7 +202,13 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
         resp_bulk_str("type"),
         resp_bulk_str(field.type_name()),
     ];
-    if let FieldType::Vector { algo, dim, metric } = &field.field_type {
+    if let FieldType::Vector {
+        algo,
+        dim,
+        metric,
+        data_type,
+    } = &field.field_type
+    {
         let pairs = [
             (
                 "algorithm",
@@ -208,7 +217,7 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
                     VectorAlgo::Hnsw { .. } => "HNSW".to_string(),
                 },
             ),
-            ("data_type", "FLOAT32".to_string()),
+            ("data_type", data_type.name().to_string()),
             ("dim", dim.to_string()),
             (
                 "distance_metric",
@@ -508,7 +517,12 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .iter()
                 .map(|f| {
                     let label = match &f.field_type {
-                        FieldType::Vector { algo, dim, metric } => {
+                        FieldType::Vector {
+                            algo,
+                            dim,
+                            metric,
+                            data_type,
+                        } => {
                             let algo = match algo {
                                 VectorAlgo::Flat => "FLAT".to_string(),
                                 VectorAlgo::Hnsw {
@@ -520,7 +534,11 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                                 DistanceMetric::Cosine => "COSINE",
                                 DistanceMetric::InnerProduct => "IP",
                             };
-                            format!("VECTOR {algo} DIM={dim} {metric}")
+                            // As it was for FLOAT32, which was all there was.
+                            match data_type {
+                                VectorType::Float32 => format!("VECTOR {algo} DIM={dim} {metric}"),
+                                ty => format!("VECTOR {algo} {} DIM={dim} {metric}", ty.name()),
+                            }
                         }
                         _ => f.type_name().to_string(),
                     };

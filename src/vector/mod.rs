@@ -61,6 +61,101 @@ pub enum VectorAlgo {
     },
 }
 
+/// The element type of a vector field's blobs, `TYPE` in `FT.CREATE`.
+///
+/// Only the blobs are in this type: a hash field's value and a query's
+/// vector parameter. The index holds every vector as `f32`, so a FLOAT64
+/// field costs what a FLOAT32 one does and FLOAT16 saves nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorType {
+    #[default]
+    Float32,
+    Float64,
+    Float16,
+    BFloat16,
+}
+
+impl VectorType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "FLOAT32" => Some(Self::Float32),
+            "FLOAT64" => Some(Self::Float64),
+            "FLOAT16" => Some(Self::Float16),
+            "BFLOAT16" => Some(Self::BFloat16),
+            _ => None,
+        }
+    }
+
+    /// As `FT.CREATE` and `FT.INFO` spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Float32 => "FLOAT32",
+            Self::Float64 => "FLOAT64",
+            Self::Float16 => "FLOAT16",
+            Self::BFloat16 => "BFLOAT16",
+        }
+    }
+
+    /// Bytes per element.
+    pub fn size(self) -> usize {
+        match self {
+            Self::Float32 => 4,
+            Self::Float64 => 8,
+            Self::Float16 | Self::BFloat16 => 2,
+        }
+    }
+
+    /// A blob of `dim` little-endian elements, as `f32`. `None` if it is not
+    /// `dim` elements long.
+    pub fn decode(self, blob: &[u8], dim: usize) -> Option<Vec<f32>> {
+        if blob.len() != dim * self.size() {
+            return None;
+        }
+        Some(match self {
+            Self::Float32 => blob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect(),
+            Self::Float64 => blob
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| f64::from_le_bytes(*b) as f32)
+                .collect(),
+            Self::Float16 => blob
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| crate::commands::json_fpha::f16_bits_to_f32(u16::from_le_bytes(*b)))
+                .collect(),
+            Self::BFloat16 => blob
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
+                .collect(),
+        })
+    }
+
+    /// One element as this type's little-endian bytes: a JSON document's
+    /// number array is turned into the blob a hash would hold.
+    pub fn encode(self, value: f64, out: &mut Vec<u8>) {
+        match self {
+            Self::Float32 => out.extend_from_slice(&(value as f32).to_le_bytes()),
+            Self::Float64 => out.extend_from_slice(&value.to_le_bytes()),
+            Self::Float16 => out.extend_from_slice(
+                &crate::commands::json_fpha::f32_to_f16_bits(value as f32).to_le_bytes(),
+            ),
+            Self::BFloat16 => {
+                let rounded = crate::commands::json_fpha::f32_to_bf16(value as f32);
+                out.extend_from_slice(&((rounded.to_bits() >> 16) as u16).to_le_bytes());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum FieldType {
     Text,
@@ -70,6 +165,7 @@ pub enum FieldType {
         algo: VectorAlgo,
         dim: usize,
         metric: DistanceMetric,
+        data_type: VectorType,
     },
 }
 
@@ -293,10 +389,16 @@ impl IndexDef {
                 a.push(alias.clone());
             }
             a.push(field.type_name().into());
-            if let FieldType::Vector { algo, dim, metric } = &field.field_type {
+            if let FieldType::Vector {
+                algo,
+                dim,
+                metric,
+                data_type,
+            } = &field.field_type
+            {
                 let mut attrs: Vec<String> = vec![
                     "TYPE".into(),
-                    "FLOAT32".into(),
+                    data_type.name().into(),
                     "DIM".into(),
                     dim.to_string(),
                     "DISTANCE_METRIC".into(),
@@ -802,13 +904,19 @@ pub fn backfill_from_db_progress(
     struct VecFieldWork {
         name: String,
         dim: usize,
+        data_type: VectorType,
         metric: DistanceMetric,
         live: LiveIndex,
     }
     let mut vec_work: Vec<VecFieldWork> = Vec::new();
     for vf in def.vector_fields() {
-        let (dim, metric) = match &vf.field_type {
-            FieldType::Vector { dim, metric, .. } => (*dim, metric.clone()),
+        let (dim, data_type, metric) = match &vf.field_type {
+            FieldType::Vector {
+                dim,
+                data_type,
+                metric,
+                ..
+            } => (*dim, *data_type, metric.clone()),
             _ => continue,
         };
         let live = match def.indexes.get(&vf.name) {
@@ -819,6 +927,7 @@ pub fn backfill_from_db_progress(
         vec_work.push(VecFieldWork {
             name: vf.name.clone(),
             dim,
+            data_type,
             metric,
             live,
         });
@@ -862,15 +971,9 @@ pub fn backfill_from_db_progress(
                     Some(b) => b.clone(),
                     None => continue,
                 };
-                if raw_bytes.len() != w.dim * 4 {
+                let Some(vec) = w.data_type.decode(&raw_bytes, w.dim) else {
                     continue;
-                }
-                let vec: Vec<f32> = raw_bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
+                };
                 match &w.live {
                     LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
                     LiveIndex::Hnsw(idx) => {
@@ -1379,16 +1482,18 @@ fn json_field_bytes(
             })?;
             Some(Arc::from(number.to_string().into_bytes()))
         }
-        FieldType::Vector { dim, .. } => {
+        // The blob a hash would hold, in the field's type, so that one
+        // decoder reads both.
+        FieldType::Vector { dim, data_type, .. } => {
             let Value::Array(items) = first.as_ref() else {
                 return None;
             };
             if items.len() != *dim {
                 return None;
             }
-            let mut bytes = Vec::with_capacity(dim * 4);
+            let mut bytes = Vec::with_capacity(dim * data_type.size());
             for item in items {
-                bytes.extend_from_slice(&(item.as_f64()? as f32).to_le_bytes());
+                data_type.encode(item.as_f64()?, &mut bytes);
             }
             Some(Arc::from(bytes))
         }
@@ -1574,23 +1679,22 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)]) {
         // a value in the incoming HSET fields; insert into that field's
         // LiveIndex. Fields without a value in this HSET are simply skipped.
         for f in &def.fields {
-            let (dim, metric) = match &f.field_type {
-                FieldType::Vector { dim, metric, .. } => (*dim, metric.clone()),
+            let (dim, data_type, metric) = match &f.field_type {
+                FieldType::Vector {
+                    dim,
+                    data_type,
+                    metric,
+                    ..
+                } => (*dim, *data_type, metric.clone()),
                 _ => continue,
             };
             let raw_bytes = match fields.iter().find(|(n, _)| n == &f.name) {
                 Some((_, b)) => b.clone(),
                 None => continue,
             };
-            if raw_bytes.len() != dim * 4 {
+            let Some(vec) = data_type.decode(&raw_bytes, dim) else {
                 continue;
-            }
-            let vec: Vec<f32> = raw_bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
+            };
             let live = match def.indexes.get(&f.name) {
                 Some(l) => l,
                 None => continue,
@@ -2400,7 +2504,7 @@ pub fn compact_hnsw(
     use std::sync::atomic::Ordering;
 
     // ── Step 1: snapshot the Arc<HnswIndex> for the named field ──────────
-    let (old_arc, metric, dim, prefixes, m, ef_construction) = {
+    let (old_arc, metric, dim, data_type, prefixes, m, ef_construction) = {
         let store = index_store.read();
         let def = match store.get(index_name) {
             Some(d) => d,
@@ -2431,8 +2535,13 @@ pub fn compact_hnsw(
             }
         };
 
-        let (dim, metric) = match &vf.field_type {
-            FieldType::Vector { dim, metric, .. } => (*dim, metric.clone()),
+        let (dim, data_type, metric) = match &vf.field_type {
+            FieldType::Vector {
+                dim,
+                data_type,
+                metric,
+                ..
+            } => (*dim, *data_type, metric.clone()),
             _ => {
                 old_arc
                     .compaction_in_progress
@@ -2444,7 +2553,15 @@ pub fn compact_hnsw(
         let m = old_arc.m;
         let ef_construction = old_arc.ef_construction;
         let prefixes = def.prefixes.clone();
-        (old_arc, metric, dim, prefixes, m, ef_construction)
+        (
+            old_arc,
+            metric,
+            dim,
+            data_type,
+            prefixes,
+            m,
+            ef_construction,
+        )
     };
 
     struct CompactionGuard<'a>(&'a HnswIndex);
@@ -2526,15 +2643,9 @@ pub fn compact_hnsw(
                     Some(b) => b,
                     None => continue,
                 };
-                if raw.len() != dim * 4 {
+                let Some(v) = data_type.decode(raw, dim) else {
                     continue;
-                }
-                let v: Vec<f32> = raw
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
+                };
                 hnsw_insert(&new_index, key.to_string(), v, &metric);
                 catchup += 1;
             }
@@ -2655,6 +2766,7 @@ mod flush_index_tests {
                     },
                     dim: 2,
                     metric: DistanceMetric::L2,
+                    data_type: VectorType::Float32,
                 },
                 options: FieldOptions::default(),
             }],
