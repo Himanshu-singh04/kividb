@@ -16,7 +16,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RedisStore` depends on this to keep namespaces apart: before, `get` and
   `delete` on a namespace could reach an item in a namespace under it. TEXT
   indexes are rebuilt from the data when the server starts, so no reindex is
-  needed after upgrading.
+  needed after upgrading. Fuzzy terms (`%…%`) and `FT.SPELLCHECK` read words
+  the same way, and a `$param` value is one word, not split at punctuation,
+  as in Redis.
 - **`MODULE LIST` names the built-in module families.** It lists `search`,
   `ReJSON`, `timeseries` and `vectorset` with the versions Redis 8.10
   reports and an empty path, as Redis lists its own built-in `vectorset`.

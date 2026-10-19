@@ -853,11 +853,25 @@ impl<'a> Parser<'a> {
         if raw.is_empty() {
             return Err(self.syntax_error_at(start));
         }
-        let raw = match raw.strip_prefix('$') {
-            Some(name) => self.param_text(name)?,
-            None => raw,
-        };
         let fields = self.text_fields(scope);
+        // A parameter's value is one word, taken as it is but for its
+        // escapes: `users.u_1` is not split at the dot, as in Redis.
+        if let Some(name) = raw.strip_prefix('$') {
+            let value = self.param_text(name)?;
+            let mut word = String::with_capacity(value.len());
+            let mut chars = value.chars();
+            while let Some(c) = chars.next() {
+                word.extend(if c == '\\' { chars.next() } else { Some(c) });
+            }
+            let word = word.to_lowercase();
+            if word.is_empty() || self.def.is_stopword(&word) {
+                return Ok(None);
+            }
+            return Ok(Some(Filter::Text {
+                fields,
+                term: TextMatch::Exact(word),
+            }));
+        }
 
         // %word% — one edit per pair of percent signs, up to three.
         let fuzz = raw.chars().take_while(|c| *c == '%').count();
@@ -866,9 +880,16 @@ impl<'a> Parser<'a> {
             if fuzz > 3 || inner.is_empty() || !raw.ends_with(&"%".repeat(fuzz)) {
                 return Err(self.syntax_error_at(start));
             }
+            // The word as the tokenizer has it, so that `%users\.u_1%` is
+            // compared with the word `users.u_1` a document holds.
+            let mut words = super::tokenize_for_vocab(inner);
+            let word = match (words.next(), words.next()) {
+                (Some(word), None) => word,
+                _ => inner.to_lowercase(),
+            };
             return Ok(Some(Filter::Text {
                 fields,
-                term: TextMatch::Fuzzy(inner.to_lowercase(), fuzz),
+                term: TextMatch::Fuzzy(word, fuzz),
             }));
         }
 
@@ -881,8 +902,7 @@ impl<'a> Parser<'a> {
                 .rev()
                 .take_while(|c| *c == '\\')
                 .count()
-                % 2
-                == 0;
+                .is_multiple_of(2);
         let core = &raw[usize::from(leading)..raw.len() - usize::from(trailing)];
         let mut tokens: Vec<String> = super::tokenize_for_vocab(core).collect();
         if leading || trailing {

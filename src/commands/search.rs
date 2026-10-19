@@ -1105,7 +1105,10 @@ fn highlight(value: &str, terms: &AHashSet<String>, open: &str, close: &str) -> 
     };
     let mut chars = value.chars();
     while let Some(c) = chars.next() {
-        // An escaped character belongs to the word, as the tokenizer has it.
+        // An escaped character belongs to the word, as the tokenizer has it,
+        // and the whole word is wrapped: `<b>users\.u_1</b>`. Redis 8.10
+        // wraps `<b>users\</b>.u_1`, which cuts the word; KiviDB differs on
+        // purpose here.
         if c == '\\' {
             word.push(c);
             if let Some(escaped) = chars.next() {

@@ -1033,3 +1033,106 @@ fn test_escaped_namespace_on_json_index_keeps_parent_and_child_apart() {
     );
     assert_eq!(search_keys(&mut c, "store", r"@prefix:org\.t1*"), both());
 }
+
+/// A fuzzy term reads escapes as any other word does: `%users\.u_ab13%` is
+/// one edit from the word `users.u_ab12`. Redis 8.10.2 matches it too.
+#[test]
+fn test_fuzzy_term_with_escape_matches_the_escaped_word() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "e:", "p");
+    c.cmds(&["HSET", "e:1", "p", r"users\.u_ab12"]);
+    thread::sleep(Duration::from_millis(50));
+
+    assert_eq!(
+        search_keys(&mut c, "idx", r"%users\.u_ab13%"),
+        Ok(vec!["e:1".to_string()])
+    );
+}
+
+/// HIGHLIGHT wraps an escaped word whole.
+#[test]
+fn test_highlight_wraps_an_escaped_word_whole() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "e:", "p");
+    c.cmds(&["HSET", "e:1", "p", r"in users\.u_ab12 now"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let r = c.cmds(&[
+        "FT.SEARCH",
+        "idx",
+        r"@p:users\.u_ab12",
+        "HIGHLIGHT",
+        "DIALECT",
+        "2",
+    ]);
+    let fields = r.as_array()[2].as_array();
+    assert_eq!(fields[1].as_str(), r"in <b>users\.u_ab12</b> now", "{r:?}");
+}
+
+/// A parameter's value is one word: escapes are read, punctuation does not
+/// split it. Redis 8.10.2 gives these results for the same data.
+#[test]
+fn test_param_value_is_one_word() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "e:", "p");
+    c.cmds(&["HSET", "e:1", "p", r"users\.u_ab12"]);
+    c.cmds(&["HSET", "e:2", "p", "users.plain"]);
+    thread::sleep(Duration::from_millis(50));
+
+    for (value, want) in [
+        (r"users\.u_ab12", vec!["e:1"]),
+        ("users.u_ab12", vec!["e:1"]),
+        ("users.plain", vec![]),
+        (r"users\.plain", vec![]),
+    ] {
+        let r = c.cmds(&[
+            "FT.SEARCH",
+            "idx",
+            "@p:$v",
+            "PARAMS",
+            "2",
+            "v",
+            value,
+            "NOCONTENT",
+            "DIALECT",
+            "2",
+        ]);
+        let keys: Vec<&str> = r.as_array()[1..].iter().map(|k| k.as_str()).collect();
+        assert_eq!(keys, want, "value {value}");
+    }
+}
+
+/// FT.SPELLCHECK reads the query's words as the index has them: a word with
+/// an escape or an underscore is spelled correctly when the index holds it.
+#[test]
+fn test_spellcheck_reads_words_as_the_index_does() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "e:", "p");
+    c.cmds(&["HSET", "e:1", "p", r"users\.u_ab12 hello world_x"]);
+    thread::sleep(Duration::from_millis(50));
+
+    for query in [r"users\.u_ab12", "world_x"] {
+        let r = c.cmds(&["FT.SPELLCHECK", "idx", query]);
+        assert!(r.as_array().is_empty(), "{query}: {r:?}");
+    }
+    let r = c.cmds(&["FT.SPELLCHECK", "idx", r"users\.u_ab13"]);
+    let term = r.as_array()[0].as_array();
+    assert_eq!(term[1].as_str(), "users.u_ab13", "{r:?}");
+    assert_eq!(
+        term[2].as_array()[0].as_array()[1].as_str(),
+        "users.u_ab12",
+        "{r:?}"
+    );
+}

@@ -442,7 +442,13 @@ pub fn tokenize_for_vocab(text: &str) -> impl Iterator<Item = String> + '_ {
                 break;
             }
         }
-        (!word.is_empty()).then(|| word.to_lowercase())
+        if word.is_ascii() {
+            // In place: no second allocation for the common case.
+            word.make_ascii_lowercase();
+        } else {
+            word = word.to_lowercase();
+        }
+        (!word.is_empty()).then_some(word)
     })
 }
 

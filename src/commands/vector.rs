@@ -1072,13 +1072,9 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let mut out: Vec<Vec<u8>> = Vec::new();
 
-    for token in query.split_whitespace() {
-        let token_clean: String = token
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect::<String>()
-            .to_lowercase();
-
+    // The query's words as the index has them, so that `world_x` and
+    // `users\.u_1` are the words the vocabulary holds.
+    for token_clean in crate::vector::tokenize_for_vocab(&query) {
         if token_clean.is_empty() || vocab.contains(&token_clean) {
             continue; // correctly spelled — skip
         }
