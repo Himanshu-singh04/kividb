@@ -1,5 +1,5 @@
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{delete_key_if_expired, is_expired, lazy_expire_key, parse_utf8};
+use crate::commands::helpers::{expire_on_read, is_expired, lazy_expire_on_read, parse_utf8};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
@@ -425,7 +425,7 @@ fn cmd_geodist(ctx: &mut Ctx) -> Vec<u8> {
     };
 
     if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
         return resp_null_bulk();
     }
 
@@ -493,7 +493,7 @@ fn cmd_geopos(ctx: &mut Ctx) -> Vec<u8> {
     };
 
     if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -548,7 +548,7 @@ fn cmd_geohash(ctx: &mut Ctx) -> Vec<u8> {
     };
 
     if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
         let nils = vec![resp_null_for(resp); cmd.len() - 2];
         return resp_array(nils);
     }
@@ -855,11 +855,11 @@ fn geo_search(ctx: &mut Ctx, form: Form, read_only: bool) -> Vec<u8> {
 
     // The set, if there is one. (Its members are looked at under its lock,
     // which the search takes for as long as it runs.)
-    lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
+    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, &key);
     let zset = {
         let shard = store::get_shard(&ctx.store[*ctx.selected_db], &key);
         let map = read_lock!(shard);
-        match map.get(key.as_str()) {
+        match map.get(key.as_str()).filter(|_| !gone) {
             Some(KiviDBValue::SortedSet(zset)) => Some(Arc::clone(zset)),
             Some(_) => {
                 return resp_error(

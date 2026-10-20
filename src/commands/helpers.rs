@@ -302,6 +302,34 @@ pub fn lazy_expire_key(store: &Store, expiry_store: &ExpiryStore, db: usize, key
     }
 }
 
+/// What a read does with a key it has found expired: deletes it, as
+/// [`delete_key_if_expired`] does, unless writes are paused
+/// ([`crate::pause::expiry_deferred`]). Then the key is left where it is, to
+/// be deleted, counted and announced once the pause is over, and the read
+/// takes it as gone all the same. Returns whether it is to be taken as gone.
+///
+/// For reads only. A write that goes on to work on the key needs it really
+/// gone, and writes are held while writes are paused, so they never meet a
+/// key left this way.
+#[inline]
+pub fn expire_on_read(store: &Store, expiry_store: &ExpiryStore, db: usize, key: &str) -> bool {
+    if crate::pause::expiry_deferred() {
+        return true;
+    }
+    delete_key_if_expired(store, expiry_store, db, key)
+}
+
+/// [`lazy_expire_key`] for a read: see [`expire_on_read`].
+#[inline]
+pub fn lazy_expire_on_read(
+    store: &Store,
+    expiry_store: &ExpiryStore,
+    db: usize,
+    key: &str,
+) -> bool {
+    is_expired(expiry_store, db, key) && expire_on_read(store, expiry_store, db, key)
+}
+
 /// Background sampler so keys — and hash fields — expire without a read
 /// (Redis `active_expire_cycle`). `pubsub` is where their expiry is announced.
 pub fn spawn_active_expire_task(
@@ -317,6 +345,11 @@ pub fn spawn_active_expire_task(
         let mut cursor = ExpireCursor::default();
         loop {
             std::thread::sleep(Duration::from_millis(100));
+            // Nothing expires while writes are paused, as in Redis: the keys
+            // and fields that come due meanwhile go once the pause is over.
+            if crate::pause::expiry_deferred() {
+                continue;
+            }
             active_expire_cycle(&store, &expiry_store, &index_store, &mut cursor);
             crate::field_expiry::sweep(&store, &expiry_store, &index_store);
         }

@@ -117,8 +117,12 @@ fn with_array_read<T>(
     missing: T,
     f: impl FnOnce(&ArrayInner) -> T,
 ) -> Result<T, Vec<u8>> {
-    if crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
-    {
+    if crate::commands::helpers::lazy_expire_on_read(
+        ctx.store,
+        ctx.expiry_store,
+        *ctx.selected_db,
+        key,
+    ) {
         return Ok(missing);
     }
     let db_ref = &ctx.store[*ctx.selected_db];

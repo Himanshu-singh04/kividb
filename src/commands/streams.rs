@@ -2,7 +2,7 @@
 
 use crate::commands::blocking::{self, ParkOutcome};
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{lazy_expire_key, parse_utf8};
+use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
 use crate::commands::stream_extra::{
     self, Approx, IdmpArg, ReadCaps, TrimRefs, TrimTo, claim_effect, setid_effect, trim_stream,
     trim_stream_approx,
@@ -612,13 +612,13 @@ pub fn xlen(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
     let map = read_lock!(shard);
 
-    match map.get(key) {
+    match map.get(key).filter(|_| !gone) {
         None => resp_integer(0),
         Some(KiviDBValue::Stream(s)) => resp_integer(s.read().entries.len() as i64),
         Some(_) => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),

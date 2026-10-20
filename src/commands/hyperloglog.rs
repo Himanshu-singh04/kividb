@@ -1,5 +1,5 @@
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{delete_key_if_expired, is_expired, parse_utf8};
+use crate::commands::helpers::{delete_key_if_expired, expire_on_read, is_expired, parse_utf8};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
@@ -335,7 +335,7 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         };
 
         if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
             return resp_integer(0);
         }
 
@@ -364,7 +364,7 @@ fn cmd_pfcount(ctx: &mut Ctx) -> Vec<u8> {
         };
 
         if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
             continue;
         }
 

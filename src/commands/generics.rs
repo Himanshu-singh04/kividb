@@ -2,10 +2,10 @@ use crate::commands::ctx::Ctx;
 use crate::commands::helpers::{
     ERR_INVALID_EXPIRE_PEXPIRE_CMD, ERR_INVALID_EXPIRE_PEXPIREAT_CMD, ERR_VALUE_NOT_INTEGER,
     absolute_when_ms_from_pexpire_ms, delete_key, delete_key_if_expired,
-    expire_modifier_allows_set, expiry_at_after, expiry_unix_millis, expiry_unix_secs,
-    get_expiry_shard, glob_match, is_expired, lazy_expire_key, parse_bytes_as_i128,
-    parse_expire_modifier_flags, parse_utf8, set_expiry, system_time_from_unix_millis_i128,
-    ttl_remaining_secs_ceil,
+    expire_modifier_allows_set, expire_on_read, expiry_at_after, expiry_unix_millis,
+    expiry_unix_secs, get_expiry_shard, glob_match, is_expired, lazy_expire_on_read,
+    parse_bytes_as_i128, parse_expire_modifier_flags, parse_utf8, set_expiry,
+    system_time_from_unix_millis_i128, ttl_remaining_secs_ceil,
 };
 use crate::keyspace_events::{KS_GENERIC, notify};
 use crate::resp::write::*;
@@ -183,7 +183,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Falling out of the loop with shard_idx == num_shards means
             // every shard was gone through: next_cursor stays 0 (done).
 
-            keys.retain(|k| !lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, k));
+            keys.retain(|k| !lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, k));
             if let Some(ref pat) = options.pattern {
                 keys.retain(|k| glob_match(pat, k));
             }
@@ -219,7 +219,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let mut matching: Vec<String> = Vec::new();
             for key in candidates {
-                if lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, &key) {
+                if lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, &key) {
                     continue;
                 }
                 if glob_match(pattern, &key) {
@@ -258,9 +258,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => return Some(resp_error("ERR key must be valid UTF-8")),
                     };
                     let db = *ctx.selected_db;
-                    lazy_expire_key(ctx.store, ctx.expiry_store, db, key);
+                    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, db, key);
                     let map = read_lock!(store::get_shard(&ctx.store[db], key));
-                    Some(match map.get(key) {
+                    Some(match map.get(key).filter(|_| !gone) {
                         Some(value) => resp_bulk_str(encoding_of(value)),
                         None => resp_null_bulk(),
                     })
@@ -280,10 +280,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => return Some(resp_error("ERR key must be valid UTF-8")),
                     };
                     let db = *ctx.selected_db;
-                    if is_expired(ctx.expiry_store, db, key) {
-                        delete_key_if_expired(ctx.store, ctx.expiry_store, db, key);
-                    }
-                    if !read_lock!(store::get_shard(&ctx.store[db], key)).contains_key(key) {
+                    let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, db, key);
+                    if gone || !read_lock!(store::get_shard(&ctx.store[db], key)).contains_key(key) {
                         return Some(resp_null_bulk());
                     }
                     let lfu = crate::eviction::policy().is_lfu();
@@ -348,7 +346,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         None => return Some(resp_error("ERR key must be valid UTF-8")),
                     };
                     if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                         return Some(resp_null_bulk());
                     }
                     let db = &ctx.store[*ctx.selected_db];
@@ -376,7 +374,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 
@@ -435,7 +433,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Expired keys are invisible — report as "none"
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_simple("none"));
             }
 
@@ -677,7 +675,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 
@@ -1080,6 +1078,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // picked.
             let db = *ctx.selected_db;
             let shards = ctx.store[db].len();
+            let mut expired = None;
             for _ in 0..64 {
                 let start = rand::random::<usize>() % shards.max(1);
                 let picked = (0..shards).find_map(|step| {
@@ -1091,11 +1090,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
                 match picked {
                     None => break,
-                    Some(key) if lazy_expire_key(ctx.store, ctx.expiry_store, db, &key) => continue,
+                    Some(key) if lazy_expire_on_read(ctx.store, ctx.expiry_store, db, &key) => {
+                        expired = Some(key);
+                    }
                     Some(key) => return Some(resp_bulk_str(&key)),
                 }
             }
-            Some(resp_null_bulk())
+            // While writes are paused an expired key is not removed, so
+            // every pick could land on one again: as in Redis, the answer is
+            // then one of them, not nil.
+            match expired {
+                Some(key) if crate::pause::expiry_deferred() => Some(resp_bulk_str(&key)),
+                _ => Some(resp_null_bulk()),
+            }
         }
 
         "TOUCH" => {
@@ -1116,7 +1123,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     None => continue,
                 };
                 if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                    delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                     continue;
                 }
                 let shard = store::get_shard(db, key);
@@ -1142,7 +1149,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR key must be valid UTF-8")),
             };
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -1271,7 +1278,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 // SORT on missing key returns empty array, or 0 if STORE
                 return Some(resp_array(vec![]));
             }
@@ -1638,7 +1645,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             // Lazy-evict expired keys, same as TTL/PTTL do.
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 
@@ -1673,7 +1680,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             };
 
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_integer(-2));
             }
 

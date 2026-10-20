@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Nothing expires while writes are paused**, as in Redis (#22). During
+  `CLIENT PAUSE` (`WRITE` or `ALL`), a slot handoff or a manual failover, a
+  key whose time has passed stays where it is: a read takes it as gone, but
+  it is deleted, counted in `expired_keys` and announced (`expired`) only
+  once the pause is over. The background sweeps wait too, so hash fields'
+  `hexpired` events and `expired_subkeys` also come after the pause. Before,
+  reads and the sweeps deleted keys during the pause. Expiries are not replicated (every node expires keys on its own
+  clock), so replication and failover were not affected. `RANDOMKEY` during a
+  pause answers with an expired key, as Redis does, instead of nil.
+- **`expired_keys` in `INFO` is exact.** It was counted per thread in batches
+  of up to 128, so after a few expiries it could still read 0.
+
 ### Security
 
 - **The Docker image is distroless.** Its runtime base is
