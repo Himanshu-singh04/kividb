@@ -1464,9 +1464,9 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         if abs_ms > unix_now_ms {
                             let delta = std::time::Duration::from_millis(abs_ms - unix_now_ms);
                             exps.insert(field, now_mono + delta);
+                        } else {
+                            crate::types::hash_remove(&mut hmap, &field);
                         }
-                        // else: already expired — drop the entry and let
-                        //       the value sit until next access.
                     }
                     let inner = crate::types::HashInner {
                         fields: hmap,
@@ -1504,7 +1504,11 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             };
 
             keys_read += 1;
-            if keep {
+            let has_value = match &value {
+                KiviDBValue::HashEx(hash) => !hash.read().is_empty(),
+                _ => true,
+            };
+            if keep && has_value {
                 map.insert(key, value);
             }
         }
