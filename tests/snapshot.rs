@@ -1533,8 +1533,8 @@ fn kdb_hashex_with_field_ttls() {
 
 #[test]
 fn kdb_hashex_already_expired_ttl_is_dropped_on_load() {
-    // A persisted expiry whose absolute time is in the past should not
-    // re-materialize as a future Instant. The loader drops it.
+    // A field that expired while the snapshot was at rest must not come back
+    // without an expiry and become permanent.
     use kividb::types::HashInner;
 
     let mut inner = HashInner::new();
@@ -1548,17 +1548,13 @@ fn kdb_hashex_already_expired_ttl_is_dropped_on_load() {
         std::time::Instant::now() - std::time::Duration::from_secs(10),
     );
 
-    let v = roundtrip_one("hxgone", KiviDBValue::HashEx(Arc::new(RwLock::new(inner))));
-    match v {
-        KiviDBValue::HashEx(h) => {
-            let read = h.read();
-            // Field's value is still there (lazy eviction), but its expiry
-            // entry should be gone after reload.
-            assert_eq!(read.fields.len(), 1);
-            assert_eq!(read.expiries.len(), 0);
-        }
-        _ => panic!("wrong variant after round-trip"),
-    }
+    let mut map = HashMap::new();
+    map.insert(
+        "hxgone".to_string(),
+        KiviDBValue::HashEx(Arc::new(RwLock::new(inner))),
+    );
+    let db0 = roundtrip_kdb(vec![map]);
+    assert!(!db0.contains_key("hxgone"));
 }
 
 // A dump.rdb written by Redis 7.4 (RDB 12) and by Redis 8.10 (RDB 15), by

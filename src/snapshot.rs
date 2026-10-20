@@ -1464,9 +1464,9 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
                         if abs_ms > unix_now_ms {
                             let delta = std::time::Duration::from_millis(abs_ms - unix_now_ms);
                             exps.insert(field, now_mono + delta);
+                        } else {
+                            crate::types::hash_remove(&mut hmap, &field);
                         }
-                        // else: already expired — drop the entry and let
-                        //       the value sit until next access.
                     }
                     let inner = crate::types::HashInner {
                         fields: hmap,
@@ -1504,7 +1504,11 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             };
 
             keys_read += 1;
-            if keep {
+            let has_value = match &value {
+                KiviDBValue::HashEx(hash) => !hash.read().is_empty(),
+                _ => true,
+            };
+            if keep && has_value {
                 map.insert(key, value);
             }
         }
@@ -4213,6 +4217,29 @@ mod expiry_section_tests {
         )])];
         let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
         assert!(loaded.expiries[0].is_empty());
+    }
+
+    #[test]
+    fn an_expired_hash_drops_its_key_expiry() {
+        let mut hash = crate::types::HashInner::new();
+        hash.fields
+            .insert("field".to_string(), Arc::from(&b"value"[..]));
+        hash.expiries.insert(
+            "field".to_string(),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let db0 = HashMap::from([(
+            "hxgone".to_string(),
+            KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash))),
+        )]);
+        let exp = vec![HashMap::from([(
+            "hxgone".to_string(),
+            unix_ms_now() + 60_000,
+        )])];
+
+        let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
+        assert!(!loaded.dbs[0].contains_key("hxgone"));
+        assert!(!loaded.expiries[0].contains_key("hxgone"));
     }
 
     /// An image with no expiry section — everything written before this
