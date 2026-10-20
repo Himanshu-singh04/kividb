@@ -5490,27 +5490,36 @@ fn test_vector_type_float64_on_json() {
     assert_eq!(parse_score(&arr[2].as_array()[1]), 0.25);
 }
 
-/// A type Redis does not know is refused at FT.CREATE.
+/// A type Redis does not know is refused at FT.CREATE, with the reply Redis
+/// 8.2.10 gives (Redis 8.10 puts `SEARCH_PARSE_ARGS` in front of it).
 #[test]
 fn test_vector_type_unknown_is_refused() {
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let r = c.cmds(&[
-        "FT.CREATE",
-        "x",
-        "SCHEMA",
-        "v",
-        "VECTOR",
-        "FLAT",
-        "6",
-        "TYPE",
-        "FLOAT8",
-        "DIM",
-        "2",
-        "DISTANCE_METRIC",
-        "L2",
-    ]);
-    assert!(r.is_error(), "{r:?}");
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("x_{algo}");
+        let r = c.cmds(&[
+            "FT.CREATE",
+            &index,
+            "SCHEMA",
+            "v",
+            "VECTOR",
+            algo,
+            "6",
+            "TYPE",
+            "FLOAT8",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+        ]);
+        let want =
+            format!("Bad arguments for vector similarity {algo} index `TYPE`: Unknown argument");
+        assert!(
+            matches!(&r, RespValue::Error(e) if *e == want),
+            "{algo}: {r:?}"
+        );
+    }
 }

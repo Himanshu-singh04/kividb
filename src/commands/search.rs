@@ -65,11 +65,12 @@ fn parse_vector_spec(field: &str, cmd: &[&[u8]], i: &mut usize) -> Result<FieldT
             })
         };
         match key.as_str() {
+            // Redis 8.2's reply; 8.10 puts `SEARCH_PARSE_ARGS` in front of it.
             "TYPE" => {
                 data_type = VectorType::parse(&value).ok_or_else(|| {
                     format!(
-                        "VECTOR field `{field}`: unknown TYPE `{value}` (use FLOAT32, FLOAT64, \
-                         FLOAT16 or BFLOAT16)"
+                        "Bad arguments for vector similarity {algo_name} index `TYPE`: Unknown \
+                         argument"
                     )
                 })?;
             }

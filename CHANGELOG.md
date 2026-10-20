@@ -33,11 +33,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **VECTOR fields take `TYPE FLOAT64`, `FLOAT16` and `BFLOAT16`.** Only
   FLOAT32 was accepted. Hash blobs and query vectors are read in the field's
-  type, as in Redis, and `FT.INFO` reports it as `data_type`. The index still
-  holds `f32`, so the smaller types save no memory. A snapshot records the
-  type in a new section after all the others. An older release that loads
-  such a snapshot reads the field as FLOAT32: it refuses the field's query
-  vectors and does not index new or rebuilt documents.
+  type, as in Redis, and `FT.INFO` reports it as `data_type`. An unknown
+  type gets Redis 8.2's reply, ``Bad arguments for vector similarity FLAT
+  index `TYPE`: Unknown argument``. The index still holds `f32`, so the
+  smaller types save no memory. A snapshot records the type in a new section
+  after all the others. An older release that loads such a snapshot reads the
+  field as FLOAT32: it refuses the field's query vectors and does not index
+  new or rebuilt documents.
 
 ## [1.1.0]
 
