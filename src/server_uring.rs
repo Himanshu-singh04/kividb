@@ -1690,6 +1690,8 @@ pub async fn handle_client(
                                 .map(|info| info.name.clone())
                                 .unwrap_or_default();
 
+                            // A plain FLUSHALL here is not counted as lazily freed.
+                            let _queued = crate::lazyfree::running_queued();
                             for queued_cmd in queued {
                                 // SUBSCRIBE and its kind, queued: see the tokio loop (#23).
                                 if queued_cmd.first().is_some_and(|name| {

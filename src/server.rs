@@ -1464,6 +1464,8 @@ where
                                 .map(|info| info.name.clone())
                                 .unwrap_or_default();
 
+                            // A plain FLUSHALL here is not counted as lazily freed.
+                            let _queued = crate::lazyfree::running_queued();
                             for queued_cmd in queued {
                                 // SUBSCRIBE and its kind, queued: run as they run
                                 // outside a transaction, their reply this command's
