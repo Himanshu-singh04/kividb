@@ -1,4 +1,6 @@
 /target
+# Where nfpm writes the .deb and .rpm during a local build.
+/dist
 *.rdb
 *.aof
 *.log
@@ -7,7 +9,9 @@
 *.kdb
 *.pyc
 nodes.conf
-kividb.conf
+# The config a server run from the repository root writes. Anchored so that
+# packaging/kividb.conf, the default config the package installs, is not ignored.
+/kividb.conf
 cert.pem
 key.pem
 tests/e2e/benchmarks/results/

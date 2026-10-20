@@ -1,0 +1,42 @@
+[Unit]
+Description=KiviDB in-memory database
+Documentation=https://github.com/kividbio/kividb
+After=network.target
+
+[Service]
+Type=simple
+User=kividb
+Group=kividb
+
+# With no flags the server reads /etc/kividb/kividb.conf when it exists.
+ExecStart=/usr/bin/kividb
+
+# dump.kdb, appendonly.aof, backups and nodes.conf land here, so the process
+# never writes into whatever directory systemd started it in.
+WorkingDirectory=/var/lib/kividb
+StateDirectory=kividb
+StateDirectoryMode=0750
+
+Restart=on-failure
+RestartSec=2s
+# The AOF is flushed on shutdown; give it time rather than a SIGKILL.
+TimeoutStopSec=30s
+# One descriptor per client, plus the listeners, the AOF and the snapshot file.
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+# CONFIG REWRITE writes the file it read, and ProtectSystem=strict makes /etc
+# read-only. This is the only place the hardening is loosened on purpose.
+ReadWritePaths=/etc/kividb
+
+[Install]
+WantedBy=multi-user.target

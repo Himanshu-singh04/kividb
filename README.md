@@ -207,6 +207,22 @@ To accept clients from other machines, do one of these:
 If you turn it off or bind to a public address, make sure the server cannot be reached from
 the internet without a password.
 
+### Linux packages
+
+The release page has `.deb` and `.rpm` packages for `amd64` and `arm64`. They
+install the binary, a systemd unit, a `kividb` system user, and a default
+`/etc/kividb/kividb.conf` that listens on loopback only. Installing enables and
+starts the unit, and an upgrade restarts it:
+
+```bash
+sudo apt install ./kividb_amd64.deb     # or: sudo rpm -i kividb.x86_64.rpm
+redis-cli -p 6380 PING
+```
+
+Data (the snapshot, the AOF, `nodes.conf`) lives in `/var/lib/kividb`, and logs
+go to the journal: `journalctl -u kividb`. To accept clients from other
+machines, set a password and change `bind` in `/etc/kividb/kividb.conf`.
+
 ### Docker
 
 Images are published to Docker Hub and the GitHub Container Registry, with
