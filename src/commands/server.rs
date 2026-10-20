@@ -162,6 +162,8 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
     ]
 }
 
+const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent value";
+
 /// `CONFIG SET` of one setting.
 fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
     let param = param.to_string();
@@ -562,6 +564,55 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
             },
+            // Remembered, as below, but only a value Redis would take: a
+            // `CONFIG SET` with several settings is refused whole for one
+            // bad value (#24).
+            // Listen there instead (`listen`): refused, with nothing
+            // changed, if the port cannot be had.
+            "port" => match value.parse::<u16>() {
+                Ok(port) if port > 0 => match crate::listen::move_to(ctx.config.port, port) {
+                    Ok(()) => Some(resp_simple("OK")),
+                    Err(e) => Some(resp_error(&format!(
+                        "ERR Unable to listen on this port: {e}"
+                    ))),
+                },
+                // Redis takes 0, for no TCP at all, with a Unix socket to be
+                // reached on; there is none here.
+                _ => Some(resp_error(
+                    "ERR argument must be between 1 and 65535 inclusive",
+                )),
+            },
+            "maxmemory-clients" => {
+                let value = match value.strip_suffix('%') {
+                    Some(percent) => match percent.parse::<u64>() {
+                        Ok(n) if n <= 100 => value.to_string(),
+                        Ok(_) => {
+                            return Some(resp_error(
+                                "ERR percentage argument must be less or equal to 100",
+                            ));
+                        }
+                        Err(_) => return Some(resp_error(NOT_MEMORY_OR_PERCENT)),
+                    },
+                    None => match memory_size(value) {
+                        Some(bytes) => bytes.to_string(),
+                        None => return Some(resp_error(NOT_MEMORY_OR_PERCENT)),
+                    },
+                };
+                REMEMBERED_CONFIG.lock().insert(param.clone(), value);
+                Some(resp_simple("OK"))
+            }
+            "client-query-buffer-limit" => match memory_size(value) {
+                Some(bytes) if (1 << 20..=i64::MAX as usize).contains(&bytes) => {
+                    REMEMBERED_CONFIG
+                        .lock()
+                        .insert(param.clone(), bytes.to_string());
+                    Some(resp_simple("OK"))
+                }
+                Some(_) => Some(resp_error(
+                    "ERR argument must be between 1048576 and 9223372036854775807 inclusive",
+                )),
+                None => Some(resp_error("ERR argument must be a memory value")),
+            },
             // What a running Redis cannot be told either.
             "daemonize" | "databases" | "pidfile" | "logfile" | "log-format" | "unixsocket"
             | "supervised" | "io-threads" | "tcp-backlog" | "set-proc-title" | "appendfilename"
@@ -669,7 +720,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
     let lua_time_limit = "5000".to_string();
     let in_effect: Vec<(&str, String)> = vec![
         ("bind", ctx.config.bind.clone()),
-        ("port", ctx.config.port.to_string()),
+        (
+            "port",
+            crate::listen::current_port(ctx.config.port).to_string(),
+        ),
         ("logfile", ctx.config.logfile.clone()),
         ("log-format", ctx.config.log_format.clone()),
         ("databases", ctx.config.databases.to_string()),
@@ -965,6 +1019,23 @@ fn client_filter(
         }
     }
     Ok(filter)
+}
+
+/// `FLUSHALL ASYNC` / `FLUSHDB ASYNC`: the values are freed in the
+/// background (`lazyfree`), after the reply.
+fn flush_is_async(cmd: &[&[u8]]) -> bool {
+    cmd.get(1)
+        .is_some_and(|arg| arg.eq_ignore_ascii_case(b"ASYNC"))
+}
+
+/// A plain `FLUSHALL` or `FLUSHDB` is, in Redis, an `ASYNC` flush the
+/// client waits for, and its keys count as lazily freed; not in a
+/// transaction or a script, where nothing can wait. The keys were freed here
+/// and the client did wait: the count is the same.
+fn count_flushed_in_place(flushed: &crate::store::Flushed) {
+    if crate::lazyfree::flush_counts() {
+        crate::lazyfree::record_freed(flushed.keys as u64);
+    }
 }
 
 /// One row per connected replica — `(ip, port, offset, lag_seconds)` — in
@@ -2573,8 +2644,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "FLUSHDB" => {
             let db = *ctx.selected_db;
             touch_watched_keys(ctx, Some(db));
-            let mut flushed = crate::store::clear_db(&ctx.store[db]);
-            flushed += crate::store::clear_expiry_db(&ctx.expiry_store[db]);
+            let flushed = if flush_is_async(cmd) {
+                let (values, flushed) = crate::store::take_db(&ctx.store[db]);
+                crate::lazyfree::free_later(values, flushed.keys as u64);
+                crate::store::clear_expiry_db(&ctx.expiry_store[db]);
+                // Nothing to give back to the OS yet: the values are freed
+                // in the background.
+                crate::store::Flushed::default()
+            } else {
+                let mut flushed = crate::store::clear_db(&ctx.store[db]);
+                flushed += crate::store::clear_expiry_db(&ctx.expiry_store[db]);
+                count_flushed_in_place(&flushed);
+                flushed
+            };
             let indexes = crate::vector::drop_indexes_for_db(ctx.index_store, db);
 
             // Locks are all released by now — malloc_trim walks every arena and
@@ -2632,7 +2714,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 ));
-                out.push_str(&format!("tcp_port:{}\r\n", ctx.config.port));
+                out.push_str(&format!(
+                    "tcp_port:{}\r\n",
+                    crate::listen::current_port(ctx.config.port)
+                ));
                 out.push_str(&format!("process_id:{}\r\n", std::process::id()));
                 out.push_str(&format!("run_id:{}\r\n", crate::stats::RUN_ID.as_str()));
                 let uptime = ctx.started_at.elapsed().as_secs();
@@ -3014,6 +3099,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str(&format!("used_memory_dataset_perc:{dataset_perc:.2}%\r\n"));
                 // Redis scripting tests read this via `[s used_memory_lua]` (unit/scripting.tcl).
                 out.push_str("used_memory_lua:0\r\n");
+                // The VM functions are loaded into (EVAL scripts that run
+                // alone share it).
+                #[cfg(feature = "lua")]
+                out.push_str(&format!(
+                    "used_memory_vm_functions:{}\r\n",
+                    crate::commands::lua::functions_vm_bytes()
+                ));
+                #[cfg(not(feature = "lua"))]
+                out.push_str("used_memory_vm_functions:0\r\n");
                 #[cfg(feature = "lua")]
                 out.push_str(&format!(
                     "number_of_cached_scripts:{}\r\n",
@@ -3041,7 +3135,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 out.push_str("mem_clients_normal:0\r\n");
                 out.push_str("mem_aof_buffer:0\r\n");
                 out.push_str("active_defrag_running:0\r\n");
-                out.push_str("lazyfree_pending_objects:0\r\n");
+                out.push_str(&format!(
+                    "lazyfree_pending_objects:{}\r\n",
+                    crate::lazyfree::pending_objects()
+                ));
+                out.push_str(&format!(
+                    "lazyfreed_objects:{}\r\n",
+                    crate::lazyfree::freed_objects()
+                ));
                 out.push_str("\r\n");
             }
 
@@ -3255,7 +3356,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             "ERR wrong number of arguments for 'config|set' command",
                         ));
                     }
-                    let settings: Vec<(String, String)> = cmd[2..]
+                    let mut settings: Vec<(String, String)> = cmd[2..]
                         .chunks(2)
                         .map(|pair| {
                             (
@@ -3264,6 +3365,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             )
                         })
                         .collect();
+                    // The port last: moving it is what can fail after the
+                    // values are found good (the port is taken), and it is
+                    // not to be moved back, so it is moved only once the
+                    // others are set.
+                    settings.sort_by_key(|(name, _)| name == "port");
                     if let Some((_, (twice, _))) = settings
                         .iter()
                         .enumerate()
@@ -3319,6 +3425,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::TOTAL_NET_OUTPUT_BYTES.store(0, Ordering::Relaxed);
                     crate::stats::EXPIRED_KEYS.store(0, Ordering::Relaxed);
                     crate::stats::EXPIRED_SUBKEYS.store(0, Ordering::Relaxed);
+                    crate::lazyfree::reset_freed();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
                     crate::stats::reset_rdb_changes();
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);
@@ -3572,7 +3679,24 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
         "FLUSHALL" => {
             touch_watched_keys(ctx, None);
-            let flushed = crate::store::clear_store(ctx.store, ctx.expiry_store);
+            let flushed = if flush_is_async(cmd) {
+                let mut values = Vec::with_capacity(ctx.store.len());
+                let mut keys = 0;
+                for db in ctx.store.iter() {
+                    let (taken, flushed) = crate::store::take_db(db);
+                    values.push(taken);
+                    keys += flushed.keys;
+                }
+                crate::lazyfree::free_later(values, keys as u64);
+                for db in ctx.expiry_store.iter() {
+                    crate::store::clear_expiry_db(db);
+                }
+                crate::store::Flushed::default()
+            } else {
+                let flushed = crate::store::clear_store(ctx.store, ctx.expiry_store);
+                count_flushed_in_place(&flushed);
+                flushed
+            };
             let indexes = crate::vector::drop_all_indexes(ctx.index_store);
             crate::vector::drop_all_dicts(ctx.dict_store);
             crate::store::clear_ts_label_index(ctx.ts_index);
