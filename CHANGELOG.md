@@ -7,6 +7,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Data from Redis loads: `RESTORE` of a Redis payload, `MIGRATE` from a
+  Redis server, a Redis `dump.rdb`, and a full sync from a Redis primary**
+  (#39). `RESTORE` refused every payload Redis produces, whatever the type,
+  with `ERR DUMP payload version or checksum are wrong`: KiviDB's CRC64 is
+  not Redis's (its polynomial is written the wrong way round for the
+  reflected loop), so no Redis checksum ever matched. And the RDB reader,
+  which loads a `dump.rdb` at startup and a Redis primary's full sync, read
+  most compact encodings under the wrong RDB type numbers, read a list
+  node's container after its bytes instead of before, and misread listpack
+  short strings (`"a"` came back as `353`), so a file from Redis 6 or later
+  holding lists, small hashes, small sets or small sorted sets did not load,
+  or loaded wrong. Strings, lists, sets, sorted sets and hashes now load from
+  Redis 6.2 to 8.10, in every encoding those versions write, checked against
+  payloads and `dump.rdb` files captured from real servers; `MIGRATE` from
+  Redis 8.10 moves them, TTLs included. KiviDB's own `DUMP` payloads keep
+  their checksum, so payloads from earlier releases still restore. Streams,
+  hashes with per-field TTLs and module types (JSON, time series) are not
+  read yet and are refused as before.
+
 ### Security
 
 - **The Docker image is distroless.** Its runtime base is
