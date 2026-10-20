@@ -404,8 +404,10 @@ Full hybrid query example:
 
 | Algorithm | Option | Description |
 |-----------|--------|-------------|
-| `FLAT` | `TYPE FLOAT32 DIM n DISTANCE_METRIC L2\|COSINE\|IP` | Brute-force exact search; O(n) per query; best for < 50k vectors |
-| `HNSW` | `TYPE FLOAT32 DIM n DISTANCE_METRIC L2\|COSINE\|IP M n EF_CONSTRUCTION n` | Approximate graph-based search; O(log n) per query; best for > 50k vectors |
+| `FLAT` | `TYPE FLOAT32\|FLOAT64\|FLOAT16\|BFLOAT16 DIM n DISTANCE_METRIC L2\|COSINE\|IP` | Brute-force exact search; O(n) per query; best for < 50k vectors |
+| `HNSW` | `TYPE FLOAT32\|FLOAT64\|FLOAT16\|BFLOAT16 DIM n DISTANCE_METRIC L2\|COSINE\|IP M n EF_CONSTRUCTION n` | Approximate graph-based search; O(log n) per query; best for > 50k vectors |
+
+`TYPE` is the element type of the field's blobs: a hash holds `DIM` little-endian elements of it, and so does a query's vector parameter, as in Redis. A JSON document holds a number array whatever the type. The index keeps every vector as 32-bit floats, so a FLOAT16 or BFLOAT16 field takes as much memory as a FLOAT32 one. `INT8` and `UINT8` (Redis 8.2) are not supported.
 
 HNSW indexes auto-compact when tombstone ratio exceeds 20% (and tombstone count exceeds 64). Compaction runs in a background thread using a shadow-index pattern — readers and writers see no pause. Manual triggers via `FT.DEBUG COMPACT index field` are also supported.
 
@@ -847,7 +849,7 @@ Shard channel message (SSUBSCRIBE / SPUBLISH):
 | `CLIENT KILL` | `CLIENT KILL ip:port \| CLIENT KILL [ID id] [TYPE type] [USER username] [ADDR ip:port] [LADDR ip:port] [SKIPME yes\|no] [MAXAGE seconds]` | Close the matching connections. The old form (`ip:port`) replies `OK` or `ERR No such client`; the filter form replies with the number killed. `SKIPME` defaults to `yes`; with `no` the caller is killed too, after it has been sent the reply. Killed connections get no reply |
 | `CLIENT NO-EVICT` | `CLIENT NO-EVICT ON\|OFF` | Mark or unmark the connection as non-evictable |
 | `CLIENT NO-TOUCH` | `CLIENT NO-TOUCH ON\|OFF` | Accepted; has no effect — key access times are recorded only while an LRU/LFU `maxmemory-policy` is selected, and not per client |
-| `CLIENT PAUSE` | `CLIENT PAUSE timeout [WRITE \| ALL]` | Pause clients for `timeout` milliseconds, until it expires or `CLIENT UNPAUSE`. `ALL` (the default) holds every command but `CLIENT UNPAUSE`; `WRITE` holds anything that may write — writes, `PFCOUNT`, `PUBLISH`, scripts not declared `no-writes`, and an `EXEC` containing any of them. A pause given during another keeps the more restrictive of the two |
+| `CLIENT PAUSE` | `CLIENT PAUSE timeout [WRITE \| ALL]` | Pause clients for `timeout` milliseconds, until it expires or `CLIENT UNPAUSE`. `ALL` (the default) holds every command but `CLIENT UNPAUSE`; `WRITE` holds anything that may write — writes, `PFCOUNT`, `PUBLISH`, scripts not declared `no-writes`, and an `EXEC` containing any of them. A pause given during another keeps the more restrictive of the two. While writes are paused nothing expires, as in Redis: a read takes a key whose time has passed as gone, but it is deleted, counted in `expired_keys` and announced only once the pause is over, and `RANDOMKEY` may name it rather than answer nil. The same holds during a slot handoff and a manual failover |
 | `CLIENT UNPAUSE` | `CLIENT UNPAUSE` | Release all connections blocked by `CLIENT PAUSE` immediately |
 | `CLIENT CACHING` | `CLIENT CACHING yes\|no` | `yes` is accepted only in `OPTIN` mode and `no` only in `OPTOUT` mode, with Redis's errors otherwise. Set a single-shot opt-in or opt-out flag for the next data read command. In OPTIN mode: `yes` registers the next read for invalidation tracking. In OPTOUT mode: `no` suppresses registration for the next read. The flag is consumed by exactly one data command then cleared. Has no effect outside OPTIN/OPTOUT mode |
 | `CLIENT TRACKING` | `CLIENT TRACKING ON\|OFF [REDIRECT client-id] [BCAST] [PREFIX prefix [...]] [OPTIN] [OPTOUT] [NOLOOP]` | Enable or disable client-side cache invalidation. Invalidations reach a RESP3 connection as push messages; a RESP2 connection has to `REDIRECT` them to a connection subscribed to `__redis__:invalidate`, and without `REDIRECT` is sent nothing, as in Redis. Every key a command reads is tracked, and keys written by scripts, expired, evicted or flushed are invalidated. Default mode: all reads auto-register; writers receive their own invalidations. OPTIN: only reads preceded by `CLIENT CACHING yes` are registered. OPTOUT: all reads register unless preceded by `CLIENT CACHING no`. NOLOOP: suppress invalidations sent back to the client that caused the write. REDIRECT forwards invalidations to another client ID. Zero cost when no tracking clients connected — one atomic load per command on the hot path |
@@ -1430,7 +1432,7 @@ Scripting (`EVAL`, `SCRIPT`, `FUNCTION`, `FCALL`, …) is **supported when built
 
 | Command | Reason |
 |---------|--------|
-| `MODULE LOAD/LOADEX/UNLOAD` | Requires `dlopen`, ABI versioning, and runtime command-table mutation. The Redis Modules C ABI is incompatible with KiviDB's safety model. (`MODULE LIST` returns an empty list.) |
+| `MODULE LOAD/LOADEX/UNLOAD` | Requires `dlopen`, ABI versioning, and runtime command-table mutation. The Redis Modules C ABI is incompatible with KiviDB's safety model. `MODULE LIST` names the built-in families clients check for (`search`, `ReJSON`, `timeseries`, `vectorset`) with Redis 8.10's versions and an empty path, as Redis lists its built-in `vectorset`. |
 | `FAILOVER` | Only meaningful in a Sentinel topology, which KiviDB does not implement. |
 | `CLUSTER SLAVES` | Deprecated by Redis in favour of `CLUSTER REPLICAS`. Use `CLUSTER REPLICAS` instead. |
 

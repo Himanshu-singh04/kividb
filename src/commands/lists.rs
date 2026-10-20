@@ -1,6 +1,6 @@
 use crate::commands::blocking;
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{lazy_expire_key, parse_utf8};
+use crate::commands::helpers::{lazy_expire_key, lazy_expire_on_read, parse_utf8};
 use crate::commands::list_move;
 use crate::keyspace_events::{KS_LIST, notify};
 use crate::resp::write::*;
@@ -283,13 +283,13 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
             let map = read_lock!(shard);
 
-            match map.get(key) {
+            match map.get(key).filter(|_| !gone) {
                 None => {
                     crate::stats::record_miss();
                     Some(resp_integer(0))

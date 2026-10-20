@@ -52,9 +52,13 @@ const KDB_ALIAS_MAGIC: &[u8; 8] = b"KIVIAL1\0";
 /// `SORTABLE`, `SEPARATOR`, `WEIGHT`, … and the index's `STOPWORDS`. After
 /// the alias section, for the same reason that one is after the expiries.
 const KDB_FIELD_OPTIONS_MAGIC: &[u8; 8] = b"KIVIFO1\0";
-/// Synonym groups of each index, and the dictionaries. After everything
-/// else: an older release stops reading at a section it does not know.
+/// Synonym groups of each index, and the dictionaries. After the field
+/// options: an older release stops reading at a section it does not know.
 const KDB_SYNONYMS_MAGIC: &[u8; 8] = b"KIVISD1\0";
+/// The element type of each vector field that is not FLOAT32. Last, for the
+/// same reason as the synonyms: the schema section has no room for it, and
+/// an older release that stops before it reads the field as FLOAT32.
+const KDB_VECTOR_TYPES_MAGIC: &[u8; 8] = b"KIVIVT1\0";
 
 // Field-type tags used inside the index schema section.
 const SCHEMA_FIELD_TEXT: u8 = 0;
@@ -749,7 +753,78 @@ pub fn write_kdb_alias_section(
     }
     drop(guard);
     write_kdb_field_options_section(w, store)?;
-    write_kdb_synonyms_section(w, store)
+    write_kdb_synonyms_section(w, store)?;
+    write_kdb_vector_types_section(w, store)
+}
+
+/// The vector types section: `index`, `field`, `type name`, for each vector
+/// field whose type is not FLOAT32. Absent when there is none, so an image
+/// with only FLOAT32 fields is what it was before the section existed.
+fn write_kdb_vector_types_section(
+    w: &mut impl Write,
+    store: &crate::vector::IndexStore,
+) -> io::Result<()> {
+    let guard = store.read();
+    let mut typed: Vec<(&str, &str, &str)> = guard
+        .iter()
+        .filter(|(key, def)| !crate::vector::is_alias(key, def))
+        .flat_map(|(_, def)| {
+            def.fields.iter().filter_map(|f| match &f.field_type {
+                FieldType::Vector { data_type, .. }
+                    if *data_type != crate::vector::VectorType::Float32 =>
+                {
+                    Some((def.name.as_str(), f.name.as_str(), data_type.name()))
+                }
+                _ => None,
+            })
+        })
+        .collect();
+    if typed.is_empty() {
+        return Ok(());
+    }
+    typed.sort();
+    w.write_all(KDB_VECTOR_TYPES_MAGIC)?;
+    w.write_all(&(typed.len() as u32).to_le_bytes())?;
+    for (index, field, ty) in typed {
+        write_bytes(w, index.as_bytes())?;
+        write_bytes(w, field.as_bytes())?;
+        write_bytes(w, ty.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Body of the vector types section; the magic has already been consumed.
+/// Not best-effort, as the field options are not: a FLOAT64 field read as
+/// FLOAT32 indexes none of its documents.
+fn read_vector_types_section(r: &mut impl Read, schemas: &mut [IndexSchema]) -> io::Result<()> {
+    let text = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad vector type utf8"))
+    };
+    for _ in 0..read_u32_le(r)? {
+        let index = text(read_bytes(r)?)?;
+        let field = text(read_bytes(r)?)?;
+        let ty = text(read_bytes(r)?)?;
+        let ty = crate::vector::VectorType::parse(&ty).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown vector type `{ty}` for field `{field}`"),
+            )
+        })?;
+        let target = schemas
+            .iter_mut()
+            .filter(|s| s.name == index)
+            .flat_map(|s| s.fields.iter_mut())
+            .find(|f| f.name == field);
+        if let Some(SchemaField {
+            field_type: FieldType::Vector { data_type, .. },
+            ..
+        }) = target
+        {
+            *data_type = ty;
+        }
+    }
+    Ok(())
 }
 
 /// The synonyms and dictionaries section: each index's synonym groups
@@ -1051,7 +1126,10 @@ fn write_index_schema(w: &mut impl Write, def: &crate::vector::IndexDef) -> io::
             FieldType::Text => w.write_all(&[SCHEMA_FIELD_TEXT])?,
             FieldType::Tag => w.write_all(&[SCHEMA_FIELD_TAG])?,
             FieldType::Numeric => w.write_all(&[SCHEMA_FIELD_NUMERIC])?,
-            FieldType::Vector { algo, dim, metric } => {
+            // The type is in the vector types section.
+            FieldType::Vector {
+                algo, dim, metric, ..
+            } => {
                 w.write_all(&[SCHEMA_FIELD_VECTOR])?;
                 match algo {
                     VectorAlgo::Flat => {
@@ -1500,6 +1578,8 @@ fn read_image(r: impl Read, keep: bool) -> io::Result<(LoadedSnapshot, usize)> {
             read_field_options_section(&mut r, &mut index_schemas)?;
         } else if &magic == KDB_SYNONYMS_MAGIC {
             dictionaries = read_synonyms_section(&mut r, &mut index_schemas)?;
+        } else if &magic == KDB_VECTOR_TYPES_MAGIC {
+            read_vector_types_section(&mut r, &mut index_schemas)?;
         } else {
             break;
         }
@@ -1661,7 +1741,13 @@ fn read_one_index_schema(r: &mut impl Read) -> io::Result<IndexSchema> {
                     2 => DistanceMetric::InnerProduct,
                     _ => DistanceMetric::Cosine,
                 };
-                FieldType::Vector { algo, dim, metric }
+                FieldType::Vector {
+                    algo,
+                    dim,
+                    metric,
+                    // Set from the vector types section, if the image has one.
+                    data_type: crate::vector::VectorType::Float32,
+                }
             }
             _ => FieldType::Text,
         };

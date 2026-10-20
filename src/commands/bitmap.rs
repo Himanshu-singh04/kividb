@@ -60,7 +60,7 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
     };
 
     if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
         return resp_integer(0);
     }
 
@@ -184,7 +184,7 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
     // Hot path: whole string — no range parsing
     if cmd.len() == 2 {
         if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+            expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
             return resp_integer(0);
         }
         let db = &ctx.store[*ctx.selected_db];
@@ -225,15 +225,14 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
             false
         };
 
-        if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-            delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
-        }
+        let gone = is_expired(ctx.expiry_store, *ctx.selected_db, key)
+            && expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
 
         let db = &ctx.store[*ctx.selected_db];
         let shard = store::get_shard(db, key);
         let map = read_lock!(shard);
 
-        let bytes: SharedBytes = match map.get(key) {
+        let bytes: SharedBytes = match map.get(key).filter(|_| !gone) {
             Some(KiviDBValue::String(b)) => b.clone(),
             None => SharedBytes::from(&[][..]),
             _ => {
@@ -374,7 +373,7 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
     };
 
     if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-        delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+        expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
         return resp_integer(if search_bit == 0 { 0 } else { -1 });
     }
 

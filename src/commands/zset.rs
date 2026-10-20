@@ -725,8 +725,12 @@ fn zcard(ctx: &mut Ctx) -> Vec<u8> {
         None => return resp_error("ERR key must be valid UTF-8"),
     };
 
-    if crate::commands::helpers::lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key)
-    {
+    if crate::commands::helpers::lazy_expire_on_read(
+        ctx.store,
+        ctx.expiry_store,
+        *ctx.selected_db,
+        key,
+    ) {
         return resp_integer(0);
     }
 

@@ -1072,13 +1072,9 @@ fn ft_spellcheck(ctx: &mut Ctx) -> Option<Vec<u8>> {
 
     let mut out: Vec<Vec<u8>> = Vec::new();
 
-    for token in query.split_whitespace() {
-        let token_clean: String = token
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect::<String>()
-            .to_lowercase();
-
+    // The query's words as the index has them, so that `world_x` and
+    // `users\.u_1` are the words the vocabulary holds.
+    for token_clean in crate::vector::tokenize_for_vocab(&query) {
         if token_clean.is_empty() || vocab.contains(&token_clean) {
             continue; // correctly spelled — skip
         }
@@ -1205,6 +1201,7 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
     struct FieldWork {
         name: String,
         dim: usize,
+        data_type: crate::vector::VectorType,
         metric: crate::vector::DistanceMetric,
         live: LiveIndex,
     }
@@ -1214,8 +1211,13 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
             Some(f) => f,
             None => continue,
         };
-        let (dim, metric) = match &vf.field_type {
-            FieldType::Vector { dim, metric, .. } => (*dim, metric.clone()),
+        let (dim, data_type, metric) = match &vf.field_type {
+            FieldType::Vector {
+                dim,
+                data_type,
+                metric,
+                ..
+            } => (*dim, *data_type, metric.clone()),
             _ => continue,
         };
         let live = match def.indexes.get(name) {
@@ -1226,6 +1228,7 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
         work.push(FieldWork {
             name: name.clone(),
             dim,
+            data_type,
             metric,
             live,
         });
@@ -1277,15 +1280,9 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
                     Some(b) => b,
                     None => continue,
                 };
-                if raw_bytes.len() != w.dim * 4 {
+                let Some(vec) = w.data_type.decode(raw_bytes, w.dim) else {
                     continue;
-                }
-                let vec: Vec<f32> = raw_bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
+                };
 
                 match &w.live {
                     LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),

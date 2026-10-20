@@ -923,3 +923,61 @@ fn zset_infinity_scores_survive_both_protocols() {
         "RESP3 -inf must use the double type's -inf form"
     );
 }
+
+/// `MODULE LIST` names the module families KiviDB has built in, with the
+/// versions Redis 8.10 reports and an empty path, the way Redis lists its own
+/// built-in `vectorset`. Clients check it before they use FT.* or JSON.*:
+/// redisvl 0.4 (LlamaIndex's Redis vector store) refuses to connect without
+/// `search`.
+#[test]
+fn module_list_names_the_built_in_families_in_both_protocols() {
+    let port = free_port();
+    start_server(port);
+
+    let modules = [
+        ("search", 81001),
+        ("ReJSON", 81000),
+        ("timeseries", 81001),
+        ("vectorset", 1),
+    ];
+    let expected = |header: &str| {
+        let mut out = format!("*{}\r\n", modules.len());
+        for (name, ver) in modules {
+            out.push_str(&format!(
+                "{header}\r\n$4\r\nname\r\n${}\r\n{name}\r\n$3\r\nver\r\n:{ver}\r\n\
+                 $4\r\npath\r\n$0\r\n\r\n$4\r\nargs\r\n*0\r\n",
+                name.len()
+            ));
+        }
+        out.into_bytes()
+    };
+
+    let mut c2 = RawConn::connect(port);
+    assert_wire!(
+        c2.raw(&["MODULE", "LIST"]),
+        &expected("*8")[..],
+        "RESP2 MODULE LIST"
+    );
+
+    let mut c3 = RawConn::connect(port);
+    c3.hello3();
+    assert_wire!(
+        c3.raw(&["MODULE", "LIST"]),
+        &expected("%4")[..],
+        "RESP3 MODULE LIST"
+    );
+}
+
+/// HELLO's `modules` is the list MODULE LIST gives, as in Redis.
+#[test]
+fn hello_reports_the_built_in_modules() {
+    let port = free_port();
+    start_server(port);
+    let mut c = RawConn::connect(port);
+    let hello = s(&c.raw(&["HELLO", "2"]));
+    let list = s(&c.raw(&["MODULE", "LIST"]));
+    assert!(
+        hello.ends_with(&format!("$7\\r\\nmodules\\r\\n{list}")),
+        "HELLO must end with the module list:\n  hello: {hello}\n  list:  {list}"
+    );
+}

@@ -89,7 +89,6 @@ thread_local! {
     static TL_COMMANDS:    Cell<u32> = const { Cell::new(0) };
     static TL_HITS:        Cell<u32> = const { Cell::new(0) };
     static TL_MISSES:      Cell<u32> = const { Cell::new(0) };
-    static TL_EXPIRED:     Cell<u32> = const { Cell::new(0) };
     static TL_RDB_CHANGES: std::sync::Arc<AtomicU64> = {
         let mine = std::sync::Arc::new(AtomicU64::new(0));
         RDB_CHANGES.lock().push(std::sync::Arc::clone(&mine));
@@ -160,9 +159,12 @@ pub fn record_evicted() {
     EVICTED_KEYS.fetch_add(1, Ordering::Relaxed);
 }
 
-#[inline(always)]
+/// Counted straight into the total, not batched per thread as commands
+/// are: keys expire far less often than commands run, and a batched count
+/// could read 0 after the first few expiries (the Redis suite's pause test).
+#[inline]
 pub fn record_expired() {
-    tl_bump!(TL_EXPIRED, EXPIRED_KEYS);
+    EXPIRED_KEYS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One more change to the dataset since it was last saved.

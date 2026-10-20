@@ -1128,6 +1128,68 @@ fn test_client_pause_write_mode() {
     c.cmds(&["CLIENT", "UNPAUSE"]);
 }
 
+fn expired_keys(c: &mut Conn) -> u64 {
+    let info = c.cmds(&["INFO", "stats"]);
+    info.as_str()
+        .lines()
+        .find_map(|line| line.strip_prefix("expired_keys:"))
+        .expect("expired_keys in INFO stats")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+// While writes are paused nothing expires, as in Redis (#22): a read takes a
+// key whose time has passed as gone, but the key is not deleted or counted
+// until the pause is over, the background sweep leaves it alone, and
+// RANDOMKEY still answers with it rather than nil. The pause is the whole
+// process's, so no other test's key expires meanwhile either; once it is
+// over, theirs may, hence "at least two" at the end.
+#[test]
+fn test_client_pause_write_defers_expiry() {
+    let _lock = pause_lock();
+    let _reset = PauseGuard;
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmds(&["SET", "foo", "bar", "PX", "200"]).is_ok());
+    assert!(c.cmds(&["SET", "bar", "foo", "PX", "200"]).is_ok());
+    let before = expired_keys(&mut c);
+    assert!(c.cmds(&["CLIENT", "PAUSE", "20000", "WRITE"]).is_ok());
+
+    // Past the keys' time, and several turns of the sweep (every 100 ms).
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(c.cmds(&["GET", "foo"]).is_nil());
+    assert!(c.cmds(&["GET", "bar"]).is_nil());
+    assert_eq!(c.cmds(&["EXISTS", "foo", "bar"]).as_int(), 0);
+    assert_eq!(c.cmds(&["TTL", "foo"]).as_int(), -2);
+    assert_eq!(c.cmds(&["TYPE", "bar"]).as_str(), "none");
+    assert!(c.cmds(&["KEYS", "*"]).as_array().is_empty());
+    let picked = c.cmds(&["RANDOMKEY"]);
+    assert!(
+        !picked.is_nil() && matches!(picked.as_str(), "foo" | "bar"),
+        "RANDOMKEY during a write pause should name an expired key, got {picked:?}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        expired_keys(&mut c),
+        before,
+        "a key was deleted as expired while writes were paused"
+    );
+
+    assert!(c.cmds(&["CLIENT", "UNPAUSE"]).is_ok());
+    // Now they go, on the next read if the sweep has not been first.
+    assert!(c.cmds(&["GET", "foo"]).is_nil());
+    assert!(c.cmds(&["GET", "bar"]).is_nil());
+    let after = expired_keys(&mut c);
+    assert!(
+        after >= before + 2,
+        "expected the two keys counted once unpaused: {before} -> {after}"
+    );
+    assert!(c.cmds(&["RANDOMKEY"]).is_nil());
+}
+
 // CLIENT TRACKING stub
 #[test]
 fn test_client_tracking_stub() {

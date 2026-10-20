@@ -5285,3 +5285,241 @@ fn test_hash_fields_keep_insertion_order() {
         ["j", "a", "h", "i", "c", "d", "f", "e", "z"]
     );
 }
+
+// ── Vector element types ──────────────────────────────────────────────────────
+
+/// `values` as little-endian elements of `ty`. The test values are exactly
+/// representable in every type, so half precision needs no rounding here.
+fn pack_as(ty: &str, values: &[f32]) -> Vec<u8> {
+    let half = |v: f32| -> u16 {
+        if v == 0.0 {
+            return 0;
+        }
+        let bits = v.to_bits();
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        (((bits >> 16) & 0x8000) | ((exponent as u32) << 10) | ((bits >> 13) & 0x3ff)) as u16
+    };
+    values
+        .iter()
+        .flat_map(|v| match ty {
+            "FLOAT32" => v.to_le_bytes().to_vec(),
+            "FLOAT64" => f64::from(*v).to_le_bytes().to_vec(),
+            "FLOAT16" => half(*v).to_le_bytes().to_vec(),
+            "BFLOAT16" => ((v.to_bits() >> 16) as u16).to_le_bytes().to_vec(),
+            other => panic!("no packing for {other}"),
+        })
+        .collect()
+}
+
+/// FLOAT64, FLOAT16 and BFLOAT16 vector fields, as Redis has them: the blobs
+/// in the hash, and the query blob, are elements of the field's type. The
+/// distances are what Redis 8.10.2 returns for the same data.
+#[test]
+fn test_vector_types_other_than_float32_on_hash() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for ty in ["FLOAT64", "FLOAT16", "BFLOAT16"] {
+        for algo in ["FLAT", "HNSW"] {
+            let index = format!("idx_{ty}_{algo}");
+            let prefix = format!("{ty}_{algo}:");
+            let created = c.cmds(&[
+                "FT.CREATE",
+                &index,
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                &prefix,
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                algo,
+                "6",
+                "TYPE",
+                ty,
+                "DIM",
+                "2",
+                "DISTANCE_METRIC",
+                "L2",
+            ]);
+            assert!(created.is_ok(), "{index}: {created:?}");
+
+            let key = |k: &str| format!("{prefix}{k}");
+            c.cmd(&[
+                b"HSET",
+                key("a").as_bytes(),
+                b"v",
+                &pack_as(ty, &[0.0, 0.0]),
+            ]);
+            c.cmd(&[
+                b"HSET",
+                key("b").as_bytes(),
+                b"v",
+                &pack_as(ty, &[3.0, 4.0]),
+            ]);
+            // A FLOAT32 blob is the wrong size for every one of these types.
+            c.cmd(&[
+                b"HSET",
+                key("bad").as_bytes(),
+                b"v",
+                &pack_f32(&[1.0, 1.0, 1.0]),
+            ]);
+
+            let r = c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"*=>[KNN 3 @v $q AS d]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &pack_as(ty, &[3.0, 3.5]),
+                b"SORTBY",
+                b"d",
+                b"RETURN",
+                b"1",
+                b"d",
+                b"DIALECT",
+                b"2",
+            ]);
+            let arr = r.as_array();
+            assert_eq!(arr.first().map(|v| v.as_int()), Some(2), "{index}: {r:?}");
+            assert_eq!(arr[1].as_str(), key("b"), "{index}");
+            assert_eq!(parse_score(&arr[2].as_array()[1]), 0.25, "{index}");
+            assert_eq!(arr[3].as_str(), key("a"), "{index}");
+            assert_eq!(parse_score(&arr[4].as_array()[1]), 21.25, "{index}");
+
+            let r = c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"@v:[VECTOR_RANGE 1 $q]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &pack_as(ty, &[3.0, 4.0]),
+                b"NOCONTENT",
+                b"DIALECT",
+                b"2",
+            ]);
+            assert_eq!(r.as_array().len(), 2, "{index}: {r:?}");
+            assert_eq!(r.as_array()[1].as_str(), key("b"), "{index}");
+
+            // A query blob of the wrong size is refused, with its size.
+            let r = c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"*=>[KNN 1 @v $q AS d]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &pack_f32(&[3.0, 4.0, 5.0]),
+                b"DIALECT",
+                b"2",
+            ]);
+            let want = if ty == "FLOAT64" { 16 } else { 4 };
+            assert!(
+                r.is_error()
+                    && format!("{r:?}").contains(&format!(
+                        "query vector blob size (12) does not match index's expected size ({want})"
+                    )),
+                "{index}: {r:?}"
+            );
+
+            let info = c.cmds(&["FT.INFO", &index]);
+            let info = format!("{info:?}");
+            assert!(
+                info.contains(&format!("{:?}", ty.as_bytes())),
+                "{index}: FT.INFO must report data_type {ty}: {info}"
+            );
+        }
+    }
+}
+
+/// A FLOAT64 vector field of a JSON index: the document holds a number array
+/// and the query blob is FLOAT64.
+#[test]
+fn test_vector_type_float64_on_json() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let created = c.cmds(&[
+        "FT.CREATE",
+        "j",
+        "ON",
+        "JSON",
+        "PREFIX",
+        "1",
+        "j:",
+        "SCHEMA",
+        "$.v",
+        "AS",
+        "v",
+        "VECTOR",
+        "FLAT",
+        "6",
+        "TYPE",
+        "FLOAT64",
+        "DIM",
+        "2",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    assert!(created.is_ok(), "{created:?}");
+    c.cmds(&["JSON.SET", "j:a", "$", r#"{"v":[0,0]}"#]);
+    c.cmds(&["JSON.SET", "j:b", "$", r#"{"v":[3,4]}"#]);
+
+    let r = c.cmd(&[
+        b"FT.SEARCH",
+        b"j",
+        b"*=>[KNN 1 @v $q AS d]",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &pack_as("FLOAT64", &[3.0, 3.5]),
+        b"RETURN",
+        b"1",
+        b"d",
+        b"DIALECT",
+        b"2",
+    ]);
+    let arr = r.as_array();
+    assert_eq!(arr.first().map(|v| v.as_int()), Some(1), "{r:?}");
+    assert_eq!(arr[1].as_str(), "j:b");
+    assert_eq!(parse_score(&arr[2].as_array()[1]), 0.25);
+}
+
+/// A type Redis does not know is refused at FT.CREATE, with the reply Redis
+/// 8.2.10 gives (Redis 8.10 puts `SEARCH_PARSE_ARGS` in front of it).
+#[test]
+fn test_vector_type_unknown_is_refused() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for algo in ["FLAT", "HNSW"] {
+        let index = format!("x_{algo}");
+        let r = c.cmds(&[
+            "FT.CREATE",
+            &index,
+            "SCHEMA",
+            "v",
+            "VECTOR",
+            algo,
+            "6",
+            "TYPE",
+            "FLOAT8",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+        ]);
+        let want =
+            format!("Bad arguments for vector similarity {algo} index `TYPE`: Unknown argument");
+        assert!(
+            matches!(&r, RespValue::Error(e) if *e == want),
+            "{algo}: {r:?}"
+        );
+    }
+}
