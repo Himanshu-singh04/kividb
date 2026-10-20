@@ -282,8 +282,10 @@ Beyond the report:
   the engine's settings. All three were stubs.
 * **Synonym groups and dictionaries are saved** in snapshots and sent in a
   full sync. They used not to survive a restart.
-* The tokenizer splits where Redis's does, an index can have its own
-  `STOPWORDS`, and `FT.ALTER` covers documents that already exist.
+* The tokenizer splits where Redis's does, and a backslash keeps the next
+  character in the word (`users\.u_1` is one word), in a document and in a
+  query. An index can have its own `STOPWORDS`, and `FT.ALTER` covers
+  documents that already exist.
 
 ## Memory, eviction, Pub/Sub, transactions
 
@@ -341,6 +343,8 @@ Beyond the report:
 * On a JSON index, a NUMERIC path that selects several numbers indexes the
   first; `RETURN` gives the first match of a path (dialect 2), not the array
   of all matches (dialect 3).
+* `HIGHLIGHT` wraps an escaped word whole: `<b>users\.u_1</b>`. Redis wraps
+  `<b>users\</b>.u_1`, which cuts the word after the backslash.
 * An ACL change that takes away a channel a client is already subscribed to
   does not end that subscription; it stops the client subscribing again.
 * HNSW graphs are not part of a backup's BASE file; they are rebuilt on

@@ -702,7 +702,7 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
             None => return Some(resp_error("ERR no such index")),
         };
 
-        // Decode vector param: PARAMS contains raw FLOAT32 bytes.
+        // Decode vector param: PARAMS holds raw bytes in the field's type.
         let raw = q.params.get(&q.vsim_param).unwrap(); // checked in parse()
         let vf = match def.vector_field_by_name(&q.vsim_field) {
             Some(f) => f,
@@ -713,23 +713,17 @@ pub fn ft_hybrid(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 )));
             }
         };
-        let dim = match &vf.field_type {
-            FieldType::Vector { dim, .. } => *dim,
+        let (dim, data_type) = match &vf.field_type {
+            FieldType::Vector { dim, data_type, .. } => (*dim, *data_type),
             _ => return Some(resp_error("ERR field is not VECTOR")),
         };
-        if raw.len() != dim * 4 {
+        let Some(v) = data_type.decode(raw, dim) else {
             return Some(resp_error(&format!(
                 "ERR vector param wrong size: expected {} bytes, got {}",
-                dim * 4,
+                dim * data_type.size(),
                 raw.len()
             )));
-        }
-        let v: Vec<f32> = raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
+        };
         (def, v)
     };
 

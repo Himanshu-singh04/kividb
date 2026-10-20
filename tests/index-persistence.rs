@@ -1940,3 +1940,105 @@ fn synonyms_dictionaries_and_json_documents_survive_restart() {
     kill_server(&mut srv2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Snapshot persistence — vector element types
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A FLOAT64 HNSW field and a FLOAT16 FLAT field come back with their types:
+/// after a restart their FLOAT64 and FLOAT16 blobs are still indexed, and
+/// still found by a query blob of the same type.
+#[test]
+fn vector_types_survive_snapshot_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("vector_types_snap");
+    let f64s = |v: &[f64]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    // 0.0, 1.0 and 2.0 in IEEE half precision.
+    let f16s = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let (zero, one, two) = (0x0000u16, 0x3c00u16, 0x4000u16);
+
+    let port1 = free_port();
+    let mut srv1 = start_server_in_dir(port1, &dir);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    {
+        let mut c = Conn::connect(port1);
+        for (index, prefix, algo, ty) in [
+            ("idx:f64", "d:", "HNSW", "FLOAT64"),
+            ("idx:f16", "h:", "FLAT", "FLOAT16"),
+        ] {
+            assert!(
+                c.cmds(&[
+                    "FT.CREATE",
+                    index,
+                    "ON",
+                    "HASH",
+                    "PREFIX",
+                    "1",
+                    prefix,
+                    "SCHEMA",
+                    "vec",
+                    "VECTOR",
+                    algo,
+                    "6",
+                    "TYPE",
+                    ty,
+                    "DIM",
+                    "2",
+                    "DISTANCE_METRIC",
+                    "L2",
+                ])
+                .is_ok(),
+                "{index}"
+            );
+        }
+        c.cmd(&[b"HSET", b"d:a", b"vec", &f64s(&[0.0, 0.0])]);
+        c.cmd(&[b"HSET", b"d:b", b"vec", &f64s(&[2.0, 2.0])]);
+        c.cmd(&[b"HSET", b"h:a", b"vec", &f16s(&[zero, zero])]);
+        c.cmd(&[b"HSET", b"h:b", b"vec", &f16s(&[two, two])]);
+        assert!(c.cmds(&["SAVE"]).is_ok());
+    }
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 stop"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_server_in_dir(port2, &dir);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        for (index, query, want) in [
+            ("idx:f64", f64s(&[2.0, 1.5]), "d:b"),
+            ("idx:f16", f16s(&[two, one]), "h:b"),
+        ] {
+            let r = c.cmd(&[
+                b"FT.SEARCH",
+                index.as_bytes(),
+                b"*=>[KNN 2 @vec $q AS d]",
+                b"PARAMS",
+                b"2",
+                b"q",
+                &query,
+                b"SORTBY",
+                b"d",
+                b"NOCONTENT",
+                b"DIALECT",
+                b"2",
+            ]);
+            let arr = r.as_array();
+            assert_eq!(arr.first().map(|v| v.as_int()), Some(2), "{index}: {r:?}");
+            assert_eq!(arr[1].as_str(), want, "{index}");
+        }
+        let info = format!("{:?}", c.cmds(&["FT.INFO", "idx:f64"]));
+        assert!(info.contains(&format!("{:?}", b"FLOAT64")), "{info}");
+    }
+    kill_server(&mut srv2);
+    let _ = std::fs::remove_dir_all(&dir);
+}

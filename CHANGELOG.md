@@ -26,6 +26,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `Cargo.lock` are scanned again every week, and the results go to the
   repository's code scanning alerts. Dependabot proposes new base images.
 
+### Added
+
+- **VECTOR fields take `TYPE FLOAT64`, `FLOAT16` and `BFLOAT16`.** Only
+  FLOAT32 was accepted. Hash blobs and query vectors are read in the field's
+  type, as in Redis, and `FT.INFO` reports it as `data_type`. An unknown
+  type gets Redis 8.2's reply, ``Bad arguments for vector similarity FLAT
+  index `TYPE`: Unknown argument``. The index still holds `f32`, so the
+  smaller types save no memory. A snapshot records the type in a new section
+  after all the others. An older release that loads such a snapshot reads the
+  field as FLOAT32: it refuses the field's query vectors and does not index
+  new or rebuilt documents.
+
+### Fixed
+
+- **A backslash in a TEXT field escapes the next character, as in Redis.**
+  `users\.u_1` is the one word `users.u_1`, in a document and in a query, so
+  `@f:users\.u_1` no longer also matches `users\.u_1\.sub`, and
+  `@f:users\.u_1*` is a prefix query instead of a syntax error. LangGraph's
+  `RedisStore` depends on this to keep namespaces apart: before, `get` and
+  `delete` on a namespace could reach an item in a namespace under it. TEXT
+  indexes are rebuilt from the data when the server starts, so no reindex is
+  needed after upgrading. Fuzzy terms (`%…%`) and `FT.SPELLCHECK` read words
+  the same way, and a `$param` value is one word, not split at punctuation,
+  as in Redis.
+- **`MODULE LIST` names the built-in module families.** It lists `search`,
+  `ReJSON`, `timeseries` and `vectorset` with the versions Redis 8.10
+  reports and an empty path, as Redis lists its own built-in `vectorset`.
+  `HELLO` reports the same list under `modules`, and
+  `COMMAND LIST FILTERBY MODULE search` (or `ReJSON`, `timeseries`,
+  `vectorset`) lists that family's commands.
+  It was empty, and clients that check it before using FT.* refused to
+  connect: redisvl 0.4, which LlamaIndex's Redis vector store requires,
+  raised `RedisModuleVersionError` on `RedisVectorStore(redis_url=...)`.
+
 ## [1.1.0]
 
 - **KiviDB is open source, under the GNU Affero General Public License,

@@ -13,7 +13,7 @@ use crate::types::KiviDBValue;
 use crate::vector::filter::{self, Filter, Params, TextMatch};
 use crate::vector::{
     DistanceMetric, FieldOptions, FieldType, IndexDef, IndexOn, IndexSchema, LiveIndex,
-    SchemaField, VectorAlgo,
+    SchemaField, VectorAlgo, VectorType,
 };
 
 use crate::vector::Fields;
@@ -52,6 +52,7 @@ fn parse_vector_spec(field: &str, cmd: &[&[u8]], i: &mut usize) -> Result<FieldT
 
     let mut dim: Option<usize> = None;
     let mut metric: Option<DistanceMetric> = None;
+    let mut data_type = VectorType::Float32;
     let mut m = 16usize;
     let mut ef_construction = 200usize;
     let mut ef_runtime = 10usize;
@@ -64,12 +65,14 @@ fn parse_vector_spec(field: &str, cmd: &[&[u8]], i: &mut usize) -> Result<FieldT
             })
         };
         match key.as_str() {
+            // Redis 8.2's reply; 8.10 puts `SEARCH_PARSE_ARGS` in front of it.
             "TYPE" => {
-                if value != "FLOAT32" {
-                    return Err(format!(
-                        "VECTOR field `{field}`: only TYPE FLOAT32 is supported, got `{value}`"
-                    ));
-                }
+                data_type = VectorType::parse(&value).ok_or_else(|| {
+                    format!(
+                        "Bad arguments for vector similarity {algo_name} index `TYPE`: Unknown \
+                         argument"
+                    )
+                })?;
             }
             "DIM" => dim = Some(number()?),
             "DISTANCE_METRIC" => {
@@ -109,6 +112,7 @@ fn parse_vector_spec(field: &str, cmd: &[&[u8]], i: &mut usize) -> Result<FieldT
         algo,
         dim,
         metric: metric.unwrap_or(DistanceMetric::L2),
+        data_type,
     })
 }
 
@@ -199,7 +203,13 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
         resp_bulk_str("type"),
         resp_bulk_str(field.type_name()),
     ];
-    if let FieldType::Vector { algo, dim, metric } = &field.field_type {
+    if let FieldType::Vector {
+        algo,
+        dim,
+        metric,
+        data_type,
+    } = &field.field_type
+    {
         let pairs = [
             (
                 "algorithm",
@@ -208,7 +218,7 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
                     VectorAlgo::Hnsw { .. } => "HNSW".to_string(),
                 },
             ),
-            ("data_type", "FLOAT32".to_string()),
+            ("data_type", data_type.name().to_string()),
             ("dim", dim.to_string()),
             (
                 "distance_metric",
@@ -508,7 +518,12 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .iter()
                 .map(|f| {
                     let label = match &f.field_type {
-                        FieldType::Vector { algo, dim, metric } => {
+                        FieldType::Vector {
+                            algo,
+                            dim,
+                            metric,
+                            data_type,
+                        } => {
                             let algo = match algo {
                                 VectorAlgo::Flat => "FLAT".to_string(),
                                 VectorAlgo::Hnsw {
@@ -520,7 +535,11 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
                                 DistanceMetric::Cosine => "COSINE",
                                 DistanceMetric::InnerProduct => "IP",
                             };
-                            format!("VECTOR {algo} DIM={dim} {metric}")
+                            // As it was for FLOAT32, which was all there was.
+                            match data_type {
+                                VectorType::Float32 => format!("VECTOR {algo} DIM={dim} {metric}"),
+                                ty => format!("VECTOR {algo} {} DIM={dim} {metric}", ty.name()),
+                            }
                         }
                         _ => f.type_name().to_string(),
                     };
@@ -1093,7 +1112,8 @@ fn highlight(value: &str, terms: &AHashSet<String>, open: &str, close: &str) -> 
         if word.is_empty() {
             return;
         }
-        if terms.contains(&word.to_lowercase()) {
+        let token = crate::vector::tokenize_for_vocab(word).next();
+        if token.is_some_and(|t| terms.contains(&t)) {
             out.push_str(open);
             out.push_str(word);
             out.push_str(close);
@@ -1102,8 +1122,18 @@ fn highlight(value: &str, terms: &AHashSet<String>, open: &str, close: &str) -> 
         }
         word.clear();
     };
-    for c in value.chars() {
-        if crate::vector::is_token_separator(c) {
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        // An escaped character belongs to the word, as the tokenizer has it,
+        // and the whole word is wrapped: `<b>users\.u_1</b>`. Redis 8.10
+        // wraps `<b>users\</b>.u_1`, which cuts the word; KiviDB differs on
+        // purpose here.
+        if c == '\\' {
+            word.push(c);
+            if let Some(escaped) = chars.next() {
+                word.push(escaped);
+            }
+        } else if crate::vector::is_token_separator(c) {
             flush(&mut word, &mut out);
             out.push(c);
         } else {
