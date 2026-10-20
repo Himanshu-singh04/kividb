@@ -1659,7 +1659,9 @@ fn rdb_files_written_by_redis_7_4_and_8_10_load() {
 // A dump.rdb written by Redis 8.10 (RDB 15) holding a stream with a consumer
 // group and a pending entry (the later entry's sequence below the master's),
 // a second stream, a RedisJSON document and a hash with a field TTL, loads
-// (#39).
+// (#39). The field's TTL was set ten years out (HEXPIRE h2 315360000): the
+// loader drops fields past their time, so a short one makes this test fail
+// once it runs out, as the first capture's one hour did.
 #[test]
 fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
     let (dbs, _) = kividb::snapshot::load_redis_rdb_from(
