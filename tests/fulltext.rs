@@ -1111,6 +1111,56 @@ fn test_param_value_is_one_word() {
     }
 }
 
+/// A parameter's value with a space in it is still one word, so it matches
+/// no document: not the one that holds those words in that order, and not
+/// the ones that hold them apart. The words in it are not query syntax
+/// either. KiviDB used to split it into an AND of its words. Redis 7.4.7,
+/// 8.2.10 and 8.10.2 give these results for the same data.
+#[test]
+fn test_param_value_with_a_space_is_one_word() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    create_text_index(&mut c, "idx", "d:", "p");
+    c.cmds(&["HSET", "d:1", "p", "hello world"]);
+    c.cmds(&["HSET", "d:2", "p", "hello"]);
+    c.cmds(&["HSET", "d:3", "p", "world"]);
+    c.cmds(&["HSET", "d:4", "p", "hello there world"]);
+    c.cmds(&["HSET", "d:5", "p", "world hello"]);
+    thread::sleep(Duration::from_millis(50));
+
+    let all_hello = vec!["d:1", "d:2", "d:4", "d:5"];
+    for query in ["@p:$v", "$v"] {
+        for (value, want) in [
+            ("hello world", vec![]),
+            ("Hello World", vec![]),
+            ("hello  world", vec![]),
+            ("  hello  ", vec![]),
+            ("hello|world", vec![]),
+            ("hel*", vec![]),
+            ("hello", all_hello.clone()),
+            ("HELLO", all_hello.clone()),
+        ] {
+            let r = c.cmds(&[
+                "FT.SEARCH",
+                "idx",
+                query,
+                "PARAMS",
+                "2",
+                "v",
+                value,
+                "NOCONTENT",
+                "DIALECT",
+                "2",
+            ]);
+            let mut keys: Vec<&str> = r.as_array()[1..].iter().map(|k| k.as_str()).collect();
+            keys.sort();
+            assert_eq!(keys, want, "{query} with v = {value:?}");
+        }
+    }
+}
+
 /// FT.SPELLCHECK reads the query's words as the index has them: a word with
 /// an escape or an underscore is spelled correctly when the index holds it.
 #[test]
