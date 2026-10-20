@@ -1,5 +1,5 @@
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{lazy_expire_key, parse_utf8};
+use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
 use crate::keyspace_events::{KS_SET, notify};
 use crate::resp::write::*;
 use crate::store;
@@ -69,7 +69,7 @@ fn get_or_create_set(ctx: &Ctx, key: &str) -> Result<Set, Vec<u8>> {
 // while doing O(n) work (diff/inter/union). The clone is O(n) in the set size,
 // same as the operation itself, so it doesn't change the complexity class.
 fn load_set(ctx: &Ctx, key: &str) -> Option<crate::member_set::MemberSet> {
-    if lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
+    if lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
         return Some(crate::member_set::MemberSet::new());
     }
     let db_ref = &ctx.store[*ctx.selected_db];
@@ -215,7 +215,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
 
-            if lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
+            if lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
                 return Some(resp_integer(0));
             }
 

@@ -5,7 +5,7 @@
 //! as soon as the answer is known to have reached it.
 
 use crate::commands::ctx::Ctx;
-use crate::commands::helpers::{lazy_expire_key, parse_utf8};
+use crate::commands::helpers::{lazy_expire_on_read, parse_utf8};
 use crate::read_lock;
 use crate::resp::write::*;
 use crate::store;
@@ -74,9 +74,9 @@ fn sets_at(ctx: &Ctx, keys: &[&[u8]]) -> Result<Vec<Option<Set>>, Vec<u8>> {
             out.push(None);
             continue;
         };
-        lazy_expire_key(ctx.store, ctx.expiry_store, db, key);
+        let gone = lazy_expire_on_read(ctx.store, ctx.expiry_store, db, key);
         let shard = store::get_shard(&ctx.store[db], key);
-        match read_lock!(shard).get(key) {
+        match read_lock!(shard).get(key).filter(|_| !gone) {
             None => out.push(None),
             Some(KiviDBValue::Set(s)) => out.push(Some(Arc::clone(s))),
             Some(_) => {

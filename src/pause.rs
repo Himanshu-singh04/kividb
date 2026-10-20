@@ -60,6 +60,18 @@ pub fn active() -> Option<bool> {
 /// A pause given while clients are already paused does not shorten the
 /// pause or narrow it: the later of the two ends holds, and all clients stay
 /// paused if either pause was of all of them.
+/// Whether keys whose time has passed are to stay where they are for now:
+/// while writes are paused, by `CLIENT PAUSE` (`WRITE` or `ALL`), a slot
+/// handoff or a manual failover. Redis does the same (`PAUSE_ACTION_EXPIRE`):
+/// a read takes such a key as gone, but it is not deleted, counted in
+/// `expired_keys` or announced until the pause is over, and the background
+/// sweeps of keys and of hash fields wait as well. One load when nothing is
+/// paused.
+#[inline]
+pub fn expiry_deferred() -> bool {
+    PAUSE_UNTIL_MS.load(Ordering::Relaxed) != 0 && active().is_some()
+}
+
 pub fn set_pause(duration_ms: i64, write_only: bool) {
     let end = now_ms().saturating_add(duration_ms);
     let (end, write_only) = match active() {

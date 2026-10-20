@@ -445,7 +445,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if !ctx.expiry_store[*ctx.selected_db][index].holds_nothing()
                 && is_expired(ctx.expiry_store, *ctx.selected_db, key)
             {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 crate::stats::record_miss();
                 return Some(resp_null_bulk());
             }
@@ -586,7 +586,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     continue;
                 };
                 if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                    delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                     continue;
                 }
                 let shard = store::get_shard(db, key);
@@ -659,7 +659,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_integer(0));
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -1208,7 +1208,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_bulk(b""));
             }
             let db = &ctx.store[*ctx.selected_db];
@@ -1512,7 +1512,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // two shard locks simultaneously (deadlock risk if same shard).
             let s1: SharedBytes = {
                 if is_expired(ctx.expiry_store, *ctx.selected_db, key1) {
-                    delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key1);
+                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key1);
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
@@ -1532,7 +1532,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let s2: SharedBytes = {
                 if is_expired(ctx.expiry_store, *ctx.selected_db, key2) {
-                    delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key2);
+                    expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key2);
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
@@ -1716,7 +1716,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 None => return Some(resp_error("ERR must be valid UTF-8")),
             };
             if is_expired(ctx.expiry_store, *ctx.selected_db, key) {
-                delete_key_if_expired(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
+                expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key);
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];

@@ -1115,7 +1115,7 @@ fn with_hash_read<F, R>(ctx: &Ctx, key: &str, f: F) -> Option<Result<R, Vec<u8>>
 where
     F: FnOnce(&crate::types::HashFields) -> R,
 {
-    if lazy_expire_key(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
+    if lazy_expire_on_read(ctx.store, ctx.expiry_store, *ctx.selected_db, key) {
         return None;
     }
     let db_ref = &ctx.store[*ctx.selected_db];
