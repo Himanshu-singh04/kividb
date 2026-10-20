@@ -2627,16 +2627,19 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
     for _ in 0..rdb_read_plain_length(r)? {
         let name = String::from_utf8(rdb_read_string(r)?)
             .map_err(|_| rdb_invalid("consumer group name is not UTF-8"))?;
+        let last_id = rdb_read_stream_id(r)?;
+        let entries_read = if type_id >= 19 {
+            rdb_read_plain_length(r)?
+        } else {
+            estimated_entries_read(&stream, &last_id)
+        };
         let mut group = ConsumerGroup {
             name: name.clone(),
-            last_id: rdb_read_stream_id(r)?,
+            last_id,
             // A group whose count Redis does not know saves -1, which reads
-            // back as KiviDB's "not known".
-            entries_read: if type_id >= 19 {
-                rdb_read_plain_length(r)?
-            } else {
-                ConsumerGroup::NO_COUNT
-            },
+            // back as KiviDB's "not known". Before type 19 there is none, and
+            // Redis estimates it from the group's last ID, as this does.
+            entries_read,
             pel: Default::default(),
             consumers: Default::default(),
             active: Default::default(),
@@ -2718,6 +2721,33 @@ fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
     Ok(KiviDBValue::Stream(Arc::new(parking_lot::RwLock::new(
         stream,
     ))))
+}
+
+/// How many of a stream's entries a group whose last-delivered ID is `id`
+/// has been delivered, for a stream from before RDB type 19, which did not
+/// record it: Redis's `streamEstimateDistanceFromFirstEverEntry`, for a
+/// stream that (from such a file) has no deletions on record.
+fn estimated_entries_read(stream: &crate::types::StreamInner, id: &crate::types::StreamId) -> u64 {
+    use crate::types::ConsumerGroup;
+    let key = |id: &crate::types::StreamId| (id.ms, id.seq);
+    let added = stream.entries_added;
+    let length = stream.entries.len() as u64;
+    if added == 0 {
+        return 0;
+    }
+    let last = key(&stream.last_id);
+    if key(id) > last {
+        return ConsumerGroup::NO_COUNT;
+    }
+    if length == 0 || key(id) == last {
+        return added;
+    }
+    let first = stream.entries.keys().next().map(key).unwrap();
+    match key(id).cmp(&first) {
+        std::cmp::Ordering::Less => added - length,
+        std::cmp::Ordering::Equal => added - length + 1,
+        std::cmp::Ordering::Greater => ConsumerGroup::NO_COUNT,
+    }
 }
 
 /// A hash whose fields have their own TTLs (Redis 7.4+). Both forms open with

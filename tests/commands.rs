@@ -1940,3 +1940,42 @@ fn test_restore_reads_streams_field_ttl_hashes_and_json_dumped_by_redis() {
         }
     }
 }
+
+// A stream payload from Redis 5 (RDB type 15) records no group's
+// entries-read: as Redis does, it is estimated from the group's last ID. The
+// payload is the Redis suite's own ("Loading from legacy (Redis <= v6.2.x,
+// rdb_ver < 10) persistence"), DUMPed after XADD 1-0 to 6-0, XDEL 3-0, two
+// groups, XREADGROUP of 4 entries by g1, and XTRIM MAXLEN = 2.
+#[test]
+fn test_restore_estimates_entries_read_for_a_stream_from_redis_5() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let payload = from_hex(&[
+        "0f011000000000000000010000000000000000c3404a4057165700000023000201040101018464617461050001030100",
+        "20010381610204200a0001400a0062600a0002400a0063600a4022018164200a4039200a0065600a0005400a0066200a",
+        "00ff02060002026731050004000000000000000100000000000000003ef783437a010000010000000000000002000000",
+        "00000000003ef783437a01000001000000000000000400000000000000003ef783437a01000001000000000000000500",
+        "000000000000003ef783437a0100000101036331313ef783437a01000004000000000000000100000000000000000000",
+        "000000000002000000000000000000000000000000040000000000000000000000000000000500000000000000000267",
+        "320000000009003d52ef6867521dfa",
+    ]
+    .concat());
+    assert!(c.cmd(&[b"RESTORE", b"x", b"0", &payload]).is_ok());
+
+    let info = reply_pairs(&c.cmds(&["XINFO", "STREAM", "x"]));
+    assert_eq!(info["max-deleted-entry-id"], "0-0");
+    assert_eq!(info["entries-added"], "2");
+    let groups: Vec<std::collections::BTreeMap<String, String>> = c
+        .cmds(&["XINFO", "GROUPS", "x"])
+        .as_array()
+        .iter()
+        .map(reply_pairs)
+        .collect();
+    let group = |name: &str| groups.iter().find(|g| g["name"] == name).unwrap().clone();
+    // g1 was delivered up to 5-0, now the first entry: 2 added - 2 kept + 1.
+    assert_eq!(group("g1")["entries-read"], "1");
+    assert_eq!(group("g1")["lag"], "1");
+    assert_eq!(group("g2")["entries-read"], "0");
+    assert_eq!(group("g2")["lag"], "2");
+}
