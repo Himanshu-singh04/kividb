@@ -529,29 +529,60 @@ pub(crate) fn is_token_separator(c: char) -> bool {
 /// document as in a query, as in Redis. LangGraph's store keeps namespaces
 /// apart this way; splitting there made a namespace match the ones under it.
 pub fn tokenize_for_vocab(text: &str) -> impl Iterator<Item = String> + '_ {
-    let mut chars = text.chars();
-    std::iter::from_fn(move || {
-        let mut word = String::new();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                match chars.next() {
-                    Some(escaped) => word.push(escaped),
-                    None => break,
+    // Most text has no backslash: it is split as it always was, at the cost
+    // tokenizing had before escapes were read. Looking for one is a byte
+    // search over the text.
+    if text.contains('\\') {
+        Words::Escaped(text)
+    } else {
+        Words::Plain(
+            text.split(is_token_separator)
+                .filter(|word| !word.is_empty())
+                .map(str::to_lowercase),
+        )
+    }
+}
+
+/// The words of a text, for [`tokenize_for_vocab`]. `Plain` is the split a
+/// text without a backslash has always had; it keeps the separator test a
+/// function the compiler inlines, as a `fn` pointer would not.
+enum Words<'a, P> {
+    Plain(P),
+    /// What is left of a text that has a backslash in it.
+    Escaped(&'a str),
+}
+
+impl<P: Iterator<Item = String>> Iterator for Words<'_, P> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        match self {
+            Words::Plain(words) => words.next(),
+            Words::Escaped(rest) => loop {
+                // A word starts at the first character that is not a
+                // separator, or at a backslash, which escapes what follows.
+                let start = rest.find(|c| c == '\\' || !is_token_separator(c))?;
+                let text = &rest[start..];
+                let mut word = String::new();
+                let mut chars = text.char_indices();
+                let mut end = text.len();
+                while let Some((i, c)) = chars.next() {
+                    if c == '\\' {
+                        word.extend(chars.next().map(|(_, escaped)| escaped));
+                    } else if is_token_separator(c) {
+                        end = i;
+                        break;
+                    } else {
+                        word.push(c);
+                    }
                 }
-            } else if !is_token_separator(c) {
-                word.push(c);
-            } else if !word.is_empty() {
-                break;
-            }
+                *rest = &text[end..];
+                if !word.is_empty() {
+                    return Some(word.to_lowercase());
+                }
+            },
         }
-        if word.is_ascii() {
-            // In place: no second allocation for the common case.
-            word.make_ascii_lowercase();
-        } else {
-            word = word.to_lowercase();
-        }
-        (!word.is_empty()).then_some(word)
-    })
+    }
 }
 
 /// Returns true if the token is a common English stopword that should not
