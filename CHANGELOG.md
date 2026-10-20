@@ -21,6 +21,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`FUNCTION RESTORE` accepts payloads produced by Redis 7.4 and 8.10**
+  (#45). It previously refused them with `ERR DUMP payload version or checksum
+  are wrong`; Redis function-library payloads now restore atomically while
+  KiviDB's own format continues to work.
 - **Data from Redis loads: `RESTORE` of a Redis payload, `MIGRATE` from a
   Redis server, a Redis `dump.rdb`, and a full sync from a Redis primary**
   (#39). `RESTORE` refused every payload Redis produces, whatever the type,
