@@ -2106,9 +2106,6 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
     Some(cmds)
 }
 
-/// Given a command invocation (cmd[0] = command name, cmd[1..] = args),
-/// return RESP-encoded key entries. Each entry is either a bulk string (GETKEYS)
-/// or a 2-element array [key, [flags...]] (GETKEYSANDFLAGS).
 /// The module families KiviDB has built in, as Redis 8.10 names and numbers
 /// them. No module can be loaded, but clients look for these before they use
 /// the commands (redisvl 0.4, which LlamaIndex's vector store pins, refuses
@@ -2160,6 +2157,9 @@ fn in_module(module: &str, name: &str) -> bool {
     }
 }
 
+/// Given a command invocation (cmd[0] = command name, cmd[1..] = args),
+/// return RESP-encoded key entries. Each entry is either a bulk string (GETKEYS)
+/// or a 2-element array [key, [flags...]] (GETKEYSANDFLAGS).
 pub(crate) fn extract_keys(args: &[&[u8]], with_flags: bool) -> Result<Vec<Vec<u8>>, String> {
     use crate::resp::write::{resp_array, resp_bulk, resp_bulk_str};
 
