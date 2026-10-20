@@ -1750,3 +1750,193 @@ fn test_restore_refuses_redis_payloads_it_cannot_read() {
     assert!(c.cmd(&[b"RESTORE", b"good", b"0", &good]).is_ok());
     assert_eq!(c.cmds(&["GET", "good"]).as_str(), "hello");
 }
+
+// Streams (every RDB stream type from Redis 6.2 to 8.10: consumer groups,
+// pending entries, an idle consumer, a deleted entry, entries with the first
+// entry's fields and with others, a released entry on 8.10, idempotent
+// production on 8.10), hashes whose fields have TTLs (Redis 7.4 and 8.10, in
+// both encodings) and a RedisJSON document (Redis 8.10), captured from real
+// servers with what each server answered about them.
+fn redis_dump_complex_fixtures() -> Vec<serde_json::Value> {
+    include_str!("fixtures/redis-dump-payloads-complex.jsonl")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// A RESP2 reply of field, value pairs, as text.
+fn reply_pairs(v: &RespValue) -> std::collections::BTreeMap<String, String> {
+    v.as_array()
+        .chunks(2)
+        .filter_map(|pair| match &pair[1] {
+            RespValue::Bulk(b) => Some((
+                reply_text(&pair[0]),
+                String::from_utf8_lossy(b).into_owned(),
+            )),
+            RespValue::Int(n) => Some((reply_text(&pair[0]), n.to_string())),
+            RespValue::SimpleStr(s) => Some((reply_text(&pair[0]), s.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_restore_reads_streams_field_ttl_hashes_and_json_dumped_by_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let fixtures = redis_dump_complex_fixtures();
+    assert_eq!(fixtures.len(), 15);
+    for f in &fixtures {
+        let field = |name: &str| f[name].as_str().unwrap().to_string();
+        let label = format!(
+            "Redis {} {} (RDB type {})",
+            field("redis"),
+            field("key"),
+            f["rdb_type"]
+        );
+        let key = format!("{}:{}", field("redis"), field("key"));
+        let payload = from_hex(&field("hex"));
+        let reply = c.cmd(&[b"RESTORE", key.as_bytes(), b"0", &payload]);
+        assert!(reply.is_ok(), "{label}: RESTORE gave {reply:?}");
+        let e = &f["expect"];
+
+        if field("type") == "stream" {
+            let got: Vec<(String, Vec<String>)> = c
+                .cmds(&["XRANGE", &key, "-", "+"])
+                .as_array()
+                .iter()
+                .map(|entry| {
+                    let entry = entry.as_array();
+                    (
+                        reply_text(&entry[0]),
+                        entry[1].as_array().iter().map(reply_text).collect(),
+                    )
+                })
+                .collect();
+            let want: Vec<(String, Vec<String>)> = e["xrange"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry[0].as_str().unwrap().to_string(),
+                        json_strings(&entry[1]),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "{label}: entries");
+
+            let info = reply_pairs(&c.cmds(&["XINFO", "STREAM", &key]));
+            assert_eq!(info["length"], e["length"].to_string(), "{label}");
+            assert_eq!(
+                info["last-generated-id"],
+                e["last_id"].as_str().unwrap(),
+                "{label}"
+            );
+            if let Some(v) = e.get("max_deleted_id") {
+                assert_eq!(info["max-deleted-entry-id"], v.as_str().unwrap(), "{label}");
+                assert_eq!(
+                    info["entries-added"],
+                    e["entries_added"].to_string(),
+                    "{label}"
+                );
+            }
+
+            let groups = c.cmds(&["XINFO", "GROUPS", &key]);
+            let mut got_groups: Vec<std::collections::BTreeMap<String, String>> =
+                groups.as_array().iter().map(reply_pairs).collect();
+            got_groups.sort_by(|a, b| a["name"].cmp(&b["name"]));
+            let want_groups = e["groups"].as_array().unwrap();
+            assert_eq!(got_groups.len(), want_groups.len(), "{label}: groups");
+            for (got, want) in got_groups.iter().zip(want_groups) {
+                let group = want["name"].as_str().unwrap();
+                assert_eq!(got["name"], group, "{label}");
+                assert_eq!(
+                    got["last-delivered-id"],
+                    want["last_id"].as_str().unwrap(),
+                    "{label} {group}"
+                );
+
+                let mut consumers: Vec<String> = c
+                    .cmds(&["XINFO", "CONSUMERS", &key, group])
+                    .as_array()
+                    .iter()
+                    .map(|consumer| reply_pairs(consumer)["name"].clone())
+                    .collect();
+                consumers.sort();
+                assert_eq!(
+                    consumers,
+                    json_strings(&want["consumers"]),
+                    "{label} {group}: consumers"
+                );
+
+                let pending: Vec<(String, String, i64)> = c
+                    .cmds(&["XPENDING", &key, group, "-", "+", "100"])
+                    .as_array()
+                    .iter()
+                    .map(|p| {
+                        let p = p.as_array();
+                        (reply_text(&p[0]), reply_text(&p[1]), p[3].as_int())
+                    })
+                    .collect();
+                let want_pending: Vec<(String, String, i64)> = want["pending"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p[0].as_str().unwrap().into(),
+                            p[1].as_str().unwrap().into(),
+                            p[2].as_i64().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(pending, want_pending, "{label} {group}: pending entries");
+            }
+        } else if field("type") == "hash" {
+            assert_eq!(
+                c.cmds(&["HLEN", &key]).as_int(),
+                e["hlen"].as_i64().unwrap(),
+                "{label}"
+            );
+            let fields: Vec<String> = c
+                .cmds(&["HKEYS", &key])
+                .as_array()
+                .iter()
+                .map(reply_text)
+                .collect();
+            let mut args = vec![
+                "HTTL".to_string(),
+                key.clone(),
+                "FIELDS".into(),
+                fields.len().to_string(),
+            ];
+            args.extend(fields.iter().cloned());
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let ttls = c.cmds(&refs);
+            let mut with_ttl: Vec<String> = fields
+                .iter()
+                .zip(ttls.as_array())
+                .filter(|(_, t)| t.as_int() > 0)
+                .map(|(f, _)| f.clone())
+                .collect();
+            with_ttl.sort();
+            assert_eq!(
+                with_ttl,
+                json_strings(&e["with_ttl"]),
+                "{label}: fields with a TTL"
+            );
+            let sample = &e["hget"];
+            let got = reply_text(&c.cmds(&["HGET", &key, sample[0].as_str().unwrap()]));
+            assert_eq!(got, sample[1].as_str().unwrap(), "{label}");
+        } else {
+            assert_eq!(field("type"), "ReJSON-RL", "{label}");
+            let got: serde_json::Value =
+                serde_json::from_str(&reply_text(&c.cmds(&["JSON.GET", &key, "$"]))).unwrap();
+            assert_eq!(got, serde_json::json!([e["json"]]), "{label}");
+        }
+    }
+}

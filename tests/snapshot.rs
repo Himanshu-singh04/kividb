@@ -1655,3 +1655,48 @@ fn rdb_files_written_by_redis_7_4_and_8_10_load() {
         }
     }
 }
+
+// A dump.rdb written by Redis 8.10 (RDB 15) holding a stream with a consumer
+// group and a pending entry (the later entry's sequence below the master's),
+// a second stream, a RedisJSON document and a hash with a field TTL, loads
+// (#39).
+#[test]
+fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
+    let (dbs, _) = kividb::snapshot::load_redis_rdb_from(
+        &include_bytes!("fixtures/redis-8.10-streams-json-ttl.rdb")[..],
+    )
+    .unwrap();
+    let db = &dbs[0];
+    let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["doc2", "h2", "st", "st2"]);
+
+    let KiviDBValue::Stream(st) = &db["st"] else {
+        panic!("st is not a stream");
+    };
+    let st = st.read();
+    assert_eq!(st.entries.len(), 2);
+    let first = st.entries.keys().next().unwrap();
+    assert_eq!((first.ms, first.seq), (1, 1));
+    let group = &st.groups["g"];
+    assert_eq!(group.pel.len(), 1);
+    assert_eq!(group.pel.values().next().unwrap().consumer, "alice");
+    assert!(group.consumers.contains_key("alice"));
+
+    let KiviDBValue::Stream(st2) = &db["st2"] else {
+        panic!("st2 is not a stream");
+    };
+    assert_eq!(st2.read().entries.len(), 1);
+
+    let KiviDBValue::Json(doc) = &db["doc2"] else {
+        panic!("doc2 is not JSON");
+    };
+    assert_eq!(*doc.read(), serde_json::json!({"z": 1}));
+
+    let KiviDBValue::HashEx(h) = &db["h2"] else {
+        panic!("h2 is not a hash with field TTLs");
+    };
+    let h = h.read();
+    assert_eq!(h.fields.get("a").map(|v| &v[..]), Some(&b"b"[..]));
+    assert!(h.expiries.contains_key("a"), "the field's TTL was lost");
+}

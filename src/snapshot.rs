@@ -2009,11 +2009,26 @@ fn rdb_read_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
             let len = ((byte[0] as u64 & 0x3F) << 8) | next[0] as u64;
             Ok((len, false)) // 14-bit length
         }
-        2 => {
-            let mut buf = [0u8; 4];
-            r.read_exact(&mut buf)?;
-            Ok((u32::from_be_bytes(buf) as u64, false)) // 32-bit length (big-endian!)
-        }
+        // RDB_32BITLEN and RDB_64BITLEN, big-endian. Every other 10xxxxxx is
+        // nothing. 0x81 used to be read as a 32-bit length too, so any
+        // length or number past 2^32 (a stream ID's milliseconds, a module
+        // ID) misread the rest of the value (#39).
+        2 => match byte[0] {
+            0x80 => {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf)?;
+                Ok((u32::from_be_bytes(buf) as u64, false))
+            }
+            0x81 => {
+                let mut buf = [0u8; 8];
+                r.read_exact(&mut buf)?;
+                Ok((u64::from_be_bytes(buf), false))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown RDB length encoding {other:#04x}"),
+            )),
+        },
         3 => Ok((byte[0] as u64 & 0x3F, true)), // special encoding
         _ => unreachable!(),
     }
@@ -2428,6 +2443,14 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 set,
             )))))
         }
+        // RDB_TYPE_STREAM_LISTPACKS, _2 (Redis 7.0), _3 (7.2), _4 (8.6) and
+        // _5 (8.10).
+        15 | 19 | 21 | 26 | 27 => rdb_read_stream(r, type_id).map(Some),
+        // RDB_TYPE_HASH_METADATA and RDB_TYPE_HASH_LISTPACK_EX (Redis 7.4+):
+        // hashes whose fields have their own TTLs.
+        24 | 25 => rdb_read_hash_with_ttls(r, type_id).map(Some),
+        // RDB_TYPE_MODULE_2: a module's value. RedisJSON's is read.
+        7 => rdb_read_module_value(r).map(Some),
         unknown => {
             // Unknown type — we can't skip because we don't know the length.
             // Log and return an error. The caller can decide to abort or ignore.
@@ -2437,6 +2460,506 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 format!("unsupported RDB type {unknown}"),
             ))
         }
+    }
+}
+
+fn rdb_invalid(what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("RDB: {what}"))
+}
+
+/// A length as an RDB writes one, not an integer encoding.
+fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
+    match rdb_read_length(r)? {
+        (n, false) => Ok(n),
+        (_, true) => Err(rdb_invalid("an encoded integer where a length belongs")),
+    }
+}
+
+/// A time in milliseconds, as `rdbSaveMillisecondTime` writes it: 8 bytes,
+/// little-endian, signed (-1 for "never").
+fn rdb_read_millisecond_time(r: &mut impl Read) -> io::Result<i64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(i64::from_le_bytes(buf))
+}
+
+/// A stream ID as Redis stores one raw (a radix-tree key, a PEL entry): the
+/// milliseconds and the sequence, 8 bytes each, big-endian.
+fn raw_stream_id(raw: &[u8]) -> Option<crate::types::StreamId> {
+    let raw: &[u8; 16] = raw.try_into().ok()?;
+    Some(crate::types::StreamId {
+        ms: u64::from_be_bytes(raw[..8].try_into().unwrap()),
+        seq: u64::from_be_bytes(raw[8..].try_into().unwrap()),
+    })
+}
+
+fn rdb_read_raw_stream_id(r: &mut impl Read) -> io::Result<crate::types::StreamId> {
+    let mut raw = [0u8; 16];
+    r.read_exact(&mut raw)?;
+    Ok(raw_stream_id(&raw).unwrap())
+}
+
+fn rdb_read_stream_id(r: &mut impl Read) -> io::Result<crate::types::StreamId> {
+    Ok(crate::types::StreamId {
+        ms: rdb_read_plain_length(r)?,
+        seq: rdb_read_plain_length(r)?,
+    })
+}
+
+/// The elements of a listpack, one at a time.
+struct LpCursor<'a>(std::slice::Iter<'a, Vec<u8>>);
+
+impl<'a> LpCursor<'a> {
+    fn bytes(&mut self) -> io::Result<&'a [u8]> {
+        self.0
+            .next()
+            .map(Vec::as_slice)
+            .ok_or_else(|| rdb_invalid("listpack ends too soon"))
+    }
+
+    fn int(&mut self) -> io::Result<i64> {
+        std::str::from_utf8(self.bytes()?)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| rdb_invalid("listpack element is not an integer"))
+    }
+
+    fn count(&mut self) -> io::Result<u64> {
+        u64::try_from(self.int()?).map_err(|_| rdb_invalid("negative count in a listpack"))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+}
+
+/// A stream (`rdbLoadObject`'s stream branch, Redis 5 to 8.10).
+///
+/// Its entries are in listpacks keyed by a master ID. Each listpack opens
+/// with a master entry, `count | deleted | n | field_1 ... field_n | 0`, and
+/// every entry after it is `flags | ms - master ms | seq - master seq` (signed), then
+/// either its values alone (flag SAMEFIELDS: the master's field names) or
+/// `n | field | value ...`, then the number of elements it took (read
+/// right to left). Deleted entries stay in the listpack, flagged.
+///
+/// After the listpacks: the length, the last ID, then (type 19 on) the first
+/// ID, the largest deleted ID and the number of entries ever added. Then the
+/// consumer groups, each with its last-delivered ID, (type 19 on) its
+/// entries read, its pending entries (raw ID, delivery time, count), and its
+/// consumers (name, seen time, (type 21 on) active time, and the IDs of the
+/// pending entries it owns). Type 27 adds, per group, the IDs of the pending
+/// entries `XNACK` released: owned by no consumer, as KiviDB keeps those.
+/// Type 26 on ends with idempotent production: duration, size, and for each
+/// producer its idempotent IDs and the entries they made, then two counters.
+fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
+    use crate::types::{
+        ConsumerGroup, IdmpRecord, PelEntry, ProducerIdmp, StreamEntry, StreamInner,
+    };
+    const DELETED: i64 = 1;
+    const SAMEFIELDS: i64 = 2;
+
+    let mut stream = StreamInner::new();
+    for _ in 0..rdb_read_plain_length(r)? {
+        let master = raw_stream_id(&rdb_read_string(r)?)
+            .ok_or_else(|| rdb_invalid("stream node key is not a stream ID"))?;
+        let elements = lp_elements(&rdb_read_string(r)?)?;
+        let mut lp = LpCursor(elements.iter());
+        let live = lp.count()?;
+        let deleted = lp.count()?;
+        let master_fields: Vec<Arc<[u8]>> = (0..lp.count()?)
+            .map(|_| lp.bytes().map(Arc::from))
+            .collect::<io::Result<_>>()?;
+        if lp.int()? != 0 {
+            return Err(rdb_invalid("stream master entry is not closed by 0"));
+        }
+        let (mut seen_live, mut seen_deleted) = (0u64, 0u64);
+        while !lp.is_empty() {
+            let flags = lp.int()?;
+            // Signed differences: an entry's sequence is often below the
+            // master's (`5-3`, then `6-0`), so `seq - master seq` is negative.
+            let offset =
+                |base: u64, diff: i64| u64::try_from(i128::from(base) + i128::from(diff)).ok();
+            let ms = offset(master.ms, lp.int()?);
+            let seq = offset(master.seq, lp.int()?);
+            let (Some(ms), Some(seq)) = (ms, seq) else {
+                return Err(rdb_invalid("stream entry ID out of range"));
+            };
+            let fields: crate::types::FieldsType = if flags & SAMEFIELDS != 0 {
+                master_fields
+                    .iter()
+                    .map(|field| Ok((Arc::clone(field), Arc::from(lp.bytes()?))))
+                    .collect::<io::Result<_>>()?
+            } else {
+                (0..lp.count()?)
+                    .map(|_| Ok((Arc::from(lp.bytes()?), Arc::from(lp.bytes()?))))
+                    .collect::<io::Result<_>>()?
+            };
+            lp.int()?; // how many elements the entry took
+            if flags & DELETED != 0 {
+                seen_deleted += 1;
+            } else {
+                seen_live += 1;
+                stream
+                    .entries
+                    .insert(crate::types::StreamId { ms, seq }, StreamEntry { fields });
+            }
+        }
+        if (seen_live, seen_deleted) != (live, deleted) {
+            return Err(rdb_invalid(
+                "stream node's entry counts do not match its entries",
+            ));
+        }
+    }
+
+    let length = rdb_read_plain_length(r)?;
+    stream.last_id = rdb_read_stream_id(r)?;
+    if type_id >= 19 {
+        rdb_read_stream_id(r)?; // the first ID: KiviDB has its entries
+        stream.max_deleted_id = rdb_read_stream_id(r)?;
+        stream.entries_added = rdb_read_plain_length(r)?;
+    } else {
+        stream.entries_added = length;
+    }
+    if length != stream.entries.len() as u64 {
+        return Err(rdb_invalid("stream length does not match its entries"));
+    }
+
+    for _ in 0..rdb_read_plain_length(r)? {
+        let name = String::from_utf8(rdb_read_string(r)?)
+            .map_err(|_| rdb_invalid("consumer group name is not UTF-8"))?;
+        let mut group = ConsumerGroup {
+            name: name.clone(),
+            last_id: rdb_read_stream_id(r)?,
+            // A group whose count Redis does not know saves -1, which reads
+            // back as KiviDB's "not known".
+            entries_read: if type_id >= 19 {
+                rdb_read_plain_length(r)?
+            } else {
+                ConsumerGroup::NO_COUNT
+            },
+            pel: Default::default(),
+            consumers: Default::default(),
+            active: Default::default(),
+        };
+        for _ in 0..rdb_read_plain_length(r)? {
+            let id = rdb_read_raw_stream_id(r)?;
+            let delivered_at = rdb_read_millisecond_time(r)?.max(0) as u64;
+            let delivery_count = rdb_read_plain_length(r)?;
+            // Owned by no one until a consumer below claims it.
+            let entry = PelEntry {
+                consumer: String::new(),
+                delivered_at,
+                delivery_count,
+            };
+            if group.pel.insert(id, entry).is_some() {
+                return Err(rdb_invalid("a pending entry is listed twice"));
+            }
+        }
+        for _ in 0..rdb_read_plain_length(r)? {
+            let consumer = String::from_utf8(rdb_read_string(r)?)
+                .map_err(|_| rdb_invalid("consumer name is not UTF-8"))?;
+            let seen = rdb_read_millisecond_time(r)?;
+            let active = if type_id >= 21 {
+                rdb_read_millisecond_time(r)?
+            } else {
+                seen
+            };
+            group.consumers.insert(consumer.clone(), seen.max(0) as u64);
+            // -1: never handed an entry.
+            if active > 0 {
+                group.active.insert(consumer.clone(), active as u64);
+            }
+            for _ in 0..rdb_read_plain_length(r)? {
+                let id = rdb_read_raw_stream_id(r)?;
+                match group.pel.get_mut(&id) {
+                    Some(entry) if entry.consumer.is_empty() => entry.consumer = consumer.clone(),
+                    _ => return Err(rdb_invalid("a consumer owns an entry the group does not")),
+                }
+            }
+        }
+        if type_id >= 27 {
+            for _ in 0..rdb_read_plain_length(r)? {
+                let id = rdb_read_raw_stream_id(r)?;
+                match group.pel.get_mut(&id) {
+                    Some(entry) if entry.consumer.is_empty() => entry.delivered_at = 0,
+                    _ => return Err(rdb_invalid("a released entry is owned or not pending")),
+                }
+            }
+        }
+        stream.groups.insert(name, group);
+    }
+
+    if type_id >= 26 {
+        stream.idmp.duration_secs = Some(rdb_read_plain_length(r)?);
+        stream.idmp.maxsize = Some(rdb_read_plain_length(r)?);
+        for _ in 0..rdb_read_plain_length(r)? {
+            let producer: Arc<[u8]> = Arc::from(rdb_read_string(r)?.as_slice());
+            let mut state = ProducerIdmp::default();
+            for _ in 0..rdb_read_plain_length(r)? {
+                let iid: Arc<[u8]> = Arc::from(rdb_read_string(r)?.as_slice());
+                let entry_id = rdb_read_stream_id(r)?;
+                state.by_iid.insert(Arc::clone(&iid), entry_id.clone());
+                // Redis keeps no time of its own for these: an ID is
+                // forgotten by its entry's milliseconds.
+                let added_ms = entry_id.ms;
+                state.order.push_back(IdmpRecord {
+                    iid,
+                    entry_id,
+                    added_ms,
+                });
+            }
+            if !state.order.is_empty() {
+                stream.idmp.producers.insert(producer, state);
+            }
+        }
+        stream.idmp.iids_added = rdb_read_plain_length(r)?;
+        stream.idmp.iids_duplicates = rdb_read_plain_length(r)?;
+    }
+    Ok(KiviDBValue::Stream(Arc::new(parking_lot::RwLock::new(
+        stream,
+    ))))
+}
+
+/// A hash whose fields have their own TTLs (Redis 7.4+). Both forms open with
+/// the soonest expiry in the hash, in milliseconds.
+///
+/// - Type 24, a hash table: the field count, then for each field its TTL,
+///   its name and its value. A TTL of 0 is none; any other is the expiry
+///   less the soonest one, plus 1.
+/// - Type 25, a listpack of field, value, expiry triples, each expiry in
+///   Unix milliseconds or 0 for none.
+///
+/// Fields already past their time are dropped, as Redis drops them.
+fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
+    let soonest = rdb_read_millisecond_time(r)?;
+    let mut fields: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+    if type_id == 24 {
+        for _ in 0..rdb_read_plain_length(r)? {
+            let ttl = rdb_read_plain_length(r)?;
+            let field = rdb_read_string(r)?;
+            let value = rdb_read_string(r)?;
+            let expires_at = if ttl == 0 {
+                0
+            } else {
+                (ttl - 1)
+                    .checked_add(
+                        u64::try_from(soonest).map_err(|_| rdb_invalid("bad hash expiry"))?,
+                    )
+                    .ok_or_else(|| rdb_invalid("bad hash expiry"))?
+            };
+            fields.push((field, value, expires_at));
+        }
+    } else {
+        let elements = lp_elements(&rdb_read_string(r)?)?;
+        if elements.len() % 3 != 0 {
+            return Err(rdb_invalid(
+                "hash listpack is not field, value, TTL triples",
+            ));
+        }
+        let mut lp = LpCursor(elements.iter());
+        while !lp.is_empty() {
+            let field = lp.bytes()?.to_vec();
+            let value = lp.bytes()?.to_vec();
+            fields.push((field, value, lp.count()?));
+        }
+    }
+
+    let now_ms = unix_ms_now();
+    let now = std::time::Instant::now();
+    let mut inner = crate::types::HashInner::new();
+    for (field, value, expires_at) in fields {
+        if expires_at != 0 && expires_at <= now_ms {
+            continue;
+        }
+        let field = String::from_utf8_lossy(&field).into_owned();
+        if expires_at != 0 {
+            let left = std::time::Duration::from_millis(expires_at - now_ms);
+            inner.expiries.insert(field.clone(), now + left);
+        }
+        inner.fields.insert(field, Arc::from(value.as_slice()));
+    }
+    Ok(KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(
+        inner,
+    ))))
+}
+
+/// The name a module ID carries: 9 characters of 6 bits each, then 10 bits of
+/// encoding version (`moduleTypeEncodeId`).
+fn module_type_name(id: u64) -> (String, u64) {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let name = (0..9)
+        .map(|i| CHARS[((id >> (64 - 6 * (i + 1))) & 63) as usize] as char)
+        .collect();
+    (name, id & 1023)
+}
+
+/// A module's value (`RDB_TYPE_MODULE_2`): the module ID, then what the
+/// module saved, each piece announced by its kind (`RDB_MODULE_OPCODE_*`),
+/// up to an end marker. Only RedisJSON's (`ReJSON-RL`) is read: one string,
+/// the document, in CBOR from encoding version 4 (Redis 8) and as JSON text
+/// before. Other modules' values (time series, Bloom filters, vector sets)
+/// are refused.
+fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
+    let (name, encoding_version) = module_type_name(rdb_read_plain_length(r)?);
+    if name != "ReJSON-RL" {
+        return Err(rdb_invalid(format!(
+            "values of module type {name} are not supported"
+        )));
+    }
+    let mut strings = Vec::new();
+    loop {
+        match rdb_read_plain_length(r)? {
+            0 => break,
+            1 | 2 => {
+                rdb_read_plain_length(r)?;
+            }
+            3 => r.read_exact(&mut [0u8; 4])?,
+            4 => r.read_exact(&mut [0u8; 8])?,
+            5 => strings.push(rdb_read_string(r)?),
+            other => return Err(rdb_invalid(format!("unknown module opcode {other}"))),
+        }
+    }
+    let [document] = strings.as_slice() else {
+        return Err(rdb_invalid("a RedisJSON value is not one string"));
+    };
+    let json = if encoding_version >= 4 {
+        cbor_to_json(document)?
+    } else {
+        serde_json::from_slice(document).map_err(|e| rdb_invalid(format!("RedisJSON: {e}")))?
+    };
+    Ok(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(json))))
+}
+
+/// A CBOR document (RFC 8949) as JSON: what RedisJSON 2.8+ saves. Only what
+/// a JSON document can be is read: integers, floats, text, arrays, maps with
+/// text keys, true, false and null.
+fn cbor_to_json(data: &[u8]) -> io::Result<serde_json::Value> {
+    let mut at = 0;
+    let value = cbor_value(data, &mut at, 0)?;
+    if at != data.len() {
+        return Err(rdb_invalid("bytes after the CBOR document"));
+    }
+    Ok(value)
+}
+
+fn cbor_value(data: &[u8], at: &mut usize, depth: usize) -> io::Result<serde_json::Value> {
+    use serde_json::Value;
+    let bad = || rdb_invalid("malformed CBOR");
+    if depth > 1024 {
+        return Err(rdb_invalid("CBOR nested too deeply"));
+    }
+    let take = |at: &mut usize, n: usize| -> io::Result<&[u8]> {
+        let bytes = data.get(*at..*at + n).ok_or_else(bad)?;
+        *at += n;
+        Ok(bytes)
+    };
+    let head = take(at, 1)?[0];
+    let (major, info) = (head >> 5, head & 31);
+    // The argument: a number, a length, or (major 7) which simple value.
+    let argument = |at: &mut usize| -> io::Result<Option<u64>> {
+        Ok(Some(match info {
+            0..=23 => u64::from(info),
+            24 => u64::from(take(at, 1)?[0]),
+            25 => u64::from(u16::from_be_bytes(take(at, 2)?.try_into().unwrap())),
+            26 => u64::from(u32::from_be_bytes(take(at, 4)?.try_into().unwrap())),
+            27 => u64::from_be_bytes(take(at, 8)?.try_into().unwrap()),
+            31 => return Ok(None), // indefinite length
+            _ => return Err(bad()),
+        }))
+    };
+    let float = |f: f64| {
+        serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .ok_or_else(bad)
+    };
+    match major {
+        0 => Ok(Value::from(argument(at)?.ok_or_else(bad)?)),
+        1 => {
+            let n = argument(at)?.ok_or_else(bad)?;
+            let n = i64::try_from(n).map_err(|_| bad())?;
+            Ok(Value::from(-1 - n))
+        }
+        3 => {
+            let text = match argument(at)? {
+                Some(n) => take(at, usize::try_from(n).map_err(|_| bad())?)?.to_vec(),
+                None => {
+                    let mut text = Vec::new();
+                    while data.get(*at) != Some(&0xFF) {
+                        match cbor_value(data, at, depth + 1)? {
+                            Value::String(s) => text.extend_from_slice(s.as_bytes()),
+                            _ => return Err(bad()),
+                        }
+                    }
+                    *at += 1;
+                    text
+                }
+            };
+            String::from_utf8(text)
+                .map(Value::String)
+                .map_err(|_| bad())
+        }
+        4 => {
+            let mut items = Vec::new();
+            match argument(at)? {
+                Some(n) => {
+                    for _ in 0..n {
+                        items.push(cbor_value(data, at, depth + 1)?);
+                    }
+                }
+                None => {
+                    while data.get(*at) != Some(&0xFF) {
+                        items.push(cbor_value(data, at, depth + 1)?);
+                    }
+                    *at += 1;
+                }
+            }
+            Ok(Value::Array(items))
+        }
+        5 => {
+            let mut map = serde_json::Map::new();
+            let mut entry = |at: &mut usize| -> io::Result<()> {
+                let Value::String(key) = cbor_value(data, at, depth + 1)? else {
+                    return Err(rdb_invalid("CBOR map key is not text"));
+                };
+                let value = cbor_value(data, at, depth + 1)?;
+                map.insert(key, value);
+                Ok(())
+            };
+            match argument(at)? {
+                Some(n) => {
+                    for _ in 0..n {
+                        entry(at)?;
+                    }
+                }
+                None => {
+                    while data.get(*at) != Some(&0xFF) {
+                        entry(at)?;
+                    }
+                    *at += 1;
+                }
+            }
+            Ok(Value::Object(map))
+        }
+        // A tag, such as a date or a big number: the value it tags.
+        6 => {
+            argument(at)?.ok_or_else(bad)?;
+            cbor_value(data, at, depth + 1)
+        }
+        7 => match info {
+            20 => Ok(Value::Bool(false)),
+            21 => Ok(Value::Bool(true)),
+            22 | 23 => Ok(Value::Null),
+            25 => {
+                let bits = u16::from_be_bytes(take(at, 2)?.try_into().unwrap());
+                float(f64::from(crate::commands::json_fpha::f16_bits_to_f32(bits)))
+            }
+            26 => float(f64::from(f32::from_be_bytes(
+                take(at, 4)?.try_into().unwrap(),
+            ))),
+            27 => float(f64::from_be_bytes(take(at, 8)?.try_into().unwrap())),
+            _ => Err(bad()),
+        },
+        _ => Err(rdb_invalid("CBOR byte strings have no JSON form")),
     }
 }
 

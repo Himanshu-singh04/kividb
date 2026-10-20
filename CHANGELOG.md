@@ -30,15 +30,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   which loads a `dump.rdb` at startup and a Redis primary's full sync, read
   most compact encodings under the wrong RDB type numbers, read a list
   node's container after its bytes instead of before, and misread listpack
-  short strings (`"a"` came back as `353`), so a file from Redis 6 or later
-  holding lists, small hashes, small sets or small sorted sets did not load,
-  or loaded wrong. Strings, lists, sets, sorted sets and hashes now load from
-  Redis 6.2 to 8.10, in every encoding those versions write, checked against
-  payloads and `dump.rdb` files captured from real servers; `MIGRATE` from
-  Redis 8.10 moves them, TTLs included. KiviDB's own `DUMP` payloads keep
-  their checksum, so payloads from earlier releases still restore. Streams,
-  hashes with per-field TTLs and module types (JSON, time series) are not
-  read yet and are refused as before.
+  short strings (`"a"` came back as `353`), and read a 64-bit length as a
+  32-bit one, so a file from Redis 6 or later holding lists, small hashes,
+  small sets, small sorted sets or any stream did not load, or loaded wrong;
+  it did not read streams, hashes with per-field TTLs or RedisJSON values at
+  all. Now strings, lists, sets, sorted sets and hashes load from Redis 6.2
+  to 8.10 in every encoding those versions write, and so do streams (every
+  RDB stream type from Redis 6.2 to 8.10, with consumer groups, pending
+  entries, entries released by `XNACK` and idempotent production), hashes
+  whose fields have TTLs (Redis 7.4+; fields already past their time are
+  dropped) and RedisJSON documents (from their CBOR form in Redis 8, and as
+  JSON text before). All of it is checked against payloads and `dump.rdb`
+  files captured from real servers; `MIGRATE` from Redis 8.10 moves them,
+  TTLs included. KiviDB's own `DUMP` payloads keep their checksum, so
+  payloads from earlier releases still restore. Values of other modules
+  (time series, Bloom filters, vector sets) and Redis 8.10's newest types
+  (arrays, template hashes, GCRA) are not read yet, and are refused.
 - **Nothing expires while writes are paused**, as in Redis (#22). During
   `CLIENT PAUSE` (`WRITE` or `ALL`), a slot handoff or a manual failover, a
   key whose time has passed stays where it is: a read takes it as gone, but
