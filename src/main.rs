@@ -26,6 +26,7 @@ pub mod keyspace_events;
 pub mod keyspec;
 pub mod latency;
 pub mod lazyfree;
+pub mod listen;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;
 mod member_set;
@@ -1005,6 +1006,9 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                         }
 
                         let listener = tokio_uring::net::TcpListener::from_std(socket.into());
+                        // `CONFIG SET port` moves it.
+                        let mut listener =
+                            crate::listen::UringListener::new(listener, addr.port(), addr);
                         static READY: std::sync::Once = std::sync::Once::new();
                         READY.call_once(|| log_info!("Ready to accept connections on {addr}"));
 
@@ -1581,6 +1585,8 @@ async fn async_main_tokio(
         Some(l) => l,
         None => bind_listener(addr).await?,
     };
+    // `CONFIG SET port` moves it.
+    let mut listener = crate::listen::Listener::new(listener, addr.port());
     log_info!("Ready to accept connections on {addr}");
 
     #[cfg(feature = "tls")]

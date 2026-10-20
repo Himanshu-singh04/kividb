@@ -13,6 +13,7 @@ pub mod eviction;
 pub mod field_expiry;
 pub mod latency;
 pub mod lazyfree;
+pub mod listen;
 #[cfg(feature = "lua")]
 mod lua_vm_blocking;
 pub mod member_set;
@@ -354,6 +355,7 @@ async fn server_tokio(
         });
     }
 
+    let mut listener = crate::listen::Listener::new(listener, config.port);
     loop {
         let (socket, peer_addr) = match listener.accept().await {
             Ok(v) => v,
