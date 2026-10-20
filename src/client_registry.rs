@@ -45,6 +45,34 @@ pub struct Activity {
     closing_after_reply: std::sync::atomic::AtomicBool,
 }
 
+/// A connection's current RESP query buffer, published without taking the
+/// registry lock. `free` is the spare capacity at the end of the backing Vec.
+#[derive(Debug, Default)]
+pub struct QueryBufferMetrics {
+    /// The high and low halves hold qbuf and qbuf-free. Redis's maximum query
+    /// buffer is below 2 GiB, so each value fits in 32 bits.
+    values: AtomicU64,
+}
+
+impl QueryBufferMetrics {
+    #[inline]
+    pub fn update(&self, len: usize, free: usize, private: bool) {
+        let len = len.min(u32::MAX as usize) as u64;
+        let free = if private {
+            free.min(u32::MAX as usize) as u64
+        } else {
+            0
+        };
+        self.values.store((len << 32) | free, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn values(&self) -> (u64, u64) {
+        let values = self.values.load(Ordering::Relaxed);
+        (values >> 32, values & u32::MAX as u64)
+    }
+}
+
 /// `CLIENT REPLY ON | OFF | SKIP`, as the connection loop keeps it.
 ///
 /// The loop builds one buffer of replies for each batch of commands it
@@ -323,6 +351,7 @@ pub struct ClientInfo {
     pub flags: String,
     pub connected_at: Instant,
     pub activity: Arc<Activity>,
+    pub query_buffer: Arc<QueryBufferMetrics>,
     pub no_evict: bool,
     /// True iff the client has issued ASKING for the next command.
     /// Single-shot: cleared after the next command runs (whatever the result).
@@ -383,6 +412,7 @@ impl ClientInfo {
             flags: "N".to_string(),
             connected_at: Instant::now(),
             activity: Arc::default(),
+            query_buffer: Arc::default(),
             no_evict: false,
             asking: false,
             readonly: false,
@@ -420,11 +450,12 @@ impl ClientInfo {
         }
     }
 
-    /// One line of `CLIENT LIST`, in Redis's layout. The fields that count
-    /// buffers and memory (`qbuf`, `rbs`, `tot-mem`, …) describe how Redis
-    /// holds a connection; nothing here corresponds, and they are zero.
+    /// One line of `CLIENT LIST`, in Redis's layout. Query-buffer counters
+    /// describe RESP bytes awaiting parsing and spare Vec capacity; other
+    /// Redis-specific buffer and memory counters remain zero.
     pub fn to_list_line(&self) -> String {
         let age = self.connected_at.elapsed().as_secs();
+        let (qbuf, qbuf_free) = self.query_buffer.values();
         let mut flags = String::new();
         if self.flags != "N" {
             flags.push_str(&self.flags);
@@ -440,7 +471,7 @@ impl ClientInfo {
         }
         format!(
             "id={} addr={} laddr={} fd=0 name={} age={} idle=0 flags={} db={} sub={} psub={} \
-            ssub={} multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
+            ssub={} multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
             rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} \
             user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0\n",
             self.id,
@@ -453,6 +484,8 @@ impl ClientInfo {
             self.subscriptions[0],
             self.subscriptions[1],
             self.subscriptions[2],
+            qbuf,
+            qbuf_free,
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -585,6 +618,7 @@ impl ClientRegistryInner {
                 flags: c.flags.clone(),
                 connected_at: c.connected_at,
                 activity: Arc::clone(&c.activity),
+                query_buffer: Arc::clone(&c.query_buffer),
                 no_evict: c.no_evict,
                 asking: c.asking,
                 readonly: c.readonly,
@@ -621,6 +655,7 @@ impl ClientRegistryInner {
             flags: c.flags.clone(),
             connected_at: c.connected_at,
             activity: Arc::clone(&c.activity),
+            query_buffer: Arc::clone(&c.query_buffer),
             no_evict: c.no_evict,
             asking: c.asking,
             readonly: c.readonly,

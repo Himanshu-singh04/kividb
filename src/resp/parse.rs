@@ -65,6 +65,20 @@ pub fn parse_resp_command(buf: &[u8]) -> Option<(usize, Vec<&[u8]>)> {
 const LINE_MAX: usize = 64 * 1024;
 /// The longest argument (Redis's `proto-max-bulk-len`).
 const BULK_MAX: i64 = 512 * 1024 * 1024;
+pub const BIG_ARG: usize = 32 * 1024;
+/// Redis allocates at least this much space after a client needs a private
+/// query buffer.
+pub const PRIVATE_QUERY_BUFFER_MIN_CAPACITY: usize = 16 * 1024;
+/// Redis resizes buffers only after they have grown beyond this allocation.
+pub const QUERY_BUFFER_RESIZE_THRESHOLD: usize = 32 * 1024;
+/// Redis only considers query buffers with more than this much spare space.
+pub const QUERY_BUFFER_MIN_SPARE_FOR_RESIZE: usize = 4 * 1024;
+/// Redis's client cron samples query-buffer peaks about ten times per second.
+pub const QUERY_BUFFER_PEAK_SAMPLE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+/// Redis releases or trims an idle private query buffer after this interval.
+#[cfg(test)]
+pub const QUERY_BUFFER_IDLE_RESIZE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 /// The most one request may come to (Redis's `client-query-buffer-limit`).
 const REQUEST_MAX: usize = 1024 * 1024 * 1024;
 /// What a client that has not authenticated may send, as in Redis: a request
@@ -97,14 +111,24 @@ fn parse_integer(bytes: &[u8]) -> Option<i64> {
     Some(if negative { -n } else { n })
 }
 
-fn parse_multibulk(buf: &[u8]) -> Result<Option<Request<'_>>, ProtocolError> {
+fn parse_multibulk<'a>(
+    buf: &'a [u8],
+    progress: Option<&mut Progress>,
+) -> Result<Option<Request<'a>>, ProtocolError> {
+    let mut progress = progress;
     let Some(cr) = memchr::memchr(b'\r', buf) else {
         if buf.len() > LINE_MAX {
             return Err("too big mbulk count string".into());
         }
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.waiting_for(0, 0);
+        }
         return Ok(None);
     };
     if cr + 1 >= buf.len() {
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.waiting_for(0, 0);
+        }
         return Ok(None);
     }
     let count = parse_integer(&buf[1..cr])
@@ -116,13 +140,20 @@ fn parse_multibulk(buf: &[u8]) -> Result<Option<Request<'_>>, ProtocolError> {
         return Ok(Some((idx, Vec::new())));
     }
     let mut parts: Vec<&[u8]> = Vec::with_capacity((count as usize).min(64));
-    for _ in 0..count {
+    for argument in 0..count {
+        let argument_start = idx;
         if idx >= buf.len() {
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.waiting_for(argument_start, count - argument);
+            }
             return Ok(None);
         }
         let Some(cr) = memchr::memchr(b'\r', &buf[idx..]) else {
             if buf.len() - idx > LINE_MAX {
                 return Err("too big bulk count string".into());
+            }
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.waiting_for(argument_start, count - argument);
             }
             return Ok(None);
         };
@@ -136,13 +167,24 @@ fn parse_multibulk(buf: &[u8]) -> Result<Option<Request<'_>>, ProtocolError> {
         }
         let line_end = idx + cr;
         if line_end + 1 >= buf.len() {
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.waiting_for(argument_start, count - argument);
+            }
             return Ok(None);
         }
         let len = parse_integer(&buf[idx + 1..line_end])
             .filter(|len| (0..=BULK_MAX).contains(len))
             .ok_or("invalid bulk length")? as usize;
         idx = line_end + 2;
+        if len >= BIG_ARG
+            && let Some(progress) = progress.as_deref_mut()
+        {
+            progress.large_bulk(len + 2);
+        }
         if idx + len + 2 > buf.len() {
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.waiting_for(argument_start, count - argument);
+            }
             return Ok(None);
         }
         parts.push(&buf[idx..idx + len]);
@@ -155,12 +197,30 @@ fn parse_multibulk(buf: &[u8]) -> Result<Option<Request<'_>>, ProtocolError> {
 pub fn parse_request(buf: &[u8]) -> Result<Option<Request<'_>>, ProtocolError> {
     match buf.first() {
         None => Ok(None),
-        Some(b'*') => parse_multibulk(buf),
+        Some(b'*') => parse_multibulk(buf, None),
         Some(_) => match parse_inline_command(buf) {
             Some(request) => Ok(Some(request)),
             None if buf.len() > LINE_MAX => Err("too big inline request".into()),
             None => Ok(None),
         },
+    }
+}
+
+fn parse_request_with_progress<'a>(
+    buf: &'a [u8],
+    progress: &mut Progress,
+) -> Result<Option<Request<'a>>, ProtocolError> {
+    match buf.first() {
+        None => Ok(None),
+        Some(b'*') => parse_multibulk(buf, Some(progress)),
+        Some(_) => {
+            let request = parse_inline_command(buf);
+            if request.is_none() {
+                progress.waiting = true;
+                progress.private_query_buffer = true;
+            }
+            Ok(request)
+        }
     }
 }
 
@@ -281,6 +341,14 @@ pub struct Progress {
     at: usize,
     /// How many arguments are still to come.
     left: i64,
+    /// Whether an incomplete request has detached this client's buffer from
+    /// the reusable query-buffer path.
+    private_query_buffer: bool,
+    /// Capacity needed for a declared large bulk argument, including its
+    /// trailing CRLF. The caller reserves this before the payload arrives.
+    reserve_hint: usize,
+    /// Largest capacity required by a declared bulk argument while parsing it.
+    minimum_capacity: usize,
 }
 
 impl Progress {
@@ -292,19 +360,81 @@ impl Progress {
         at: usize,
         authenticated: bool,
     ) -> Result<Option<Request<'a>>, ProtocolError> {
-        if buf.get(at) == Some(&b'*') && (self.waiting || !authenticated) {
-            if !self.whole(&buf[at..], authenticated)? {
-                if buf.len() - at > REQUEST_MAX {
-                    return Err("query buffer limit exceeded".into());
+        if buf.get(at) == Some(&b'*') {
+            if self.waiting || !authenticated {
+                if !self.whole(&buf[at..], authenticated)? {
+                    if buf.len() - at > REQUEST_MAX {
+                        return Err("query buffer limit exceeded".into());
+                    }
+                    self.waiting = true;
+                    self.private_query_buffer = true;
+                    return Ok(None);
                 }
-                self.waiting = true;
-                return Ok(None);
+                self.clear_request_scan();
             }
-            *self = Progress::default();
+
+            let request = if authenticated {
+                parse_request_with_progress(&buf[at..], self)?
+            } else {
+                parse_request(&buf[at..])?
+            };
+            if request.is_some() {
+                self.clear_request_scan();
+            }
+            Ok(request)
+        } else {
+            let has_request_bytes = at < buf.len();
+            let request = next_request(buf, at);
+            if matches!(request, Ok(None)) && has_request_bytes {
+                self.waiting = true;
+                self.private_query_buffer = true;
+            } else {
+                self.clear_request_scan();
+            }
+            request
         }
-        let request = next_request(buf, at);
-        self.waiting = matches!(request, Ok(None));
-        request
+    }
+
+    fn waiting_for(&mut self, at: usize, left: i64) {
+        self.waiting = true;
+        self.private_query_buffer = true;
+        self.at = at;
+        self.left = left;
+    }
+
+    fn large_bulk(&mut self, required_capacity: usize) {
+        self.private_query_buffer = true;
+        if required_capacity > self.minimum_capacity {
+            self.reserve_hint = required_capacity;
+            self.minimum_capacity = required_capacity;
+        }
+    }
+
+    fn clear_request_scan(&mut self) {
+        self.waiting = false;
+        self.at = 0;
+        self.left = 0;
+        self.reserve_hint = 0;
+        self.minimum_capacity = 0;
+    }
+
+    #[cfg(test)]
+    fn uses_private_query_buffer(&self) -> bool {
+        self.private_query_buffer
+    }
+
+    pub fn take_private_query_buffer(&mut self) -> bool {
+        std::mem::take(&mut self.private_query_buffer)
+    }
+
+    pub fn take_reserve_hint(&mut self) -> usize {
+        std::mem::take(&mut self.reserve_hint)
+    }
+
+    /// Capacity Redis protects from peak-based shrinking while a bulk is in
+    /// progress. Idle trimming may still release the excess as Redis does.
+    pub fn minimum_capacity(&self) -> usize {
+        self.minimum_capacity
     }
 
     /// Whether `request` may have all arrived. `true` also when something in
@@ -346,6 +476,10 @@ impl Progress {
             if !authenticated && len > UNAUTHENTICATED_BULK_MAX {
                 return Err("unauthenticated bulk length".into());
             }
+            let required_capacity = len as usize + 2;
+            if len as usize >= BIG_ARG {
+                self.large_bulk(required_capacity);
+            }
             let end = self.at + cr + 2 + len as usize + 2;
             if end > request.len() {
                 return Ok(false);
@@ -355,6 +489,83 @@ impl Progress {
         }
         Ok(true)
     }
+}
+
+/// Redis's query-buffer maintenance step. Idle private buffers are released or
+/// trimmed; active oversized buffers are trimmed when their recent peak is
+/// less than half their allocation.
+///
+/// `read_start` marks consumed bytes still preceding the unread query data.
+/// Returns true when the buffer was resized. `private` is cleared only when an
+/// empty buffer is released.
+#[cfg(test)]
+fn resize_private_query_buffer(
+    buffer: &mut Vec<u8>,
+    read_start: usize,
+    private: &mut bool,
+    idle_for: std::time::Duration,
+    recent_peak: usize,
+    minimum_capacity: usize,
+) -> bool {
+    resize_private_query_buffer_after(
+        buffer,
+        read_start,
+        private,
+        idle_for,
+        QUERY_BUFFER_IDLE_RESIZE_AFTER,
+        recent_peak,
+        minimum_capacity,
+    )
+}
+
+pub fn resize_private_query_buffer_after(
+    buffer: &mut Vec<u8>,
+    read_start: usize,
+    private: &mut bool,
+    idle_for: std::time::Duration,
+    idle_resize_after: std::time::Duration,
+    recent_peak: usize,
+    minimum_capacity: usize,
+) -> bool {
+    if !*private
+        || buffer.capacity().saturating_sub(buffer.len()) <= QUERY_BUFFER_MIN_SPARE_FOR_RESIZE
+    {
+        return false;
+    }
+
+    let idle = idle_for > idle_resize_after;
+    let should_trim_for_peak = !idle
+        && buffer.capacity() > QUERY_BUFFER_RESIZE_THRESHOLD
+        && buffer.capacity() / 2 > recent_peak;
+    if !idle && !should_trim_for_peak {
+        return false;
+    }
+
+    let read_start = read_start.min(buffer.len());
+    if read_start > 0 {
+        buffer.drain(..read_start);
+    }
+    if idle && buffer.is_empty() {
+        *buffer = Vec::new();
+        *private = false;
+        return true;
+    }
+
+    // Redis preserves the recent peak, and the current bulk length, while
+    // trimming an active buffer. Idle buffers instead shrink to their current
+    // unread contents.
+    let target_capacity = if idle {
+        buffer.len()
+    } else {
+        buffer.len().max(recent_peak).max(minimum_capacity)
+    };
+    // Rebuild so the consumed prefix is gone and excess capacity is actually
+    // relinquished, even if Vec::shrink_to_fit is a no-op for an allocator's
+    // size class.
+    let mut compacted = Vec::with_capacity(target_capacity);
+    compacted.extend_from_slice(buffer);
+    *buffer = compacted;
+    true
 }
 
 /// The next request in `buf`, from `at` on.
@@ -633,5 +844,147 @@ mod inline_line_ending_tests {
         let mut buf = b"*2\r\n$4\r\nAUTH\r\n$3\r\npwd\r\n".to_vec();
         let mut progress = Progress::default();
         assert!(progress.next_request(&mut buf, 0, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn idle_private_query_buffer_is_released_or_trimmed() {
+        let mut empty = Vec::with_capacity(PRIVATE_QUERY_BUFFER_MIN_CAPACITY);
+        let mut private = true;
+        assert!(!resize_private_query_buffer(
+            &mut empty,
+            0,
+            &mut private,
+            QUERY_BUFFER_IDLE_RESIZE_AFTER,
+            0,
+            0,
+        ));
+        assert!(
+            private,
+            "Redis waits for strictly more than two idle seconds"
+        );
+
+        assert!(resize_private_query_buffer(
+            &mut empty,
+            0,
+            &mut private,
+            QUERY_BUFFER_IDLE_RESIZE_AFTER + std::time::Duration::from_millis(1),
+            0,
+            0,
+        ));
+        assert!(!private);
+        assert_eq!(empty.capacity(), 0);
+
+        let mut partial = Vec::with_capacity(1024 * 1024);
+        partial.extend_from_slice(b"consumed-prefix\r\npartial-request");
+        let read_start = b"consumed-prefix\r\n".len();
+        let mut private = true;
+        let recent_peak = partial.len();
+        assert!(resize_private_query_buffer(
+            &mut partial,
+            read_start,
+            &mut private,
+            QUERY_BUFFER_IDLE_RESIZE_AFTER + std::time::Duration::from_millis(1),
+            recent_peak,
+            0,
+        ));
+        assert!(private, "an incomplete request still owns a private buffer");
+        assert_eq!(partial, b"partial-request");
+        assert!(partial.capacity() < 1024 * 1024);
+        assert!(partial.capacity() - partial.len() <= QUERY_BUFFER_MIN_SPARE_FOR_RESIZE);
+    }
+
+    #[test]
+    fn peak_resize_trims_only_when_recent_peak_is_less_than_half_capacity() {
+        let mut buffer = Vec::with_capacity(256 * 1024);
+        buffer.extend(std::iter::repeat_n(b'x', 8 * 1024));
+        let mut private = true;
+        let original_capacity = buffer.capacity();
+
+        assert!(!resize_private_query_buffer(
+            &mut buffer,
+            0,
+            &mut private,
+            std::time::Duration::from_secs(1),
+            original_capacity / 2,
+            0,
+        ));
+        assert_eq!(buffer.capacity(), original_capacity);
+
+        assert!(resize_private_query_buffer(
+            &mut buffer,
+            0,
+            &mut private,
+            std::time::Duration::from_secs(1),
+            8 * 1024,
+            0,
+        ));
+        assert!(buffer.capacity() < original_capacity);
+        assert!(buffer.capacity() >= buffer.len());
+        assert!(private);
+        assert_eq!(buffer, vec![b'x'; 8 * 1024]);
+    }
+
+    #[test]
+    fn peak_resize_preserves_incomplete_bulk_reservation_and_unread_bytes() {
+        let mut buffer = Vec::with_capacity(256 * 1024);
+        buffer.extend_from_slice(b"consumed-prefix\r\npartial-bulk");
+        let read_start = b"consumed-prefix\r\n".len();
+        let mut private = true;
+
+        assert!(resize_private_query_buffer(
+            &mut buffer,
+            read_start,
+            &mut private,
+            std::time::Duration::from_secs(1),
+            8 * 1024,
+            96 * 1024,
+        ));
+        assert!(buffer.capacity() >= 96 * 1024);
+        assert_eq!(buffer, b"partial-bulk");
+        assert!(private);
+    }
+
+    #[test]
+    fn incomplete_large_bulk_header_is_reserved_only_once() {
+        let mut progress = Progress::default();
+        let mut buffer = b"*3\r\n$3\r\nset\r\n$1\r\na\r\n$1000000\r\n".to_vec();
+
+        assert!(
+            progress
+                .next_request(&mut buffer, 0, true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(progress.take_reserve_hint(), 1_000_002);
+        assert_eq!(progress.minimum_capacity(), 1_000_002);
+
+        // No payload has arrived, so parsing sees the same header again. It
+        // must not ask the caller to reserve that same span again.
+        assert!(
+            progress
+                .next_request(&mut buffer, 0, true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(progress.take_reserve_hint(), 0);
+        assert_eq!(progress.minimum_capacity(), 1_000_002);
+    }
+
+    #[test]
+    fn complete_large_bulk_argument_is_detected_during_parsing() {
+        let mut request = format!("*1\r\n${BIG_ARG}\r\n").into_bytes();
+        request.extend(std::iter::repeat_n(b'x', BIG_ARG));
+        request.extend_from_slice(b"\r\n");
+        let mut progress = Progress::default();
+
+        let (_, args) = progress
+            .next_request(&mut request, 0, true)
+            .unwrap()
+            .expect("complete request");
+
+        assert_eq!(args[0].len(), BIG_ARG);
+        assert!(progress.uses_private_query_buffer());
+        assert_eq!(progress.minimum_capacity(), 0);
+        assert_eq!(progress.take_reserve_hint(), 0);
     }
 }

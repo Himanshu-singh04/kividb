@@ -462,10 +462,14 @@ fn exec_fast_apply_sets(
 /// empty, rather than kept.
 const BIG_BUFFER: usize = 256 * 1024;
 
-/// What a connection's read buffer starts at, and grows by: what the two
-/// buffers it replaces (one to read into, one to parse from) came to.
+/// How much room a read is given at a time. Like Redis's `PROTO_IOBUF_LEN`,
+/// a fresh read asks for a full 32 KiB so a pipelined batch or a large bulk
+/// arrives in as few syscalls as possible; the buffer is only ever reserved
+/// in these units, so this is also the floor a reclaimed buffer returns to.
 const READ_BUFFER: usize = 32 * 1024;
-/// A read is not started with less room than this.
+/// A read is only submitted when the buffer has at least this much spare
+/// capacity left. Below it, another `READ_BUFFER`-sized chunk is reserved
+/// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
 
 #[allow(clippy::too_many_arguments)]
@@ -509,6 +513,7 @@ pub async fn handle_client(
         crate::client_registry::ClientInfo::new(client_id, peer_addr.clone());
     client_info.laddr = format!("{}:{}", config.bind, config.port);
     let activity = Arc::clone(&client_info.activity);
+    let query_buffer = Arc::clone(&client_info.query_buffer);
     // `CLIENT REPLY`.
     let mut reply_gate = crate::client_registry::ReplyGate::default();
     client_registry.register(client_info);
@@ -534,9 +539,13 @@ pub async fn handle_client(
     };
 
     // ── Connection state ─────────────────────────────────────────────────
-    // What the client sends is read straight into the end of `parse_buf`:
-    // there is no buffer in between to copy it out of.
     let mut parse_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER);
+    let mut private_query_buffer = false;
+    let mut last_query_buffer_activity = Instant::now();
+    let query_buffer_idle_resize_after =
+        std::time::Duration::from_millis(config.query_buffer_idle_resize_after_ms);
+    let mut query_buffer_peak = 0usize;
+    query_buffer.update(0, 0, private_query_buffer);
     let mut parse_start = 0usize;
     // How far the request still arriving has been read.
     let mut progress = resp::parse::Progress::default();
@@ -699,19 +708,29 @@ pub async fn handle_client(
     let mut lua_env: Option<crate::lua_vm_blocking::ClientExecEnv> = None;
 
     loop {
+        let was_private_at_read = private_query_buffer;
         // No `kill_rx` check here any more — the watcher task above shuts the
         // socket down, so a kill surfaces as `Ok(0)` from the read below even
         // when the client is idle.
-        // Room for a read of a useful size after whatever is still waiting
-        // to be parsed (the first part of a request that has not all
-        // arrived). The kernel writes into the spare capacity, and the
-        // buffer comes back that much longer.
-        if parse_buf.capacity() - parse_buf.len() < READ_MIN {
+        //
+        // The read is never raced. tokio_uring cannot cancel an in-flight op,
+        // so a losing `select!` arm would leak the buffer it owns until the
+        // kernel completes it (see the note above). Reading straight into
+        // `parse_buf` — the same zero-copy path an ordinary client uses — keeps
+        // the buffer owned by this loop for exactly the duration of the read.
+        // Query-buffer shrinking therefore happens *between* batches: right
+        // after a read completes (the buffer is then owned by this loop, with
+        // no operation in flight), before the next read is submitted. An idle
+        // client whose oversized buffer is not followed by another read keeps
+        // that buffer until the next read opportunity; that is the accepted
+        // io_uring tradeoff for not racing the read (Redis shrinks such buffers
+        // from its client cron instead).
+        if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
             parse_buf.reserve(READ_BUFFER);
         }
         let unparsed = parse_buf.len();
-        let (res, buf) = stream.read(parse_buf.slice(unparsed..)).await;
-        parse_buf = buf.into_inner();
+        let (res, buffer) = stream.read(parse_buf.slice(unparsed..)).await;
+        parse_buf = buffer.into_inner();
 
         let n = match res {
             Ok(0) => break,
@@ -722,10 +741,49 @@ pub async fn handle_client(
                 break;
             }
         };
+        // Between batches, before the activity timestamp is refreshed: if this
+        // client was idle for long enough, reclaim an oversized private buffer
+        // now. No read is in flight, so rebuilding `parse_buf` is safe.
+        //
+        // Only buffers past the resize threshold can be reclaimed, so the
+        // clock is read only for those; an ordinary client — whose buffer is
+        // the small initial one — pays nothing. This keeps `SET`/`GET` at the
+        // floor from a `clock_gettime` on every read.
+        if private_query_buffer
+            && parse_buf.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
+            && parse_buf.capacity().saturating_sub(parse_buf.len())
+                > resp::parse::QUERY_BUFFER_MIN_SPARE_FOR_RESIZE
+        {
+            let resized = resp::parse::resize_private_query_buffer_after(
+                &mut parse_buf,
+                parse_start,
+                &mut private_query_buffer,
+                last_query_buffer_activity.elapsed(),
+                query_buffer_idle_resize_after,
+                query_buffer_peak,
+                progress.minimum_capacity(),
+            );
+            if resized {
+                parse_start = 0;
+            }
+            query_buffer_peak = parse_buf
+                .len()
+                .saturating_sub(parse_start)
+                .max(progress.minimum_capacity());
+        }
+        if was_private_at_read {
+            last_query_buffer_activity = Instant::now();
+        }
         crate::stats::TOTAL_NET_INPUT_BYTES
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
+        query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
         debug_assert_eq!(parse_buf.len(), unparsed + n);
+        query_buffer.update(
+            parse_buf.len().saturating_sub(parse_start),
+            parse_buf.capacity().saturating_sub(parse_buf.len()),
+            private_query_buffer,
+        );
 
         let mut parse_offset = parse_start;
         let mut connection_handoff: Option<ConnectionHandoff> = None;
@@ -736,6 +794,9 @@ pub async fn handle_client(
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
+        let query_buffer_bytes = parse_buf.len();
+        let query_buffer_free = parse_buf.capacity().saturating_sub(parse_buf.len());
+        let was_private_query_buffer = private_query_buffer;
         while let Some((consumed, cmd)) =
             match progress.next_request(&mut parse_buf, parse_offset, authenticated_user.is_some())
             {
@@ -746,10 +807,21 @@ pub async fn handle_client(
                 }
             }
         {
+            private_query_buffer |= progress.take_private_query_buffer();
             if cmd.is_empty() {
                 parse_offset += consumed;
+                query_buffer.update(
+                    query_buffer_bytes.saturating_sub(parse_offset),
+                    query_buffer_free,
+                    private_query_buffer,
+                );
                 continue;
             }
+            query_buffer.update(
+                query_buffer_bytes.saturating_sub(parse_offset + consumed),
+                query_buffer_free,
+                private_query_buffer,
+            );
             // Re-read every command: CONFIG SET appendonly yes must take effect
             // on this connection, not only on ones accepted after the toggle.
             // Tokio's loop already loads AOF_ENABLED per command; this parameter
@@ -2274,6 +2346,23 @@ pub async fn handle_client(
             out_buf.extend_from_slice(&response);
             parse_offset += consumed;
         }
+        private_query_buffer |= progress.take_private_query_buffer();
+        if private_query_buffer && !was_private_query_buffer {
+            last_query_buffer_activity = Instant::now();
+        }
+        let reserve_hint = progress.take_reserve_hint();
+        if private_query_buffer
+            && !was_private_query_buffer
+            && parse_buf.capacity() < resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY
+        {
+            parse_buf.reserve(
+                resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(parse_buf.len()),
+            );
+        }
+        if reserve_hint > parse_buf.capacity() {
+            parse_buf.reserve(reserve_hint.saturating_sub(parse_buf.len()));
+        }
+        query_buffer_peak = query_buffer_peak.max(reserve_hint);
         reply_gate.settle(&mut out_buf);
         crate::tracking::after_command(
             &tracking_table,
@@ -2298,10 +2387,17 @@ pub async fn handle_client(
         if parse_start == parse_buf.len() {
             parse_buf.clear();
             parse_start = 0;
-            // A buffer that grew to hold one large request is not kept at
-            // that size for the life of the connection.
+            // A buffer that grew to hold one large request is given back at the
+            // end of the batch that finished it, rather than kept at that size
+            // for the life of the connection. This is the batch boundary: the
+            // request has been parsed and answered, no read is in flight, and
+            // `parse_buf` is owned by this loop — so rebuilding it cannot
+            // invalidate a pending io_uring operation. It happens here even if
+            // the client then goes idle, which is what the idle-driven resize
+            // above cannot reach: that one only runs after the *next* read.
             if parse_buf.capacity() > BIG_BUFFER {
                 parse_buf = Vec::with_capacity(READ_BUFFER);
+                query_buffer_peak = 0;
             }
         } else if parse_start > 0 && parse_start > parse_buf.len() / 2 {
             let remaining = parse_buf.len() - parse_start;
@@ -2309,6 +2405,11 @@ pub async fn handle_client(
             parse_buf.truncate(remaining);
             parse_start = 0;
         }
+        query_buffer.update(
+            parse_buf.len().saturating_sub(parse_start),
+            parse_buf.capacity().saturating_sub(parse_buf.len()),
+            private_query_buffer,
+        );
 
         // Flush output — swap with spare to avoid malloc/free per write cycle.
         // Pushes are no longer drained here; the forwarder task owns them, so

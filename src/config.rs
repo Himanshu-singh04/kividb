@@ -80,6 +80,11 @@ pub struct Config {
     #[arg(long, default_value_t = 0, value_parser = parse_memory_flag)]
     pub maxmemory: usize,
 
+    /// Idle time before a private client query buffer is released. Hidden so
+    /// integration tests can shorten the maintenance interval deterministically.
+    #[arg(long, default_value_t = 2000, hide = true)]
+    pub query_buffer_idle_resize_after_ms: u64,
+
     /// What to do when `maxmemory` is reached (Redis `maxmemory-policy`):
     ///   noeviction — refuse the write
     ///   allkeys-lru | allkeys-lfu | allkeys-lrm | allkeys-random — delete
@@ -430,6 +435,7 @@ impl Default for Config {
             aof_rewrite_min_size: 64 * 1024 * 1024,
             databases: 16,
             maxmemory: 0,
+            query_buffer_idle_resize_after_ms: 2000,
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,
@@ -538,6 +544,7 @@ impl Config {
             aof_rewrite_min_size: 64 * 1024 * 1024,
             databases: 16,
             maxmemory: 0,
+            query_buffer_idle_resize_after_ms: 2000,
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,

@@ -208,6 +208,7 @@ fn start_server(port: u16) {
             aclfile: "".to_string(),
             slowlog_log_slower_than: 10_000,
             slowlog_max_len: 128,
+            query_buffer_idle_resize_after_ms: 150,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
@@ -996,6 +997,244 @@ fn test_client_info() {
 
     assert!(text.contains("id="));
     assert!(text.contains("addr="));
+    assert!(text.contains("qbuf=0"));
+    assert!(text.contains("qbuf-free="));
+}
+
+fn client_list_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix(name))
+}
+
+#[test]
+fn test_client_list_reports_partial_query_buffer() {
+    let port = free_port();
+    start_server(port);
+    let mut partial = Conn::connect(port);
+    let mut observer = Conn::connect(port);
+    let partial_addr = format!("addr={}", partial.stream.local_addr().unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let idle_line = loop {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains(&partial_addr))
+            .unwrap_or("")
+            .to_string();
+        if client_list_field(&line, "qbuf-free=").is_some() || std::time::Instant::now() >= deadline
+        {
+            break line;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        client_list_field(&idle_line, "qbuf=") == Some("0")
+            && client_list_field(&idle_line, "qbuf-free=") == Some("0"),
+        "idle client should report no private query buffer: {idle_line}"
+    );
+
+    partial.cmds(&["CLIENT", "SETNAME", "partial-query"]);
+
+    // Pipeline one complete command, then leave the next one short of its
+    // terminating CRLF. Only the second request should remain in qbuf.
+    partial
+        .stream
+        .write_all(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING")
+        .unwrap();
+    assert_eq!(partial.read_value().as_str(), "PONG");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let line = loop {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=partial-query"))
+            .unwrap_or("")
+            .to_string();
+        if client_list_field(&line, "qbuf=") == Some("12") || std::time::Instant::now() >= deadline
+        {
+            break line;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        client_list_field(&line, "qbuf=") == Some("12"),
+        "partial query not reflected: {line}"
+    );
+    let qbuf_free = client_list_field(&line, "qbuf-free=")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    assert!(
+        qbuf_free == 16 * 1024 - 12,
+        "expected spare capacity after buffering the 12-byte partial request: {line}"
+    );
+
+    partial.stream.write_all(b"\r\n").unwrap();
+    assert_eq!(partial.read_value().as_str(), "PONG");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let line = loop {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=partial-query"))
+            .unwrap_or("")
+            .to_string();
+        if client_list_field(&line, "qbuf=") == Some("0") || std::time::Instant::now() >= deadline {
+            break line;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        client_list_field(&line, "qbuf=") == Some("0"),
+        "completed query still buffered: {line}"
+    );
+    assert_eq!(
+        client_list_field(&line, "qbuf-free="),
+        Some("16384"),
+        "completed partial query should retain its private query buffer: {line}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let line = loop {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=partial-query"))
+            .unwrap_or("")
+            .to_string();
+        if client_list_field(&line, "qbuf-free=") == Some("0")
+            || std::time::Instant::now() >= deadline
+        {
+            break line;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(client_list_field(&line, "qbuf="), Some("0"), "{line}");
+    assert_eq!(
+        client_list_field(&line, "qbuf-free="),
+        Some("0"),
+        "idle private query buffer was not released: {line}"
+    );
+
+    assert_eq!(partial.cmds(&["PING"]).as_str(), "PONG");
+    let line = observer
+        .cmds(&["CLIENT", "LIST"])
+        .as_str()
+        .lines()
+        .find(|line| line.contains("name=partial-query"))
+        .unwrap_or("")
+        .to_string();
+    assert_eq!(client_list_field(&line, "qbuf="), Some("0"), "{line}");
+    assert_eq!(
+        client_list_field(&line, "qbuf-free="),
+        Some("0"),
+        "a released reusable buffer must not be marked private again: {line}"
+    );
+}
+
+#[test]
+fn test_client_list_reserves_query_buffer_for_declared_large_argument() {
+    let port = free_port();
+    start_server(port);
+    let mut client = Conn::connect(port);
+    let mut observer = Conn::connect(port);
+    client.cmds(&["CLIENT", "SETNAME", "large-query"]);
+
+    // The command is incomplete: only its framing and declared 1 MB bulk
+    // argument length have arrived. Redis reserves private query-buffer space
+    // from that length before receiving the argument body.
+    client
+        .stream
+        .write_all(b"*3\r\n$3\r\nset\r\n$1\r\na\r\n$1000000\r\n")
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let line = loop {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=large-query"))
+            .unwrap_or("")
+            .to_string();
+        let capacity = client_list_field(&line, "qbuf=")
+            .and_then(|qbuf| qbuf.parse::<usize>().ok())
+            .zip(client_list_field(&line, "qbuf-free=").and_then(|free| free.parse::<usize>().ok()))
+            .map(|(qbuf, free)| qbuf + free);
+        if capacity.is_some_and(|capacity| capacity > 1_000_000)
+            || std::time::Instant::now() >= deadline
+        {
+            break line;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(client_list_field(&line, "qbuf="), Some("30"), "{line}");
+    let capacity = client_list_field(&line, "qbuf-free=")
+        .and_then(|free| free.parse::<usize>().ok())
+        .map(|free| free + 30);
+    assert!(
+        capacity.is_some_and(|capacity| capacity > 1_000_000),
+        "declared large argument did not reserve private query-buffer capacity: {line}"
+    );
+
+    client.stream.write_all(b"a").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let line = loop {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=large-query"))
+            .unwrap_or("")
+            .to_string();
+        if client_list_field(&line, "qbuf=") == Some("31") || std::time::Instant::now() >= deadline
+        {
+            break line;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(client_list_field(&line, "qbuf="), Some("31"), "{line}");
+    let capacity = client_list_field(&line, "qbuf-free=")
+        .and_then(|free| free.parse::<usize>().ok())
+        .map(|free| free + 31);
+    assert!(
+        capacity.is_some_and(|capacity| capacity > 1_000_000),
+        "partial large argument lost its reserved query-buffer capacity: {line}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let line = loop {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=large-query"))
+            .unwrap_or("")
+            .to_string();
+        let capacity = client_list_field(&line, "qbuf=")
+            .and_then(|qbuf| qbuf.parse::<usize>().ok())
+            .zip(client_list_field(&line, "qbuf-free=").and_then(|free| free.parse::<usize>().ok()))
+            .map(|(qbuf, free)| qbuf + free);
+        if capacity.is_some_and(|capacity| capacity < 1_000_000)
+            || std::time::Instant::now() >= deadline
+        {
+            break line;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(client_list_field(&line, "qbuf="), Some("31"), "{line}");
+    let capacity = client_list_field(&line, "qbuf-free=")
+        .and_then(|free| free.parse::<usize>().ok())
+        .map(|free| free + 31);
+    assert!(
+        capacity.is_some_and(|capacity| capacity < 1_000_000),
+        "idle partial request retained excess query-buffer capacity: {line}"
+    );
 }
 
 // CLIENT NO-EVICT is accepted
