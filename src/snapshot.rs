@@ -3639,6 +3639,29 @@ mod expiry_section_tests {
         assert!(loaded.expiries[0].is_empty());
     }
 
+    #[test]
+    fn an_expired_hash_drops_its_key_expiry() {
+        let mut hash = crate::types::HashInner::new();
+        hash.fields
+            .insert("field".to_string(), Arc::from(&b"value"[..]));
+        hash.expiries.insert(
+            "field".to_string(),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let db0 = HashMap::from([(
+            "hxgone".to_string(),
+            KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(hash))),
+        )]);
+        let exp = vec![HashMap::from([(
+            "hxgone".to_string(),
+            unix_ms_now() + 60_000,
+        )])];
+
+        let loaded = load_snapshot_from(&image(&[db0], &exp)[..]).unwrap();
+        assert!(!loaded.dbs[0].contains_key("hxgone"));
+        assert!(!loaded.expiries[0].contains_key("hxgone"));
+    }
+
     /// An image with no expiry section — everything written before this
     /// section existed — still loads, with every key permanent as before.
     #[test]
