@@ -7,39 +7,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Nothing expires while writes are paused**, as in Redis (#22). During
-  `CLIENT PAUSE` (`WRITE` or `ALL`), a slot handoff or a manual failover, a
-  key whose time has passed stays where it is: a read takes it as gone, but
-  it is deleted, counted in `expired_keys` and announced (`expired`) only
-  once the pause is over. The background sweeps wait too, so hash fields'
-  `hexpired` events and `expired_subkeys` also come after the pause. Before,
-  reads and the sweeps deleted keys during the pause. Expiries are not replicated (every node expires keys on its own
-  clock), so replication and failover were not affected. `RANDOMKEY` during a
-  pause answers with an expired key, as Redis does, instead of nil.
-- **`expired_keys` in `INFO` is exact.** It was counted per thread in batches
-  of up to 128, so after a few expiries it could still read 0.
-
-### Security
-
-- **The Docker image is distroless.** Its runtime base is
-  `gcr.io/distroless/cc-debian12` (glibc, libgcc, CA certificates, time
-  zones) instead of `debian:bookworm-slim`. Scanners reported 4 critical and
-  62 high CVEs on the 1.1.0 image, all in Debian packages kividb does not use
-  (perl, util-linux, zlib's minizip); the new image has none critical and
-  one high, with no fix released. The server still runs as UID and GID 1000
-  in `/home/kividb`, so existing volumes keep working. **The image no longer
-  has a shell or `redis-cli`**: connect from another container
-  (`docker run --rm -it --network container:<name> redis redis-cli -p 6380`)
-  or with `kubectl debug`.
-- rustls 0.23.45 (GHSA-2mjx-qc3c-rqvc: TLS 1.3 handshake messages accepted
-  across encryption levels) and rand 0.8.6 (GHSA-cq8v-f236-94qc).
-- Every release image is scanned with Trivy before it is published: a
-  critical or high CVE that has a fix stops the release. The published images
-  and `Cargo.lock` are scanned again every week, and the results go to the
-  repository's code scanning alerts. Dependabot proposes new base images.
-
 ### Added
 
 - **VECTOR fields take `TYPE FLOAT64`, `FLOAT16` and `BFLOAT16`.** Only
@@ -53,6 +20,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   new or rebuilt documents.
 
 ### Fixed
+
+- **Data from Redis loads: `RESTORE` of a Redis payload, `MIGRATE` from a
+  Redis server, a Redis `dump.rdb`, and a full sync from a Redis primary**
+  (#39). `RESTORE` refused every payload Redis produces, whatever the type,
+  with `ERR DUMP payload version or checksum are wrong`: KiviDB's CRC64 is
+  not Redis's (its polynomial is written the wrong way round for the
+  reflected loop), so no Redis checksum ever matched. And the RDB reader,
+  which loads a `dump.rdb` at startup and a Redis primary's full sync, read
+  most compact encodings under the wrong RDB type numbers, read a list
+  node's container after its bytes instead of before, and misread listpack
+  short strings (`"a"` came back as `353`), and read a 64-bit length as a
+  32-bit one, so a file from Redis 6 or later holding lists, small hashes,
+  small sets, small sorted sets or any stream did not load, or loaded wrong;
+  it did not read streams, hashes with per-field TTLs or RedisJSON values at
+  all. Now strings, lists, sets, sorted sets and hashes load from Redis 6.2
+  to 8.10 in every encoding those versions write, and so do streams (every
+  RDB stream type from Redis 6.2 to 8.10, with consumer groups, pending
+  entries, entries released by `XNACK` and idempotent production), hashes
+  whose fields have TTLs (Redis 7.4+; fields already past their time are
+  dropped) and RedisJSON documents (from their CBOR form in Redis 8, and as
+  JSON text before). All of it is checked against payloads and `dump.rdb`
+  files captured from real servers; `MIGRATE` from Redis 8.10 moves them,
+  TTLs included. KiviDB's own `DUMP` payloads keep their checksum, so
+  payloads from earlier releases still restore. Values of other modules
+  (time series, Bloom filters, vector sets) and Redis 8.10's newest types
+  (arrays, template hashes, GCRA) are not read yet, and are refused.
+- **Nothing expires while writes are paused**, as in Redis (#22). During
+  `CLIENT PAUSE` (`WRITE` or `ALL`), a slot handoff or a manual failover, a
+  key whose time has passed stays where it is: a read takes it as gone, but
+  it is deleted, counted in `expired_keys` and announced (`expired`) only
+  once the pause is over. The background sweeps wait too, so hash fields'
+  `hexpired` events and `expired_subkeys` also come after the pause. Before,
+  reads and the sweeps deleted keys during the pause. Expiries are not replicated (every node expires keys on its own
+  clock), so replication and failover were not affected. `RANDOMKEY` during a
+  pause answers with an expired key, as Redis does, instead of nil.
+- **`expired_keys` in `INFO` is exact.** It was counted per thread in batches
+  of up to 128, so after a few expiries it could still read 0.
 
 - **A backslash in a TEXT field escapes the next character, as in Redis.**
   `users\.u_1` is the one word `users.u_1`, in a document and in a query, so
@@ -73,6 +77,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   It was empty, and clients that check it before using FT.* refused to
   connect: redisvl 0.4, which LlamaIndex's Redis vector store requires,
   raised `RedisModuleVersionError` on `RedisVectorStore(redis_url=...)`.
+
+### Security
+
+- **The Docker image is distroless.** Its runtime base is
+  `gcr.io/distroless/cc-debian12` (glibc, libgcc, CA certificates, time
+  zones) instead of `debian:bookworm-slim`. Scanners reported 4 critical and
+  62 high CVEs on the 1.1.0 image, all in Debian packages kividb does not use
+  (perl, util-linux, zlib's minizip); the new image has none critical and
+  one high, with no fix released. The server still runs as UID and GID 1000
+  in `/home/kividb`, so existing volumes keep working. **The image no longer
+  has a shell or `redis-cli`**: connect from another container
+  (`docker run --rm -it --network container:<name> redis redis-cli -p 6380`)
+  or with `kubectl debug`.
+- rustls 0.23.45 (GHSA-2mjx-qc3c-rqvc: TLS 1.3 handshake messages accepted
+  across encryption levels) and rand 0.8.6 (GHSA-cq8v-f236-94qc).
+- Every release image is scanned with Trivy before it is published: a
+  critical or high CVE that has a fix stops the release. The published images
+  and `Cargo.lock` are scanned again every week, and the results go to the
+  repository's code scanning alerts. Dependabot proposes new base images.
 
 ## [1.1.0]
 
@@ -974,7 +997,7 @@ model, two resolved spec ambiguities, and known deviations.
   previously fell through to the generic fallback, returned
   `-ERR unknown command`, and left the socket open.
 
-## [Unreleased]
+## Before 1.0.4
 
 ### Added
 

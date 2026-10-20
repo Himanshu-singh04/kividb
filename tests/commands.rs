@@ -1495,3 +1495,487 @@ fn test_sort_get_hash_self_unchanged() {
     let vals: Vec<&str> = r.as_array().iter().map(|v| v.as_str()).collect();
     assert_eq!(vals, vec!["1", "2", "3"]);
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// RESTORE of payloads DUMPed by Redis (#39)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Captured from redis:6.2 (RDB 9), redis:7.0 (RDB 10), redis:7.4 (RDB 12)
+// and redis:8.10 (RDB 15): each type DUMPed in the encodings those versions write for a
+// small value and a large one, with what the value holds. One JSON object a
+// line: redis, rdb, key, type, encoding, hex (the payload), expect.
+fn redis_dump_fixtures() -> Vec<serde_json::Value> {
+    include_str!("fixtures/redis-dump-payloads.jsonl")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn from_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn reply_text(v: &RespValue) -> String {
+    String::from_utf8_lossy(v.as_bytes()).into_owned()
+}
+
+fn json_strings(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect()
+}
+
+// Data moves in from Redis by DUMP/RESTORE (MIGRATE, redis-shake, RIOT): a
+// payload from Redis 6.2, 7.0, 7.4 or 8.10 restores to the same value, whatever
+// its type and encoding.
+#[test]
+fn test_restore_reads_payloads_dumped_by_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let fixtures = redis_dump_fixtures();
+    assert_eq!(fixtures.len(), 56, "4 Redis versions x 14 values");
+    for f in &fixtures {
+        let field = |name: &str| f[name].as_str().unwrap().to_string();
+        let label = format!(
+            "Redis {} {} ({})",
+            field("redis"),
+            field("key"),
+            field("encoding")
+        );
+        let key = format!("{}:{}", field("redis"), field("key"));
+        let payload = from_hex(&field("hex"));
+
+        let reply = c.cmd(&[b"RESTORE", key.as_bytes(), b"0", &payload]);
+        assert!(reply.is_ok(), "{label}: RESTORE gave {reply:?}");
+        assert_eq!(c.cmds(&["TYPE", &key]).as_str(), field("type"), "{label}");
+
+        let e = &f["expect"];
+        if let Some(v) = e.get("get") {
+            assert_eq!(
+                reply_text(&c.cmds(&["GET", &key])),
+                v.as_str().unwrap(),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("get_hex") {
+            assert_eq!(
+                c.cmds(&["GET", &key]).as_bytes(),
+                from_hex(v.as_str().unwrap()),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("lrange") {
+            let got: Vec<String> = c
+                .cmds(&["LRANGE", &key, "0", "-1"])
+                .as_array()
+                .iter()
+                .map(reply_text)
+                .collect();
+            assert_eq!(got, json_strings(v), "{label}");
+        }
+        if let Some(v) = e.get("llen") {
+            assert_eq!(
+                c.cmds(&["LLEN", &key]).as_int(),
+                v.as_i64().unwrap(),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("lindex") {
+            let at = v[0].as_i64().unwrap().to_string();
+            assert_eq!(
+                reply_text(&c.cmds(&["LINDEX", &key, &at])),
+                v[1].as_str().unwrap(),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("lindex_last") {
+            assert_eq!(
+                reply_text(&c.cmds(&["LINDEX", &key, "-1"])),
+                v.as_str().unwrap(),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("smembers") {
+            let mut got: Vec<String> = c
+                .cmds(&["SMEMBERS", &key])
+                .as_array()
+                .iter()
+                .map(reply_text)
+                .collect();
+            let mut want = json_strings(v);
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "{label}");
+        }
+        if let Some(v) = e.get("scard") {
+            assert_eq!(
+                c.cmds(&["SCARD", &key]).as_int(),
+                v.as_i64().unwrap(),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("sismember") {
+            assert_eq!(
+                c.cmds(&["SISMEMBER", &key, v.as_str().unwrap()]).as_int(),
+                1,
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("zrange") {
+            let got: Vec<String> = c
+                .cmds(&["ZRANGE", &key, "0", "-1", "WITHSCORES"])
+                .as_array()
+                .iter()
+                .map(reply_text)
+                .collect();
+            let want: Vec<String> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(json_strings)
+                .collect();
+            assert_eq!(got, want, "{label}");
+        }
+        if let Some(v) = e.get("zcard") {
+            assert_eq!(
+                c.cmds(&["ZCARD", &key]).as_int(),
+                v.as_i64().unwrap(),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("zscore") {
+            let got = reply_text(&c.cmds(&["ZSCORE", &key, v[0].as_str().unwrap()]));
+            assert_eq!(got, v[1].as_str().unwrap(), "{label}");
+        }
+        if let Some(v) = e.get("hgetall") {
+            let flat: Vec<String> = c
+                .cmds(&["HGETALL", &key])
+                .as_array()
+                .iter()
+                .map(reply_text)
+                .collect();
+            let got: std::collections::BTreeMap<String, String> = flat
+                .chunks(2)
+                .map(|pair| (pair[0].clone(), pair[1].clone()))
+                .collect();
+            let want: std::collections::BTreeMap<String, String> = v
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                .collect();
+            assert_eq!(got, want, "{label}");
+        }
+        if let Some(v) = e.get("hlen") {
+            assert_eq!(
+                c.cmds(&["HLEN", &key]).as_int(),
+                v.as_i64().unwrap(),
+                "{label}"
+            );
+        }
+        if let Some(v) = e.get("hget") {
+            let got = reply_text(&c.cmds(&["HGET", &key, v[0].as_str().unwrap()]));
+            assert_eq!(got, v[1].as_str().unwrap(), "{label}");
+        }
+    }
+}
+
+// Redis's checksum, by its published check value.
+#[test]
+fn test_redis_crc64_is_redis_crc64() {
+    assert_eq!(
+        kividb::snapshot::redis_crc64(b"123456789"),
+        0xe9c6d914c4b8d9ca
+    );
+}
+
+// A Redis payload is taken only whole and from an RDB version this reads:
+// one that fails its checksum, comes from a newer version than Redis 8.10's,
+// or holds a type the loader does not know is refused, as Redis refuses it.
+#[test]
+fn test_restore_refuses_redis_payloads_it_cannot_read() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    const REFUSED: &str = "ERR DUMP payload version or checksum are wrong";
+
+    let fixture = redis_dump_fixtures()
+        .into_iter()
+        .find(|f| f["redis"] == "8.10" && f["key"] == "str:raw")
+        .unwrap();
+    let good = from_hex(fixture["hex"].as_str().unwrap());
+    // A payload with its checksum made right for whatever came before it.
+    let resealed = |mut body: Vec<u8>| {
+        let crc = kividb::snapshot::redis_crc64(&body);
+        body.extend_from_slice(&crc.to_le_bytes());
+        body
+    };
+    let refused = |c: &mut Conn, key: &str, payload: &[u8]| {
+        let reply = c.cmd(&[b"RESTORE", key.as_bytes(), b"0", payload]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == REFUSED),
+            "{key}: expected a refusal, got {reply:?}"
+        );
+        assert!(c.cmds(&["EXISTS", key]).as_int() == 0, "{key} was created");
+    };
+
+    let mut corrupt = good.clone();
+    corrupt[3] ^= 0x20;
+    refused(&mut c, "corrupt", &corrupt);
+
+    let mut newer = good[..good.len() - 8].to_vec();
+    let at = newer.len() - 2;
+    newer[at..].copy_from_slice(&16u16.to_le_bytes());
+    refused(&mut c, "newer", &resealed(newer));
+
+    let mut unknown_type = good[..good.len() - 8].to_vec();
+    unknown_type[0] = 200;
+    refused(&mut c, "unknown-type", &resealed(unknown_type));
+
+    // Bytes left over after the value: not one value.
+    let mut trailing = good[..good.len() - 10].to_vec();
+    trailing.push(0);
+    trailing.extend_from_slice(&15u16.to_le_bytes());
+    refused(&mut c, "trailing", &resealed(trailing));
+
+    // The payload itself, for contrast.
+    assert!(c.cmd(&[b"RESTORE", b"good", b"0", &good]).is_ok());
+    assert_eq!(c.cmds(&["GET", "good"]).as_str(), "hello");
+}
+
+// Streams (every RDB stream type from Redis 6.2 to 8.10: consumer groups,
+// pending entries, an idle consumer, a deleted entry, entries with the first
+// entry's fields and with others, a released entry on 8.10, idempotent
+// production on 8.10), hashes whose fields have TTLs (Redis 7.4 and 8.10, in
+// both encodings) and a RedisJSON document (Redis 8.10), captured from real
+// servers with what each server answered about them.
+fn redis_dump_complex_fixtures() -> Vec<serde_json::Value> {
+    include_str!("fixtures/redis-dump-payloads-complex.jsonl")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// A RESP2 reply of field, value pairs, as text.
+fn reply_pairs(v: &RespValue) -> std::collections::BTreeMap<String, String> {
+    v.as_array()
+        .chunks(2)
+        .filter_map(|pair| match &pair[1] {
+            RespValue::Bulk(b) => Some((
+                reply_text(&pair[0]),
+                String::from_utf8_lossy(b).into_owned(),
+            )),
+            RespValue::Int(n) => Some((reply_text(&pair[0]), n.to_string())),
+            RespValue::SimpleStr(s) => Some((reply_text(&pair[0]), s.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_restore_reads_streams_field_ttl_hashes_and_json_dumped_by_redis() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let fixtures = redis_dump_complex_fixtures();
+    assert_eq!(fixtures.len(), 15);
+    for f in &fixtures {
+        let field = |name: &str| f[name].as_str().unwrap().to_string();
+        let label = format!(
+            "Redis {} {} (RDB type {})",
+            field("redis"),
+            field("key"),
+            f["rdb_type"]
+        );
+        let key = format!("{}:{}", field("redis"), field("key"));
+        let payload = from_hex(&field("hex"));
+        let reply = c.cmd(&[b"RESTORE", key.as_bytes(), b"0", &payload]);
+        assert!(reply.is_ok(), "{label}: RESTORE gave {reply:?}");
+        let e = &f["expect"];
+
+        if field("type") == "stream" {
+            let got: Vec<(String, Vec<String>)> = c
+                .cmds(&["XRANGE", &key, "-", "+"])
+                .as_array()
+                .iter()
+                .map(|entry| {
+                    let entry = entry.as_array();
+                    (
+                        reply_text(&entry[0]),
+                        entry[1].as_array().iter().map(reply_text).collect(),
+                    )
+                })
+                .collect();
+            let want: Vec<(String, Vec<String>)> = e["xrange"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry[0].as_str().unwrap().to_string(),
+                        json_strings(&entry[1]),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "{label}: entries");
+
+            let info = reply_pairs(&c.cmds(&["XINFO", "STREAM", &key]));
+            assert_eq!(info["length"], e["length"].to_string(), "{label}");
+            assert_eq!(
+                info["last-generated-id"],
+                e["last_id"].as_str().unwrap(),
+                "{label}"
+            );
+            if let Some(v) = e.get("max_deleted_id") {
+                assert_eq!(info["max-deleted-entry-id"], v.as_str().unwrap(), "{label}");
+                assert_eq!(
+                    info["entries-added"],
+                    e["entries_added"].to_string(),
+                    "{label}"
+                );
+            }
+
+            let groups = c.cmds(&["XINFO", "GROUPS", &key]);
+            let mut got_groups: Vec<std::collections::BTreeMap<String, String>> =
+                groups.as_array().iter().map(reply_pairs).collect();
+            got_groups.sort_by(|a, b| a["name"].cmp(&b["name"]));
+            let want_groups = e["groups"].as_array().unwrap();
+            assert_eq!(got_groups.len(), want_groups.len(), "{label}: groups");
+            for (got, want) in got_groups.iter().zip(want_groups) {
+                let group = want["name"].as_str().unwrap();
+                assert_eq!(got["name"], group, "{label}");
+                assert_eq!(
+                    got["last-delivered-id"],
+                    want["last_id"].as_str().unwrap(),
+                    "{label} {group}"
+                );
+
+                let mut consumers: Vec<String> = c
+                    .cmds(&["XINFO", "CONSUMERS", &key, group])
+                    .as_array()
+                    .iter()
+                    .map(|consumer| reply_pairs(consumer)["name"].clone())
+                    .collect();
+                consumers.sort();
+                assert_eq!(
+                    consumers,
+                    json_strings(&want["consumers"]),
+                    "{label} {group}: consumers"
+                );
+
+                let pending: Vec<(String, String, i64)> = c
+                    .cmds(&["XPENDING", &key, group, "-", "+", "100"])
+                    .as_array()
+                    .iter()
+                    .map(|p| {
+                        let p = p.as_array();
+                        (reply_text(&p[0]), reply_text(&p[1]), p[3].as_int())
+                    })
+                    .collect();
+                let want_pending: Vec<(String, String, i64)> = want["pending"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p[0].as_str().unwrap().into(),
+                            p[1].as_str().unwrap().into(),
+                            p[2].as_i64().unwrap(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(pending, want_pending, "{label} {group}: pending entries");
+            }
+        } else if field("type") == "hash" {
+            assert_eq!(
+                c.cmds(&["HLEN", &key]).as_int(),
+                e["hlen"].as_i64().unwrap(),
+                "{label}"
+            );
+            let fields: Vec<String> = c
+                .cmds(&["HKEYS", &key])
+                .as_array()
+                .iter()
+                .map(reply_text)
+                .collect();
+            let mut args = vec![
+                "HTTL".to_string(),
+                key.clone(),
+                "FIELDS".into(),
+                fields.len().to_string(),
+            ];
+            args.extend(fields.iter().cloned());
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let ttls = c.cmds(&refs);
+            let mut with_ttl: Vec<String> = fields
+                .iter()
+                .zip(ttls.as_array())
+                .filter(|(_, t)| t.as_int() > 0)
+                .map(|(f, _)| f.clone())
+                .collect();
+            with_ttl.sort();
+            assert_eq!(
+                with_ttl,
+                json_strings(&e["with_ttl"]),
+                "{label}: fields with a TTL"
+            );
+            let sample = &e["hget"];
+            let got = reply_text(&c.cmds(&["HGET", &key, sample[0].as_str().unwrap()]));
+            assert_eq!(got, sample[1].as_str().unwrap(), "{label}");
+        } else {
+            assert_eq!(field("type"), "ReJSON-RL", "{label}");
+            let got: serde_json::Value =
+                serde_json::from_str(&reply_text(&c.cmds(&["JSON.GET", &key, "$"]))).unwrap();
+            assert_eq!(got, serde_json::json!([e["json"]]), "{label}");
+        }
+    }
+}
+
+// A stream payload from Redis 5 (RDB type 15) records no group's
+// entries-read: as Redis does, it is estimated from the group's last ID. The
+// payload is the Redis suite's own ("Loading from legacy (Redis <= v6.2.x,
+// rdb_ver < 10) persistence"), DUMPed after XADD 1-0 to 6-0, XDEL 3-0, two
+// groups, XREADGROUP of 4 entries by g1, and XTRIM MAXLEN = 2.
+#[test]
+fn test_restore_estimates_entries_read_for_a_stream_from_redis_5() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let payload = from_hex(&[
+        "0f011000000000000000010000000000000000c3404a4057165700000023000201040101018464617461050001030100",
+        "20010381610204200a0001400a0062600a0002400a0063600a4022018164200a4039200a0065600a0005400a0066200a",
+        "00ff02060002026731050004000000000000000100000000000000003ef783437a010000010000000000000002000000",
+        "00000000003ef783437a01000001000000000000000400000000000000003ef783437a01000001000000000000000500",
+        "000000000000003ef783437a0100000101036331313ef783437a01000004000000000000000100000000000000000000",
+        "000000000002000000000000000000000000000000040000000000000000000000000000000500000000000000000267",
+        "320000000009003d52ef6867521dfa",
+    ]
+    .concat());
+    assert!(c.cmd(&[b"RESTORE", b"x", b"0", &payload]).is_ok());
+
+    let info = reply_pairs(&c.cmds(&["XINFO", "STREAM", "x"]));
+    assert_eq!(info["max-deleted-entry-id"], "0-0");
+    assert_eq!(info["entries-added"], "2");
+    let groups: Vec<std::collections::BTreeMap<String, String>> = c
+        .cmds(&["XINFO", "GROUPS", "x"])
+        .as_array()
+        .iter()
+        .map(reply_pairs)
+        .collect();
+    let group = |name: &str| groups.iter().find(|g| g["name"] == name).unwrap().clone();
+    // g1 was delivered up to 5-0, now the first entry: 2 added - 2 kept + 1.
+    assert_eq!(group("g1")["entries-read"], "1");
+    assert_eq!(group("g1")["lag"], "1");
+    assert_eq!(group("g2")["entries-read"], "0");
+    assert_eq!(group("g2")["lag"], "2");
+}

@@ -1560,3 +1560,143 @@ fn kdb_hashex_already_expired_ttl_is_dropped_on_load() {
         _ => panic!("wrong variant after round-trip"),
     }
 }
+
+// A dump.rdb written by Redis 7.4 (RDB 12) and by Redis 8.10 (RDB 15), by
+// SAVE, loads: its aux fields, a key with a TTL, and the compact encodings
+// those versions write for small strings, lists, sets, sorted sets and
+// hashes, and a large list. Up to 1.1.0 most compact encodings were read
+// under the wrong RDB type numbers, and the listpack decoder misread short
+// strings, so such a file did not load (#39).
+#[test]
+fn rdb_files_written_by_redis_7_4_and_8_10_load() {
+    let files: [(&str, &[u8]); 2] = [
+        ("7.4", include_bytes!("fixtures/redis-7.4.rdb")),
+        ("8.10", include_bytes!("fixtures/redis-8.10.rdb")),
+    ];
+    for (label, bytes) in files {
+        let (dbs, expiries) = kividb::snapshot::load_redis_rdb_from(bytes)
+            .unwrap_or_else(|e| panic!("Redis {label}: {e}"));
+        let db = &dbs[0];
+        let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["h", "l", "lbig", "n", "s", "si", "ss", "ttl", "z"],
+            "Redis {label}"
+        );
+        let string = |key: &str| match &db[key] {
+            KiviDBValue::String(b) => String::from_utf8(b.to_vec()).unwrap(),
+            _ => panic!("Redis {label} {key}: wrong type"),
+        };
+        assert_eq!(string("s"), "hello", "Redis {label}");
+        assert_eq!(string("n"), "42", "Redis {label}");
+        assert_eq!(string("ttl"), "soon", "Redis {label}");
+        assert!(
+            expiries[0].contains_key("ttl"),
+            "Redis {label}: the TTL was lost"
+        );
+        assert!(!expiries[0].contains_key("s"), "Redis {label}");
+
+        let list = |key: &str| match &db[key] {
+            KiviDBValue::List(l) => l
+                .read()
+                .iter()
+                .map(|v| String::from_utf8(v.to_vec()).unwrap())
+                .collect::<Vec<_>>(),
+            _ => panic!("Redis {label} {key}: wrong type"),
+        };
+        assert_eq!(list("l"), ["a", "b", "3"], "Redis {label}");
+        let big = list("lbig");
+        assert_eq!(big.len(), 300, "Redis {label}");
+        assert_eq!(
+            big[0],
+            format!("item-0-{}", "x".repeat(40)),
+            "Redis {label}"
+        );
+        assert_eq!(
+            big[299],
+            format!("item-299-{}", "x".repeat(40)),
+            "Redis {label}"
+        );
+
+        let set = |key: &str| match &db[key] {
+            KiviDBValue::Set(s) => {
+                let mut members: Vec<String> = s
+                    .read()
+                    .iter()
+                    .map(|m| String::from_utf8(m.to_vec()).unwrap())
+                    .collect();
+                members.sort();
+                members
+            }
+            _ => panic!("Redis {label} {key}: wrong type"),
+        };
+        assert_eq!(set("si"), ["1", "2", "3"], "Redis {label}");
+        assert_eq!(set("ss"), ["x", "y"], "Redis {label}");
+
+        match &db["z"] {
+            KiviDBValue::SortedSet(z) => {
+                let z = z.read();
+                let score = |m: &[u8]| z.members.get(m).copied();
+                assert_eq!(score(b"a"), Some(1.0), "Redis {label}");
+                assert_eq!(score(b"b"), Some(2.5), "Redis {label}");
+                assert_eq!(z.members.len(), 2, "Redis {label}");
+            }
+            _ => panic!("Redis {label} z: wrong type"),
+        }
+        match &db["h"] {
+            KiviDBValue::Hash(h) => {
+                let h = h.read();
+                assert_eq!(h.get("f").map(|v| &v[..]), Some(&b"v"[..]), "Redis {label}");
+                assert_eq!(h.get("g").map(|v| &v[..]), Some(&b"7"[..]), "Redis {label}");
+                assert_eq!(h.len(), 2, "Redis {label}");
+            }
+            _ => panic!("Redis {label} h: wrong type"),
+        }
+    }
+}
+
+// A dump.rdb written by Redis 8.10 (RDB 15) holding a stream with a consumer
+// group and a pending entry (the later entry's sequence below the master's),
+// a second stream, a RedisJSON document and a hash with a field TTL, loads
+// (#39).
+#[test]
+fn an_rdb_file_with_streams_json_and_field_ttls_from_redis_8_10_loads() {
+    let (dbs, _) = kividb::snapshot::load_redis_rdb_from(
+        &include_bytes!("fixtures/redis-8.10-streams-json-ttl.rdb")[..],
+    )
+    .unwrap();
+    let db = &dbs[0];
+    let mut keys: Vec<&str> = db.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["doc2", "h2", "st", "st2"]);
+
+    let KiviDBValue::Stream(st) = &db["st"] else {
+        panic!("st is not a stream");
+    };
+    let st = st.read();
+    assert_eq!(st.entries.len(), 2);
+    let first = st.entries.keys().next().unwrap();
+    assert_eq!((first.ms, first.seq), (1, 1));
+    let group = &st.groups["g"];
+    assert_eq!(group.pel.len(), 1);
+    assert_eq!(group.pel.values().next().unwrap().consumer, "alice");
+    assert!(group.consumers.contains_key("alice"));
+
+    let KiviDBValue::Stream(st2) = &db["st2"] else {
+        panic!("st2 is not a stream");
+    };
+    assert_eq!(st2.read().entries.len(), 1);
+
+    let KiviDBValue::Json(doc) = &db["doc2"] else {
+        panic!("doc2 is not JSON");
+    };
+    assert_eq!(*doc.read(), serde_json::json!({"z": 1}));
+
+    let KiviDBValue::HashEx(h) = &db["h2"] else {
+        panic!("h2 is not a hash with field TTLs");
+    };
+    let h = h.read();
+    assert_eq!(h.fields.get("a").map(|v| &v[..]), Some(&b"b"[..]));
+    assert!(h.expiries.contains_key("a"), "the field's TTL was lost");
+}

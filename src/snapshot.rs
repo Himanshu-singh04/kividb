@@ -2009,11 +2009,26 @@ fn rdb_read_length(r: &mut impl Read) -> io::Result<(u64, bool)> {
             let len = ((byte[0] as u64 & 0x3F) << 8) | next[0] as u64;
             Ok((len, false)) // 14-bit length
         }
-        2 => {
-            let mut buf = [0u8; 4];
-            r.read_exact(&mut buf)?;
-            Ok((u32::from_be_bytes(buf) as u64, false)) // 32-bit length (big-endian!)
-        }
+        // RDB_32BITLEN and RDB_64BITLEN, big-endian. Every other 10xxxxxx is
+        // nothing. 0x81 used to be read as a 32-bit length too, so any
+        // length or number past 2^32 (a stream ID's milliseconds, a module
+        // ID) misread the rest of the value (#39).
+        2 => match byte[0] {
+            0x80 => {
+                let mut buf = [0u8; 4];
+                r.read_exact(&mut buf)?;
+                Ok((u32::from_be_bytes(buf) as u64, false))
+            }
+            0x81 => {
+                let mut buf = [0u8; 8];
+                r.read_exact(&mut buf)?;
+                Ok((u64::from_be_bytes(buf), false))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown RDB length encoding {other:#04x}"),
+            )),
+        },
         3 => Ok((byte[0] as u64 & 0x3F, true)), // special encoding
         _ => unreachable!(),
     }
@@ -2273,131 +2288,22 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 parking_lot::RwLock::new(ss),
             ))))
         }
-        6 => {
-            // Ziplist-encoded hash (Redis ≤ 6 compact encoding)
-            let blob = rdb_read_string(r)?;
-            let mut hmap = crate::types::HashFields::default();
-            let mut deque = VecDeque::new();
-            rdb_decode_ziplist_into_list(&blob, &mut deque);
-            // Elements come as field, value, field, value...
-            let mut iter = deque.into_iter();
-            while let (Some(field), Some(val)) = (iter.next(), iter.next()) {
-                let field_str = String::from_utf8_lossy(&field).into_owned();
-                hmap.insert(field_str, val);
-            }
-            Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
-                hmap,
-            )))))
-        }
-
-        9 => {
-            // Ziplist-encoded sorted set (Redis ≤ 6 compact encoding)
-            let blob = rdb_read_string(r)?;
-            let mut ss = SortedSetInner::new();
-            let mut deque = VecDeque::new();
-            rdb_decode_ziplist_into_list(&blob, &mut deque);
-            // Elements come as member, score_string, member, score_string...
-            let mut iter = deque.into_iter();
-            while let (Some(member), Some(score_bytes)) = (iter.next(), iter.next()) {
-                let score: f64 = std::str::from_utf8(&score_bytes)
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0);
-                ss.insert(Arc::from(member.as_ref()), score);
-            }
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
-            ))))
-        }
+        // The numbers are Redis's (`RDB_TYPE_*` in rdb.h). Up to 1.1.0 most
+        // of the compact encodings were filed under the wrong ones, so a
+        // `dump.rdb` or a `DUMP` payload from Redis 6 or 7 holding lists,
+        // small hashes or small sets did not load (#39).
         10 => {
-            // Quicklist (RDB v7+ list encoding) — each node is a ziplist blob
-            // For simplicity: decode each ziplist node
-            let (node_count, _) = rdb_read_length(r)?;
+            // RDB_TYPE_LIST_ZIPLIST (Redis 2.6 to 3.0): one ziplist.
+            let blob = rdb_read_string(r)?;
             let mut deque = VecDeque::new();
-            for _ in 0..node_count {
-                let blob = rdb_read_string(r)?; // raw ziplist bytes
-                rdb_decode_ziplist_into_list(&blob, &mut deque);
-            }
+            rdb_decode_ziplist_into_list(&blob, &mut deque);
             Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
                 deque,
             )))))
         }
         11 => {
-            // Quicklist v2 — node + container type
-            let (node_count, _) = rdb_read_length(r)?;
-            let mut deque = VecDeque::new();
-            for _ in 0..node_count {
-                let blob = rdb_read_string(r)?;
-                let (_container, _) = rdb_read_length(r)?; // 1=plain, 2=ziplist
-                rdb_decode_ziplist_into_list(&blob, &mut deque);
-            }
-            Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
-                deque,
-            )))))
-        }
-        13 => {
-            // Listpack-encoded list (RDB v10+)
-            let blob = rdb_read_string(r)?;
-            let mut deque = VecDeque::new();
-            rdb_decode_listpack_into_list(&blob, &mut deque);
-            Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
-                deque,
-            )))))
-        }
-        14 => {
-            // Listpack-encoded hash
-            let blob = rdb_read_string(r)?;
-            let mut hmap = crate::types::HashFields::default();
-            rdb_decode_listpack_into_hash(&blob, &mut hmap);
-            Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
-                hmap,
-            )))))
-        }
-        17 => {
-            // Listpack-encoded sorted set
-            let blob = rdb_read_string(r)?;
-            let mut ss = SortedSetInner::new();
-            rdb_decode_listpack_into_zset(&blob, &mut ss);
-            Ok(Some(KiviDBValue::SortedSet(Arc::new(
-                parking_lot::RwLock::new(ss),
-            ))))
-        }
-        // Inside rdb_read_value match, add alongside the others:
-        16 => {
-            // Listpack-encoded set (Redis 7.2+)
-            let blob = rdb_read_string(r)?;
-            let mut set = crate::member_set::MemberSet::new();
-            let mut deque = VecDeque::new();
-            rdb_decode_listpack_into_list(&blob, &mut deque);
-            for item in deque {
-                set.insert(item);
-            }
-            Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
-                set,
-            )))))
-        }
-
-        18 => {
-            // Quicklist v2 with listpack nodes (Redis 7.0+)
-            let (node_count, _) = rdb_read_length(r)?;
-            let mut deque = VecDeque::new();
-            for _ in 0..node_count {
-                let blob = rdb_read_string(r)?;
-                let (container, _) = rdb_read_length(r)?;
-                if container == 2 {
-                    rdb_decode_listpack_into_list(&blob, &mut deque);
-                } else {
-                    // plain string node
-                    deque.push_back(Arc::from(blob.as_slice()));
-                }
-            }
-            Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
-                deque,
-            )))))
-        }
-        20 => {
-            // Intset — compact integer-only set
-            // Wire format: a blob containing a header + sorted i64 array
+            // RDB_TYPE_SET_INTSET: a set of integers, one blob of a header
+            // and the sorted values.
             let blob = rdb_read_string(r)?;
             let mut set = crate::member_set::MemberSet::new();
             if blob.len() >= 8 {
@@ -2433,6 +2339,118 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 set,
             )))))
         }
+        12 => {
+            // RDB_TYPE_ZSET_ZIPLIST (Redis up to 6.2): member, score, member,
+            // score..., the scores as text.
+            let blob = rdb_read_string(r)?;
+            let mut ss = SortedSetInner::new();
+            let mut deque = VecDeque::new();
+            rdb_decode_ziplist_into_list(&blob, &mut deque);
+            let mut iter = deque.into_iter();
+            while let (Some(member), Some(score_bytes)) = (iter.next(), iter.next()) {
+                let score: f64 = std::str::from_utf8(&score_bytes)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bad ziplist zset score")
+                    })?;
+                ss.insert(Arc::from(member.as_ref()), score);
+            }
+            Ok(Some(KiviDBValue::SortedSet(Arc::new(
+                parking_lot::RwLock::new(ss),
+            ))))
+        }
+        13 => {
+            // RDB_TYPE_HASH_ZIPLIST (Redis up to 6.2): field, value, ...
+            let blob = rdb_read_string(r)?;
+            let mut hmap = crate::types::HashFields::default();
+            let mut deque = VecDeque::new();
+            rdb_decode_ziplist_into_list(&blob, &mut deque);
+            let mut iter = deque.into_iter();
+            while let (Some(field), Some(val)) = (iter.next(), iter.next()) {
+                let field_str = String::from_utf8_lossy(&field).into_owned();
+                hmap.insert(field_str, val);
+            }
+            Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
+                hmap,
+            )))))
+        }
+        14 => {
+            // RDB_TYPE_LIST_QUICKLIST (Redis 3.2 to 6.2): a count of nodes,
+            // each one ziplist.
+            let (node_count, _) = rdb_read_length(r)?;
+            let mut deque = VecDeque::new();
+            for _ in 0..node_count {
+                let blob = rdb_read_string(r)?;
+                rdb_decode_ziplist_into_list(&blob, &mut deque);
+            }
+            Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
+                deque,
+            )))))
+        }
+        16 => {
+            // RDB_TYPE_HASH_LISTPACK (Redis 7.0+).
+            let blob = rdb_read_string(r)?;
+            let mut hmap = crate::types::HashFields::default();
+            rdb_decode_listpack_into_hash(&blob, &mut hmap)?;
+            Ok(Some(KiviDBValue::Hash(Arc::new(parking_lot::RwLock::new(
+                hmap,
+            )))))
+        }
+        17 => {
+            // RDB_TYPE_ZSET_LISTPACK (Redis 7.0+).
+            let blob = rdb_read_string(r)?;
+            let mut ss = SortedSetInner::new();
+            rdb_decode_listpack_into_zset(&blob, &mut ss)?;
+            Ok(Some(KiviDBValue::SortedSet(Arc::new(
+                parking_lot::RwLock::new(ss),
+            ))))
+        }
+        18 => {
+            // RDB_TYPE_LIST_QUICKLIST_2 (Redis 7.0+): a count of nodes, each
+            // its container (1 a plain element, 2 a listpack) and then its
+            // bytes, in that order.
+            let (node_count, _) = rdb_read_length(r)?;
+            let mut deque = VecDeque::new();
+            for _ in 0..node_count {
+                let (container, _) = rdb_read_length(r)?;
+                let blob = rdb_read_string(r)?;
+                match container {
+                    1 => deque.push_back(Arc::from(blob.as_slice())),
+                    2 => rdb_decode_listpack_into_list(&blob, &mut deque)?,
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unknown quicklist container {other}"),
+                        ));
+                    }
+                }
+            }
+            Ok(Some(KiviDBValue::List(Arc::new(parking_lot::RwLock::new(
+                deque,
+            )))))
+        }
+        20 => {
+            // RDB_TYPE_SET_LISTPACK (Redis 7.2+).
+            let blob = rdb_read_string(r)?;
+            let mut set = crate::member_set::MemberSet::new();
+            let mut deque = VecDeque::new();
+            rdb_decode_listpack_into_list(&blob, &mut deque)?;
+            for item in deque {
+                set.insert(item);
+            }
+            Ok(Some(KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(
+                set,
+            )))))
+        }
+        // RDB_TYPE_STREAM_LISTPACKS, _2 (Redis 7.0), _3 (7.2), _4 (8.6) and
+        // _5 (8.10).
+        15 | 19 | 21 | 26 | 27 => rdb_read_stream(r, type_id).map(Some),
+        // RDB_TYPE_HASH_METADATA and RDB_TYPE_HASH_LISTPACK_EX (Redis 7.4+):
+        // hashes whose fields have their own TTLs.
+        24 | 25 => rdb_read_hash_with_ttls(r, type_id).map(Some),
+        // RDB_TYPE_MODULE_2: a module's value. RedisJSON's is read.
+        7 => rdb_read_module_value(r).map(Some),
         unknown => {
             // Unknown type — we can't skip because we don't know the length.
             // Log and return an error. The caller can decide to abort or ignore.
@@ -2442,6 +2460,536 @@ fn rdb_read_value(r: &mut impl Read, type_id: u8) -> io::Result<Option<KiviDBVal
                 format!("unsupported RDB type {unknown}"),
             ))
         }
+    }
+}
+
+fn rdb_invalid(what: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("RDB: {what}"))
+}
+
+/// A length as an RDB writes one, not an integer encoding.
+fn rdb_read_plain_length(r: &mut impl Read) -> io::Result<u64> {
+    match rdb_read_length(r)? {
+        (n, false) => Ok(n),
+        (_, true) => Err(rdb_invalid("an encoded integer where a length belongs")),
+    }
+}
+
+/// A time in milliseconds, as `rdbSaveMillisecondTime` writes it: 8 bytes,
+/// little-endian, signed (-1 for "never").
+fn rdb_read_millisecond_time(r: &mut impl Read) -> io::Result<i64> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    Ok(i64::from_le_bytes(buf))
+}
+
+/// A stream ID as Redis stores one raw (a radix-tree key, a PEL entry): the
+/// milliseconds and the sequence, 8 bytes each, big-endian.
+fn raw_stream_id(raw: &[u8]) -> Option<crate::types::StreamId> {
+    let raw: &[u8; 16] = raw.try_into().ok()?;
+    Some(crate::types::StreamId {
+        ms: u64::from_be_bytes(raw[..8].try_into().unwrap()),
+        seq: u64::from_be_bytes(raw[8..].try_into().unwrap()),
+    })
+}
+
+fn rdb_read_raw_stream_id(r: &mut impl Read) -> io::Result<crate::types::StreamId> {
+    let mut raw = [0u8; 16];
+    r.read_exact(&mut raw)?;
+    Ok(raw_stream_id(&raw).unwrap())
+}
+
+fn rdb_read_stream_id(r: &mut impl Read) -> io::Result<crate::types::StreamId> {
+    Ok(crate::types::StreamId {
+        ms: rdb_read_plain_length(r)?,
+        seq: rdb_read_plain_length(r)?,
+    })
+}
+
+/// The elements of a listpack, one at a time.
+struct LpCursor<'a>(std::slice::Iter<'a, Vec<u8>>);
+
+impl<'a> LpCursor<'a> {
+    fn bytes(&mut self) -> io::Result<&'a [u8]> {
+        self.0
+            .next()
+            .map(Vec::as_slice)
+            .ok_or_else(|| rdb_invalid("listpack ends too soon"))
+    }
+
+    fn int(&mut self) -> io::Result<i64> {
+        std::str::from_utf8(self.bytes()?)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| rdb_invalid("listpack element is not an integer"))
+    }
+
+    fn count(&mut self) -> io::Result<u64> {
+        u64::try_from(self.int()?).map_err(|_| rdb_invalid("negative count in a listpack"))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+}
+
+/// A stream (`rdbLoadObject`'s stream branch, Redis 5 to 8.10).
+///
+/// Its entries are in listpacks keyed by a master ID. Each listpack opens
+/// with a master entry, `count | deleted | n | field_1 ... field_n | 0`, and
+/// every entry after it is `flags | ms - master ms | seq - master seq` (signed), then
+/// either its values alone (flag SAMEFIELDS: the master's field names) or
+/// `n | field | value ...`, then the number of elements it took (read
+/// right to left). Deleted entries stay in the listpack, flagged.
+///
+/// After the listpacks: the length, the last ID, then (type 19 on) the first
+/// ID, the largest deleted ID and the number of entries ever added. Then the
+/// consumer groups, each with its last-delivered ID, (type 19 on) its
+/// entries read, its pending entries (raw ID, delivery time, count), and its
+/// consumers (name, seen time, (type 21 on) active time, and the IDs of the
+/// pending entries it owns). Type 27 adds, per group, the IDs of the pending
+/// entries `XNACK` released: owned by no consumer, as KiviDB keeps those.
+/// Type 26 on ends with idempotent production: duration, size, and for each
+/// producer its idempotent IDs and the entries they made, then two counters.
+fn rdb_read_stream(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
+    use crate::types::{
+        ConsumerGroup, IdmpRecord, PelEntry, ProducerIdmp, StreamEntry, StreamInner,
+    };
+    const DELETED: i64 = 1;
+    const SAMEFIELDS: i64 = 2;
+
+    let mut stream = StreamInner::new();
+    for _ in 0..rdb_read_plain_length(r)? {
+        let master = raw_stream_id(&rdb_read_string(r)?)
+            .ok_or_else(|| rdb_invalid("stream node key is not a stream ID"))?;
+        let elements = lp_elements(&rdb_read_string(r)?)?;
+        let mut lp = LpCursor(elements.iter());
+        let live = lp.count()?;
+        let deleted = lp.count()?;
+        let master_fields: Vec<Arc<[u8]>> = (0..lp.count()?)
+            .map(|_| lp.bytes().map(Arc::from))
+            .collect::<io::Result<_>>()?;
+        if lp.int()? != 0 {
+            return Err(rdb_invalid("stream master entry is not closed by 0"));
+        }
+        let (mut seen_live, mut seen_deleted) = (0u64, 0u64);
+        while !lp.is_empty() {
+            let flags = lp.int()?;
+            // Signed differences: an entry's sequence is often below the
+            // master's (`5-3`, then `6-0`), so `seq - master seq` is negative.
+            let offset =
+                |base: u64, diff: i64| u64::try_from(i128::from(base) + i128::from(diff)).ok();
+            let ms = offset(master.ms, lp.int()?);
+            let seq = offset(master.seq, lp.int()?);
+            let (Some(ms), Some(seq)) = (ms, seq) else {
+                return Err(rdb_invalid("stream entry ID out of range"));
+            };
+            let fields: crate::types::FieldsType = if flags & SAMEFIELDS != 0 {
+                master_fields
+                    .iter()
+                    .map(|field| Ok((Arc::clone(field), Arc::from(lp.bytes()?))))
+                    .collect::<io::Result<_>>()?
+            } else {
+                (0..lp.count()?)
+                    .map(|_| Ok((Arc::from(lp.bytes()?), Arc::from(lp.bytes()?))))
+                    .collect::<io::Result<_>>()?
+            };
+            lp.int()?; // how many elements the entry took
+            if flags & DELETED != 0 {
+                seen_deleted += 1;
+            } else {
+                seen_live += 1;
+                stream
+                    .entries
+                    .insert(crate::types::StreamId { ms, seq }, StreamEntry { fields });
+            }
+        }
+        if (seen_live, seen_deleted) != (live, deleted) {
+            return Err(rdb_invalid(
+                "stream node's entry counts do not match its entries",
+            ));
+        }
+    }
+
+    let length = rdb_read_plain_length(r)?;
+    stream.last_id = rdb_read_stream_id(r)?;
+    if type_id >= 19 {
+        rdb_read_stream_id(r)?; // the first ID: KiviDB has its entries
+        stream.max_deleted_id = rdb_read_stream_id(r)?;
+        stream.entries_added = rdb_read_plain_length(r)?;
+    } else {
+        stream.entries_added = length;
+    }
+    if length != stream.entries.len() as u64 {
+        return Err(rdb_invalid("stream length does not match its entries"));
+    }
+
+    for _ in 0..rdb_read_plain_length(r)? {
+        let name = String::from_utf8(rdb_read_string(r)?)
+            .map_err(|_| rdb_invalid("consumer group name is not UTF-8"))?;
+        let last_id = rdb_read_stream_id(r)?;
+        let entries_read = if type_id >= 19 {
+            rdb_read_plain_length(r)?
+        } else {
+            estimated_entries_read(&stream, &last_id)
+        };
+        let mut group = ConsumerGroup {
+            name: name.clone(),
+            last_id,
+            // A group whose count Redis does not know saves -1, which reads
+            // back as KiviDB's "not known". Before type 19 there is none, and
+            // Redis estimates it from the group's last ID, as this does.
+            entries_read,
+            pel: Default::default(),
+            consumers: Default::default(),
+            active: Default::default(),
+        };
+        for _ in 0..rdb_read_plain_length(r)? {
+            let id = rdb_read_raw_stream_id(r)?;
+            let delivered_at = rdb_read_millisecond_time(r)?.max(0) as u64;
+            let delivery_count = rdb_read_plain_length(r)?;
+            // Owned by no one until a consumer below claims it.
+            let entry = PelEntry {
+                consumer: String::new(),
+                delivered_at,
+                delivery_count,
+            };
+            if group.pel.insert(id, entry).is_some() {
+                return Err(rdb_invalid("a pending entry is listed twice"));
+            }
+        }
+        for _ in 0..rdb_read_plain_length(r)? {
+            let consumer = String::from_utf8(rdb_read_string(r)?)
+                .map_err(|_| rdb_invalid("consumer name is not UTF-8"))?;
+            let seen = rdb_read_millisecond_time(r)?;
+            let active = if type_id >= 21 {
+                rdb_read_millisecond_time(r)?
+            } else {
+                seen
+            };
+            group.consumers.insert(consumer.clone(), seen.max(0) as u64);
+            // -1: never handed an entry.
+            if active > 0 {
+                group.active.insert(consumer.clone(), active as u64);
+            }
+            for _ in 0..rdb_read_plain_length(r)? {
+                let id = rdb_read_raw_stream_id(r)?;
+                match group.pel.get_mut(&id) {
+                    Some(entry) if entry.consumer.is_empty() => entry.consumer = consumer.clone(),
+                    _ => return Err(rdb_invalid("a consumer owns an entry the group does not")),
+                }
+            }
+        }
+        if type_id >= 27 {
+            for _ in 0..rdb_read_plain_length(r)? {
+                let id = rdb_read_raw_stream_id(r)?;
+                match group.pel.get_mut(&id) {
+                    Some(entry) if entry.consumer.is_empty() => entry.delivered_at = 0,
+                    _ => return Err(rdb_invalid("a released entry is owned or not pending")),
+                }
+            }
+        }
+        stream.groups.insert(name, group);
+    }
+
+    if type_id >= 26 {
+        stream.idmp.duration_secs = Some(rdb_read_plain_length(r)?);
+        stream.idmp.maxsize = Some(rdb_read_plain_length(r)?);
+        for _ in 0..rdb_read_plain_length(r)? {
+            let producer: Arc<[u8]> = Arc::from(rdb_read_string(r)?.as_slice());
+            let mut state = ProducerIdmp::default();
+            for _ in 0..rdb_read_plain_length(r)? {
+                let iid: Arc<[u8]> = Arc::from(rdb_read_string(r)?.as_slice());
+                let entry_id = rdb_read_stream_id(r)?;
+                state.by_iid.insert(Arc::clone(&iid), entry_id.clone());
+                // Redis keeps no time of its own for these: an ID is
+                // forgotten by its entry's milliseconds.
+                let added_ms = entry_id.ms;
+                state.order.push_back(IdmpRecord {
+                    iid,
+                    entry_id,
+                    added_ms,
+                });
+            }
+            if !state.order.is_empty() {
+                stream.idmp.producers.insert(producer, state);
+            }
+        }
+        stream.idmp.iids_added = rdb_read_plain_length(r)?;
+        stream.idmp.iids_duplicates = rdb_read_plain_length(r)?;
+    }
+    Ok(KiviDBValue::Stream(Arc::new(parking_lot::RwLock::new(
+        stream,
+    ))))
+}
+
+/// How many of a stream's entries a group whose last-delivered ID is `id`
+/// has been delivered, for a stream from before RDB type 19, which did not
+/// record it: Redis's `streamEstimateDistanceFromFirstEverEntry`, for a
+/// stream that (from such a file) has no deletions on record.
+fn estimated_entries_read(stream: &crate::types::StreamInner, id: &crate::types::StreamId) -> u64 {
+    use crate::types::ConsumerGroup;
+    let key = |id: &crate::types::StreamId| (id.ms, id.seq);
+    let added = stream.entries_added;
+    let length = stream.entries.len() as u64;
+    if added == 0 {
+        return 0;
+    }
+    let last = key(&stream.last_id);
+    if key(id) > last {
+        return ConsumerGroup::NO_COUNT;
+    }
+    if length == 0 || key(id) == last {
+        return added;
+    }
+    let first = stream.entries.keys().next().map(key).unwrap();
+    match key(id).cmp(&first) {
+        std::cmp::Ordering::Less => added - length,
+        std::cmp::Ordering::Equal => added - length + 1,
+        std::cmp::Ordering::Greater => ConsumerGroup::NO_COUNT,
+    }
+}
+
+/// A hash whose fields have their own TTLs (Redis 7.4+). Both forms open with
+/// the soonest expiry in the hash, in milliseconds.
+///
+/// - Type 24, a hash table: the field count, then for each field its TTL,
+///   its name and its value. A TTL of 0 is none; any other is the expiry
+///   less the soonest one, plus 1.
+/// - Type 25, a listpack of field, value, expiry triples, each expiry in
+///   Unix milliseconds or 0 for none.
+///
+/// Fields already past their time are dropped, as Redis drops them.
+fn rdb_read_hash_with_ttls(r: &mut impl Read, type_id: u8) -> io::Result<KiviDBValue> {
+    let soonest = rdb_read_millisecond_time(r)?;
+    let mut fields: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+    if type_id == 24 {
+        for _ in 0..rdb_read_plain_length(r)? {
+            let ttl = rdb_read_plain_length(r)?;
+            let field = rdb_read_string(r)?;
+            let value = rdb_read_string(r)?;
+            let expires_at = if ttl == 0 {
+                0
+            } else {
+                (ttl - 1)
+                    .checked_add(
+                        u64::try_from(soonest).map_err(|_| rdb_invalid("bad hash expiry"))?,
+                    )
+                    .ok_or_else(|| rdb_invalid("bad hash expiry"))?
+            };
+            fields.push((field, value, expires_at));
+        }
+    } else {
+        let elements = lp_elements(&rdb_read_string(r)?)?;
+        if elements.len() % 3 != 0 {
+            return Err(rdb_invalid(
+                "hash listpack is not field, value, TTL triples",
+            ));
+        }
+        let mut lp = LpCursor(elements.iter());
+        while !lp.is_empty() {
+            let field = lp.bytes()?.to_vec();
+            let value = lp.bytes()?.to_vec();
+            fields.push((field, value, lp.count()?));
+        }
+    }
+
+    let now_ms = unix_ms_now();
+    let now = std::time::Instant::now();
+    let mut inner = crate::types::HashInner::new();
+    for (field, value, expires_at) in fields {
+        if expires_at != 0 && expires_at <= now_ms {
+            continue;
+        }
+        let field = String::from_utf8_lossy(&field).into_owned();
+        if expires_at != 0 {
+            let left = std::time::Duration::from_millis(expires_at - now_ms);
+            inner.expiries.insert(field.clone(), now + left);
+        }
+        inner.fields.insert(field, Arc::from(value.as_slice()));
+    }
+    Ok(KiviDBValue::HashEx(Arc::new(parking_lot::RwLock::new(
+        inner,
+    ))))
+}
+
+/// The name a module ID carries: 9 characters of 6 bits each, then 10 bits of
+/// encoding version (`moduleTypeEncodeId`).
+fn module_type_name(id: u64) -> (String, u64) {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let name = (0..9)
+        .map(|i| CHARS[((id >> (64 - 6 * (i + 1))) & 63) as usize] as char)
+        .collect();
+    (name, id & 1023)
+}
+
+/// A module's value (`RDB_TYPE_MODULE_2`): the module ID, then what the
+/// module saved, each piece announced by its kind (`RDB_MODULE_OPCODE_*`),
+/// up to an end marker. Only RedisJSON's (`ReJSON-RL`) is read: one string,
+/// the document, in CBOR from encoding version 4 (Redis 8) and as JSON text
+/// before. Other modules' values (time series, Bloom filters, vector sets)
+/// are refused.
+fn rdb_read_module_value(r: &mut impl Read) -> io::Result<KiviDBValue> {
+    let (name, encoding_version) = module_type_name(rdb_read_plain_length(r)?);
+    if name != "ReJSON-RL" {
+        return Err(rdb_invalid(format!(
+            "values of module type {name} are not supported"
+        )));
+    }
+    let mut strings = Vec::new();
+    loop {
+        match rdb_read_plain_length(r)? {
+            0 => break,
+            1 | 2 => {
+                rdb_read_plain_length(r)?;
+            }
+            3 => r.read_exact(&mut [0u8; 4])?,
+            4 => r.read_exact(&mut [0u8; 8])?,
+            5 => strings.push(rdb_read_string(r)?),
+            other => return Err(rdb_invalid(format!("unknown module opcode {other}"))),
+        }
+    }
+    let [document] = strings.as_slice() else {
+        return Err(rdb_invalid("a RedisJSON value is not one string"));
+    };
+    let json = if encoding_version >= 4 {
+        cbor_to_json(document)?
+    } else {
+        serde_json::from_slice(document).map_err(|e| rdb_invalid(format!("RedisJSON: {e}")))?
+    };
+    Ok(KiviDBValue::Json(Arc::new(parking_lot::RwLock::new(json))))
+}
+
+/// A CBOR document (RFC 8949) as JSON: what RedisJSON 2.8+ saves. Only what
+/// a JSON document can be is read: integers, floats, text, arrays, maps with
+/// text keys, true, false and null.
+fn cbor_to_json(data: &[u8]) -> io::Result<serde_json::Value> {
+    let mut at = 0;
+    let value = cbor_value(data, &mut at, 0)?;
+    if at != data.len() {
+        return Err(rdb_invalid("bytes after the CBOR document"));
+    }
+    Ok(value)
+}
+
+fn cbor_value(data: &[u8], at: &mut usize, depth: usize) -> io::Result<serde_json::Value> {
+    use serde_json::Value;
+    let bad = || rdb_invalid("malformed CBOR");
+    if depth > 1024 {
+        return Err(rdb_invalid("CBOR nested too deeply"));
+    }
+    let take = |at: &mut usize, n: usize| -> io::Result<&[u8]> {
+        let bytes = data.get(*at..*at + n).ok_or_else(bad)?;
+        *at += n;
+        Ok(bytes)
+    };
+    let head = take(at, 1)?[0];
+    let (major, info) = (head >> 5, head & 31);
+    // The argument: a number, a length, or (major 7) which simple value.
+    let argument = |at: &mut usize| -> io::Result<Option<u64>> {
+        Ok(Some(match info {
+            0..=23 => u64::from(info),
+            24 => u64::from(take(at, 1)?[0]),
+            25 => u64::from(u16::from_be_bytes(take(at, 2)?.try_into().unwrap())),
+            26 => u64::from(u32::from_be_bytes(take(at, 4)?.try_into().unwrap())),
+            27 => u64::from_be_bytes(take(at, 8)?.try_into().unwrap()),
+            31 => return Ok(None), // indefinite length
+            _ => return Err(bad()),
+        }))
+    };
+    let float = |f: f64| {
+        serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .ok_or_else(bad)
+    };
+    match major {
+        0 => Ok(Value::from(argument(at)?.ok_or_else(bad)?)),
+        1 => {
+            let n = argument(at)?.ok_or_else(bad)?;
+            let n = i64::try_from(n).map_err(|_| bad())?;
+            Ok(Value::from(-1 - n))
+        }
+        3 => {
+            let text = match argument(at)? {
+                Some(n) => take(at, usize::try_from(n).map_err(|_| bad())?)?.to_vec(),
+                None => {
+                    let mut text = Vec::new();
+                    while data.get(*at) != Some(&0xFF) {
+                        match cbor_value(data, at, depth + 1)? {
+                            Value::String(s) => text.extend_from_slice(s.as_bytes()),
+                            _ => return Err(bad()),
+                        }
+                    }
+                    *at += 1;
+                    text
+                }
+            };
+            String::from_utf8(text)
+                .map(Value::String)
+                .map_err(|_| bad())
+        }
+        4 => {
+            let mut items = Vec::new();
+            match argument(at)? {
+                Some(n) => {
+                    for _ in 0..n {
+                        items.push(cbor_value(data, at, depth + 1)?);
+                    }
+                }
+                None => {
+                    while data.get(*at) != Some(&0xFF) {
+                        items.push(cbor_value(data, at, depth + 1)?);
+                    }
+                    *at += 1;
+                }
+            }
+            Ok(Value::Array(items))
+        }
+        5 => {
+            let mut map = serde_json::Map::new();
+            let mut entry = |at: &mut usize| -> io::Result<()> {
+                let Value::String(key) = cbor_value(data, at, depth + 1)? else {
+                    return Err(rdb_invalid("CBOR map key is not text"));
+                };
+                let value = cbor_value(data, at, depth + 1)?;
+                map.insert(key, value);
+                Ok(())
+            };
+            match argument(at)? {
+                Some(n) => {
+                    for _ in 0..n {
+                        entry(at)?;
+                    }
+                }
+                None => {
+                    while data.get(*at) != Some(&0xFF) {
+                        entry(at)?;
+                    }
+                    *at += 1;
+                }
+            }
+            Ok(Value::Object(map))
+        }
+        // A tag, such as a date or a big number: the value it tags.
+        6 => {
+            argument(at)?.ok_or_else(bad)?;
+            cbor_value(data, at, depth + 1)
+        }
+        7 => match info {
+            20 => Ok(Value::Bool(false)),
+            21 => Ok(Value::Bool(true)),
+            22 | 23 => Ok(Value::Null),
+            25 => {
+                let bits = u16::from_be_bytes(take(at, 2)?.try_into().unwrap());
+                float(f64::from(crate::commands::json_fpha::f16_bits_to_f32(bits)))
+            }
+            26 => float(f64::from(f32::from_be_bytes(
+                take(at, 4)?.try_into().unwrap(),
+            ))),
+            27 => float(f64::from_be_bytes(take(at, 8)?.try_into().unwrap())),
+            _ => Err(bad()),
+        },
+        _ => Err(rdb_invalid("CBOR byte strings have no JSON form")),
     }
 }
 
@@ -2586,167 +3134,142 @@ fn rdb_decode_ziplist_into_list(blob: &[u8], deque: &mut VecDeque<Arc<[u8]>>) {
     }
 }
 
-/// Read one listpack element from `blob` starting at `pos`.
-/// Returns (bytes_representing_the_value, new_pos_after_backlen).
-/// Returns None when the end marker 0xFF is hit or the blob is exhausted.
-fn lp_read_element(blob: &[u8], pos: usize) -> Option<(Vec<u8>, usize)> {
-    if pos >= blob.len() {
-        return None;
-    }
+fn malformed_listpack() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "malformed listpack")
+}
 
-    let enc = blob[pos];
-
+/// One element of a listpack (Redis's `listpack.c`) at `pos`: its value, an
+/// integer as its decimal text, and where the next element begins, past the
+/// element's back-length. `Ok(None)` at the end marker.
+///
+/// The encodings, by the first byte: `0xxxxxxx` a 7-bit unsigned integer;
+/// `10xxxxxx` a string of up to 63 bytes; `110xxxxx` and one more byte a
+/// 13-bit signed integer; `1110xxxx` and one more byte the length of a
+/// string of up to 4095 bytes; `0xF0` and four bytes the length of a longer
+/// one; `0xF1` to `0xF4` 16-, 24-, 32- and 64-bit signed integers. The
+/// back-length after each element is its length again, 7 bits a byte, so
+/// one to five bytes.
+///
+/// It used to read `10xxxxxx` as a 13-bit integer and every back-length as
+/// one byte, so the string "a" came back as 353 (#39).
+fn lp_read_element(blob: &[u8], pos: usize) -> io::Result<Option<(Vec<u8>, usize)>> {
+    let enc = *blob.get(pos).ok_or_else(malformed_listpack)?;
     if enc == 0xFF {
-        return None; // end marker
+        return Ok(None);
     }
-
-    let (value_bytes, data_end) = if enc & 0x80 == 0 {
-        // 7-bit uint: 0xxxxxxx — value is bottom 7 bits
-        let val = (enc & 0x7F) as i64;
-        (val.to_string().into_bytes(), pos + 1)
-    } else if enc & 0xE0 == 0x80 {
-        // 6-bit string: 10xxxxxx — bottom 6 bits = length
-        // Wait — this conflicts with the 13-bit int. Let me use the
-        // actual Redis listpack spec bit layout:
-        //
-        // 0xxxxxxx           = 7-bit uint
-        // 10xxxxxx xxxxxxxx  = 13-bit signed int
-        // 110xxxxx           = 6-bit string length prefix
-        // 1110xxxx xxxxxxxx  = 16-bit signed
-        // 11110001           = 24-bit signed
-        // 11110010           = 32-bit signed
-        // 11110011           = 64-bit signed
-        // 11111111           = end
-        //
-        // 10xxxxxx: top bit=1, second bit=0 → 13-bit int
-        if pos + 1 >= blob.len() {
-            return None;
-        }
-        let val = (((enc as i16 & 0x1F) << 8) | blob[pos + 1] as i16) as i64;
-        // sign-extend from 13 bits
-        let val = if val & 0x1000 != 0 {
-            val | !0x1FFF
-        } else {
-            val
-        };
-        (val.to_string().into_bytes(), pos + 2)
+    let byte = |i: usize| blob.get(pos + i).copied().ok_or_else(malformed_listpack);
+    let bytes = |from: usize, n: usize| {
+        blob.get(pos + from..pos + from + n)
+            .ok_or_else(malformed_listpack)
+    };
+    let int = |v: i64| v.to_string().into_bytes();
+    let (value, len) = if enc & 0x80 == 0 {
+        (int(i64::from(enc & 0x7F)), 1)
+    } else if enc & 0xC0 == 0x80 {
+        let n = usize::from(enc & 0x3F);
+        (bytes(1, n)?.to_vec(), 1 + n)
     } else if enc & 0xE0 == 0xC0 {
-        // 6-bit string length: 110xxxxx
-        let slen = (enc & 0x3F) as usize;
-        let start = pos + 1;
-        let end = start + slen;
-        if end > blob.len() {
-            return None;
-        }
-        (blob[start..end].to_vec(), end)
+        let raw = (i64::from(enc & 0x1F) << 8) | i64::from(byte(1)?);
+        (int(if raw & 0x1000 != 0 { raw - 0x2000 } else { raw }), 2)
     } else if enc & 0xF0 == 0xE0 {
-        // 16-bit signed int: 1110xxxx xxxxxxxx
-        if pos + 2 > blob.len() {
-            return None;
-        }
-        let val = i16::from_le_bytes([blob[pos + 1], blob[pos + 2]]) as i64;
-        (val.to_string().into_bytes(), pos + 3)
+        let n = (usize::from(enc & 0x0F) << 8) | usize::from(byte(1)?);
+        (bytes(2, n)?.to_vec(), 2 + n)
     } else {
-        // 0xF0 family — check the exact byte
         match enc {
-            0xF1 => {
-                // 24-bit signed
-                if pos + 3 > blob.len() {
-                    return None;
-                }
-                let raw = (blob[pos + 1] as i32)
-                    | ((blob[pos + 2] as i32) << 8)
-                    | ((blob[pos + 3] as i32) << 16);
-                let val = if raw & 0x800000 != 0 {
-                    raw | !0xFFFFFF
-                } else {
-                    raw
-                };
-                (val.to_string().into_bytes(), pos + 4)
+            0xF0 => {
+                let n = u32::from_le_bytes(bytes(1, 4)?.try_into().unwrap()) as usize;
+                (bytes(5, n)?.to_vec(), 5 + n)
             }
+            0xF1 => (
+                int(i16::from_le_bytes(bytes(1, 2)?.try_into().unwrap()).into()),
+                3,
+            ),
+            // 24 bits, sign-extended by shifting them to the top and back.
             0xF2 => {
-                // 32-bit signed
-                if pos + 4 > blob.len() {
-                    return None;
-                }
-                let val = i32::from_le_bytes([
-                    blob[pos + 1],
-                    blob[pos + 2],
-                    blob[pos + 3],
-                    blob[pos + 4],
-                ]) as i64;
-                (val.to_string().into_bytes(), pos + 5)
+                let b = bytes(1, 3)?;
+                let v = i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8;
+                (int(v.into()), 4)
             }
-            0xF3 => {
-                // 64-bit signed
-                if pos + 8 > blob.len() {
-                    return None;
-                }
-                let val = i64::from_le_bytes(blob[pos + 1..pos + 9].try_into().ok()?);
-                (val.to_string().into_bytes(), pos + 9)
-            }
-            _ => return None, // unknown, bail
+            0xF3 => (
+                int(i32::from_le_bytes(bytes(1, 4)?.try_into().unwrap()).into()),
+                5,
+            ),
+            0xF4 => (int(i64::from_le_bytes(bytes(1, 8)?.try_into().unwrap())), 9),
+            _ => return Err(malformed_listpack()),
         }
     };
-
-    // Skip the backlen byte (1 byte at data_end)
-    let next_pos = data_end + 1;
-    Some((value_bytes, next_pos))
+    let backlen = match len {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        2_097_152..=268_435_455 => 4,
+        _ => 5,
+    };
+    let next = pos + len + backlen;
+    if next > blob.len() {
+        return Err(malformed_listpack());
+    }
+    Ok(Some((value, next)))
 }
 
-fn rdb_decode_listpack_into_list(blob: &[u8], deque: &mut VecDeque<Arc<[u8]>>) {
-    // Skip header: total_bytes (u32) + num_elements (u16) = 6 bytes
-    if blob.len() < 7 {
-        return;
-    }
+/// Every element of a listpack, in order. An error unless the elements run
+/// exactly to its end marker, its last byte.
+fn lp_elements(blob: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    // The header: total bytes (u32) and element count (u16).
     let mut pos = 6usize;
-
-    while let Some((val, next)) = lp_read_element(blob, pos) {
-        deque.push_back(Arc::from(val.as_slice()));
+    if blob.len() < pos + 1 {
+        return Err(malformed_listpack());
+    }
+    let mut out = Vec::new();
+    while let Some((value, next)) = lp_read_element(blob, pos)? {
+        out.push(value);
         pos = next;
     }
+    if pos + 1 != blob.len() {
+        return Err(malformed_listpack());
+    }
+    Ok(out)
 }
 
-fn rdb_decode_listpack_into_hash(blob: &[u8], hmap: &mut crate::types::HashFields) {
-    if blob.len() < 7 {
-        return;
+fn rdb_decode_listpack_into_list(blob: &[u8], deque: &mut VecDeque<Arc<[u8]>>) -> io::Result<()> {
+    for value in lp_elements(blob)? {
+        deque.push_back(Arc::from(value.as_slice()));
     }
-    let mut pos = 6usize;
-
-    while let Some(v) = lp_read_element(blob, pos) {
-        let (field_bytes, next) = v;
-        let (val_bytes, next2) = match lp_read_element(blob, next) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let field = String::from_utf8_lossy(&field_bytes).into_owned();
-        hmap.insert(field, Arc::from(val_bytes.as_slice()));
-        pos = next2;
-    }
+    Ok(())
 }
 
-fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) {
-    if blob.len() < 7 {
-        return;
+/// field, value, field, value...
+fn rdb_decode_listpack_into_hash(
+    blob: &[u8],
+    hmap: &mut crate::types::HashFields,
+) -> io::Result<()> {
+    let elements = lp_elements(blob)?;
+    if elements.len() % 2 != 0 {
+        return Err(malformed_listpack());
     }
-    let mut pos = 6usize;
+    let mut iter = elements.into_iter();
+    while let (Some(field), Some(value)) = (iter.next(), iter.next()) {
+        let field = String::from_utf8_lossy(&field).into_owned();
+        hmap.insert(field, Arc::from(value.as_slice()));
+    }
+    Ok(())
+}
 
-    while let Some(v) = lp_read_element(blob, pos) {
-        let (member_bytes, next) = v;
-        let (score_bytes, next2) = match lp_read_element(blob, next) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let score: f64 = std::str::from_utf8(&score_bytes)
+/// member, score, member, score..., a score as an integer or as text.
+fn rdb_decode_listpack_into_zset(blob: &[u8], ss: &mut SortedSetInner) -> io::Result<()> {
+    let elements = lp_elements(blob)?;
+    if elements.len() % 2 != 0 {
+        return Err(malformed_listpack());
+    }
+    let mut iter = elements.into_iter();
+    while let (Some(member), Some(score)) = (iter.next(), iter.next()) {
+        let score: f64 = std::str::from_utf8(&score)
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-
-        ss.insert(Arc::from(member_bytes.as_slice()), score);
-        pos = next2;
+            .ok_or_else(malformed_listpack)?;
+        ss.insert(Arc::from(member.as_slice()), score);
     }
+    Ok(())
 }
 
 /// Load a snapshot and populate the store directly.
@@ -3059,8 +3582,19 @@ pub fn dump_payload(value: &KiviDBValue) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The newest RDB version whose `DUMP` payloads `RESTORE` reads: the one
+/// Redis 8.10 writes. Redis refuses a payload from a newer version than its
+/// own, as this does, since a newer one may hold encodings it cannot read.
+const REDIS_DUMP_VERSION_MAX: u16 = 15;
+
 /// Parse a `DUMP` payload back into a value. `None` if the payload is
 /// truncated, fails its checksum, or does not decode.
+///
+/// Two kinds are read: KiviDB's own, and Redis's, so that data can be moved
+/// in from Redis with `DUMP`/`RESTORE` or `MIGRATE` (and the tools built on
+/// them). Their checksums tell them apart: KiviDB's covers the value, Redis's
+/// the value and the 2-byte version after it. The version alone would not:
+/// Redis 7.0 writes RDB version 10, the number KiviDB's payloads carry.
 ///
 /// The checksum is verified. It used to be stripped unread, so a payload
 /// corrupted in transit — or simply wrong — was handed to the decoder as-is.
@@ -3069,9 +3603,49 @@ pub fn restore_payload(payload: &[u8]) -> Option<KiviDBValue> {
         return None;
     }
     let (data, trailer) = payload.split_at(payload.len() - 10);
-    if trailer[..2] != DUMP_VERSION || crc64_digest(data).to_le_bytes() != trailer[2..] {
-        return None;
+    if trailer[..2] == DUMP_VERSION && crc64_digest(data).to_le_bytes() == trailer[2..] {
+        return restore_kividb_payload(data);
     }
+    let (versioned, crc) = payload.split_at(payload.len() - 8);
+    let version = u16::from_le_bytes([trailer[0], trailer[1]]);
+    if version <= REDIS_DUMP_VERSION_MAX && redis_crc64(versioned).to_le_bytes() == crc {
+        return restore_redis_payload(data);
+    }
+    None
+}
+
+/// Redis's CRC64, which seals the `DUMP` payloads Redis writes (`crc64.c`:
+/// the Jones polynomial, reflected, from 0, with no final XOR). Its check
+/// value, the sum of `123456789`, is `0xe9c6d914c4b8d9ca`.
+pub fn redis_crc64(data: &[u8]) -> u64 {
+    // The Jones polynomial 0xad93d23594c935a9, bit-reversed for the
+    // least-significant-bit-first loop.
+    const POLY: u64 = 0x95ac_9329_ac4b_c9b5;
+    let mut crc: u64 = 0;
+    for &byte in data {
+        crc ^= u64::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// A value as Redis's `DUMP` serialises it: its RDB type, then the value in
+/// the RDB encoding of that type, which the `dump.rdb` loader reads. Every
+/// byte must belong to the value.
+fn restore_redis_payload(data: &[u8]) -> Option<KiviDBValue> {
+    let (&type_id, mut rest) = data.split_first()?;
+    let value = rdb_read_value(&mut rest, type_id).ok()??;
+    rest.is_empty().then_some(value)
+}
+
+/// A value as KiviDB's own `DUMP` serialises it.
+fn restore_kividb_payload(data: &[u8]) -> Option<KiviDBValue> {
     if data.starts_with(KDB_MAGIC) {
         load_snapshot_from(data)
             .ok()?
@@ -3367,7 +3941,13 @@ fn read_bytes_slice(data: &[u8], pos: usize) -> Option<(&[u8], usize)> {
     Some((&data[start..end], end))
 }
 
-/// CRC64 (ECMA-182 polynomial) — matches Redis's checksum for DUMP/RESTORE.
+/// The checksum that seals KiviDB's own `DUMP` and `FUNCTION DUMP` payloads.
+///
+/// It is not Redis's CRC64, though it was meant to be: it runs the reflected
+/// (least-significant-bit-first) loop with the Jones polynomial written the
+/// other way round, so its sums never matched Redis's. It stays as it is,
+/// since payloads written by earlier releases carry it. Redis's own payloads
+/// are checked with [`redis_crc64`].
 pub fn crc64_digest(data: &[u8]) -> u64 {
     // Polynomial: 0xad93d23594c935a9 (ECMA-182)
     const POLY: u64 = 0xad93d23594c935a9;
