@@ -746,15 +746,91 @@ fn delex_without_a_condition_deletes_any_type() {
     assert_eq!(c.cmd(&["DELEX", "dx:s", "IFNE", "other"]).i(), 1);
     assert_eq!(c.cmd(&["DELEX", "dx:missing", "IFEQ", "v"]).i(), 0);
 
-    // A condition needs a string.
+    // A condition needs a string, and the errors are Redis 8.10's.
     c.cmd(&["RPUSH", "dx:list", "a"]);
-    assert!(
-        c.cmd(&["DELEX", "dx:list", "IFEQ", "a"])
-            .s()
-            .starts_with("WRONGTYPE")
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:list", "IFEQ", "a"]),
+        V::Err("ERR Key should be of string type if conditions are specified".into())
     );
-    assert!(c.cmd(&["DELEX", "dx:list", "IFEQ"]).is_err());
-    assert!(c.cmd(&["DELEX", "dx:list", "MAYBE", "a"]).is_err());
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:list", "IFEQ"]),
+        V::Err("ERR wrong number of arguments for 'delex' command".into())
+    );
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:s2", "IFEQ", "a", "extra"]),
+        V::Err("ERR wrong number of arguments for 'delex' command".into())
+    );
+    c.cmd(&["SET", "dx:s2", "v"]);
+    assert_eq!(
+        c.cmd(&["DELEX", "dx:s2", "MAYBE", "a"]),
+        V::Err("ERR Invalid condition. Use IFEQ, IFNE, IFDEQ, or IFDNE".into())
+    );
+    for digest in ["", "abc", "0123456789abcdef0"] {
+        assert_eq!(
+            c.cmd(&["DELEX", "dx:s2", "IFDEQ", digest]),
+            V::Err("ERR must be exactly 16 hexadecimal characters".into())
+        );
+        assert_eq!(
+            c.cmd(&["SET", "dx:s2", "w", "IFDNE", digest]),
+            V::Err("ERR must be exactly 16 hexadecimal characters".into())
+        );
+    }
+}
+
+/// MSETEX's replies and errors as Redis 8.10 has them, and GETRANGE's empty
+/// range when both ends count from the end.
+#[test]
+fn msetex_and_getrange_follow_redis_8_10() {
+    let mut c = conn();
+    assert_eq!(
+        c.cmd(&[
+            "MSETEX", "2", "mx:{t}1", "a", "mx:{t}2", "b", "NX", "EX", "10"
+        ])
+        .i(),
+        1
+    );
+    assert_eq!(
+        c.cmd(&["MSETEX", "1", "mx:{t}1", "c", "NX", "EX", "10"])
+            .i(),
+        0
+    );
+    assert_eq!(
+        c.cmd(&["MSETEX", "1", "mx:{t}none", "c", "XX", "EX", "10"])
+            .i(),
+        0
+    );
+    assert_eq!(c.cmd(&["GET", "mx:{t}1"]).s(), "a");
+    for (args, error) in [
+        (
+            &["MSETEX", "k", "v", "EX", "10"][..],
+            "ERR invalid numkeys value",
+        ),
+        (
+            &["MSETEX", "2147483648", "k", "v"],
+            "ERR invalid numkeys value",
+        ),
+        (
+            &["MSETEX", "2", "k1", "v1", "k2"],
+            "ERR wrong number of key-value pairs",
+        ),
+        (&["MSETEX", "1", "k", "v", "NX", "XX"], "ERR syntax error"),
+        (
+            &["MSETEX", "1", "k", "v", "EX", "10", "PX", "10"],
+            "ERR syntax error",
+        ),
+        (
+            &["MSETEX", "1", "k", "v", "KEEPTTL", "EX", "10"],
+            "ERR syntax error",
+        ),
+        (&["MSETEX", "1", "k", "v", "BOGUS"], "ERR syntax error"),
+    ] {
+        assert_eq!(c.cmd(args), V::Err(error.into()), "{args:?}");
+    }
+
+    c.cmd(&["SET", "gr", "Hello World"]);
+    assert_eq!(c.cmd(&["GETRANGE", "gr", "-100", "-101"]).s(), "");
+    assert_eq!(c.cmd(&["GETRANGE", "gr", "-100", "-100"]).s(), "H");
+    assert_eq!(c.cmd(&["GETRANGE", "gr", "-4", "-1"]).s(), "orld");
 }
 
 #[test]
@@ -3004,4 +3080,370 @@ fn concurrent_writes_to_different_databases_stay_in_their_databases() {
         }
         assert!(c.cmd(&["SELECT", "0"]).ok());
     }
+}
+
+/// INCREX's options and errors as Redis 8.10 has them: each option at most
+/// once, anything else a syntax error, and Redis's wording for the rest.
+#[test]
+fn increx_options_and_errors_follow_redis_8_10() {
+    let mut c = conn();
+    for (args, error) in [
+        (&["BYINT", "1", "BYFLOAT", "1"][..], "ERR syntax error"),
+        (&["BYINT", "1", "BYINT", "2"], "ERR syntax error"),
+        (&["PERSIST", "ENX"], "ERR syntax error"),
+        (&["ENX", "PERSIST"], "ERR syntax error"),
+        (&["EX", "10", "PX", "10"], "ERR syntax error"),
+        (&["SATURATE", "SATURATE"], "ERR syntax error"),
+        (
+            &["BYINT", "x"],
+            "ERR Increment is not an integer or out of range",
+        ),
+        (&["BYFLOAT", "x"], "ERR Increment is not a valid float"),
+        (
+            &["BYFLOAT", "inf"],
+            "ERR BYFLOAT increment cannot be Infinity",
+        ),
+        (
+            &["LBOUND", "x"],
+            "ERR LBOUND is not an integer or out of range",
+        ),
+        (
+            &["BYFLOAT", "1", "UBOUND", "x"],
+            "ERR UBOUND is not a valid float",
+        ),
+        (
+            &["LBOUND", "5", "UBOUND", "1"],
+            "ERR LBOUND can't be greater than UBOUND",
+        ),
+        (&["ENX"], "ERR ENX flag requires an expiration"),
+        (&["EX", "0"], "ERR invalid expire time in 'increx' command"),
+    ] {
+        let mut cmd = vec!["INCREX", "ix"];
+        cmd.extend_from_slice(args);
+        assert_eq!(c.cmd(&cmd), V::Err(error.into()), "{args:?}");
+    }
+
+    // Out of bounds: left alone, with the value as it is and 0; SATURATE
+    // clamps to the bound.
+    assert!(c.cmd(&["SET", "ix", "9223372036854775806"]).ok());
+    let reply = c.cmd(&["INCREX", "ix", "BYINT", "5"]);
+    assert_eq!(reply.arr()[0].i(), 9223372036854775806);
+    assert_eq!(reply.arr()[1].i(), 0);
+    assert!(c.cmd(&["SET", "ix", "-9223372036854775808"]).ok());
+    assert_eq!(
+        c.cmd(&[
+            "INCREX",
+            "ix",
+            "BYINT",
+            "1",
+            "UBOUND",
+            "9223372036854775807",
+            "SATURATE",
+            "LBOUND",
+            "9223372036854775807"
+        ]),
+        V::Err("ERR applied increment would overflow".into())
+    );
+    assert!(c.cmd(&["SET", "ix", "inf"]).ok());
+    assert_eq!(
+        c.cmd(&["INCREX", "ix", "BYFLOAT", "1"]),
+        V::Err("ERR value cannot be Infinity".into())
+    );
+
+    // A TTL already past: the key goes at once.
+    assert!(c.cmd(&["SET", "ix", "10"]).ok());
+    let reply = c.cmd(&["INCREX", "ix", "BYINT", "1", "EXAT", "1"]);
+    assert_eq!(reply.arr()[0].i(), 11);
+    assert_eq!(c.cmd(&["EXISTS", "ix"]).i(), 0);
+    assert!(c.cmd(&["SET", "ix", "10", "EX", "500"]).ok());
+    c.cmd(&["INCREX", "ix", "BYINT", "1", "PERSIST"]);
+    assert_eq!(c.cmd(&["TTL", "ix"]).i(), -1);
+}
+
+/// Argument checks Redis 8.10 tightened: LMOVEM's trailer, SDIFFCARD's
+/// numbers, a negative LIMIT offset, XREADGROUP's options and IDs.
+#[test]
+fn argument_checks_follow_redis_8_10() {
+    let mut c = conn();
+    c.cmd(&["RPUSH", "lm:{t}src", "a", "b", "c"]);
+    for (args, error) in [
+        (
+            &["LMOVEM", "lm:{t}src", "lm:{t}dst", "LEFT"][..],
+            "ERR wrong number of arguments for 'lmovem' command",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "2",
+            ],
+            "ERR syntax error",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "2",
+                "OBO",
+                "x",
+            ],
+            "ERR syntax error",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "0",
+                "BULK",
+            ],
+            "ERR count should be greater than 0",
+        ),
+        (
+            &[
+                "LMOVEM",
+                "lm:{t}src",
+                "lm:{t}dst",
+                "LEFT",
+                "RIGHT",
+                "COUNT",
+                "a",
+                "BULK",
+            ],
+            "ERR count should be greater than 0",
+        ),
+        (
+            &["SDIFFCARD", "a", "s:{t}1"],
+            "ERR numkeys should be greater than 0",
+        ),
+        (
+            &["SDIFFCARD", "1", "s:{t}1", "LIMIT", "a"],
+            "ERR LIMIT can't be negative",
+        ),
+        (
+            &["ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "x", "2"],
+            "ERR value is not an integer or out of range",
+        ),
+    ] {
+        assert_eq!(c.cmd(args), V::Err(error.into()), "{args:?}");
+    }
+    assert_eq!(
+        c.cmd(&[
+            "LMOVEM",
+            "lm:{t}src",
+            "lm:{t}dst",
+            "LEFT",
+            "RIGHT",
+            "COUNT",
+            "2",
+            "OBO"
+        ])
+        .arr()
+        .len(),
+        2
+    );
+
+    c.cmd(&["ZADD", "z", "1", "a", "2", "b", "3", "c"]);
+    assert!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "-1", "2"])
+            .arr()
+            .is_empty()
+    );
+    assert!(
+        c.cmd(&["ZRANGEBYLEX", "z", "-", "+", "LIMIT", "-1", "2"])
+            .arr()
+            .is_empty()
+    );
+    assert_eq!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "1", "-1"])
+            .arr()
+            .len(),
+        2
+    );
+
+    c.cmd(&["XADD", "xs", "1-0", "f", "v"]);
+    assert!(c.cmd(&["XGROUP", "CREATE", "xs", "g", "0"]).ok());
+    for (args, error) in [
+        (
+            &["BLOCK", "abc"][..],
+            "ERR timeout is not an integer or out of range",
+        ),
+        (&["BLOCK", "-1"], "ERR timeout is negative"),
+        (
+            &["COUNT", "abc"],
+            "ERR value is not an integer or out of range",
+        ),
+        (
+            &["MAXCOUNT", "foo"],
+            "ERR value is not an integer or out of range",
+        ),
+        (
+            &["MAXCOUNT", "0"],
+            "ERR MAXCOUNT must be a positive integer",
+        ),
+        (&["INVALID", "x"], "ERR syntax error"),
+    ] {
+        let mut cmd = vec!["XREADGROUP", "GROUP", "g", "c"];
+        cmd.extend_from_slice(args);
+        cmd.extend_from_slice(&["STREAMS", "xs", ">"]);
+        assert_eq!(c.cmd(&cmd), V::Err(error.into()), "{args:?}");
+    }
+    for id in ["invalid-id", "123-", "-123", "abc-def", "--"] {
+        assert_eq!(
+            c.cmd(&["XREADGROUP", "GROUP", "g", "c", "STREAMS", "xs", id]),
+            V::Err("ERR Invalid stream ID specified as stream command argument".into()),
+            "{id}"
+        );
+    }
+    assert_eq!(
+        c.cmd(&["XREADGROUP", "GROUP", "g", "c", "STREAM", "xs", ">"]),
+        V::Err("ERR syntax error".into())
+    );
+    assert_eq!(
+        c.cmd(&[
+            "XREADGROUP",
+            "GROUP",
+            "g",
+            "c",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "xs",
+            ">"
+        ])
+        .arr()
+        .len(),
+        1
+    );
+}
+
+/// HSETEX and HGETEX take their options after the FIELDS block as well as
+/// before it (Redis 8.10), and a field named like an option is still a field.
+#[test]
+fn hsetex_and_hgetex_take_options_after_fields() {
+    let mut c = conn();
+    assert_eq!(
+        c.cmd(&[
+            "HSETEX", "hx", "FIELDS", "2", "f1", "v1", "EX", "v2", "EX", "60"
+        ])
+        .i(),
+        1
+    );
+    assert_eq!(c.cmd(&["HGET", "hx", "EX"]).s(), "v2", "a field named EX");
+    let ttl = c.cmd(&["HTTL", "hx", "FIELDS", "1", "f1"]).arr()[0].i();
+    assert!((1..=60).contains(&ttl), "{ttl}");
+    assert_eq!(
+        c.cmd(&["HSETEX", "hx", "FIELDS", "1", "f1", "w", "FXX", "KEEPTTL"])
+            .i(),
+        1
+    );
+    assert!(
+        c.cmd(&["HTTL", "hx", "FIELDS", "1", "f1"]).arr()[0].i() > 0,
+        "KEEPTTL after FIELDS"
+    );
+    assert_eq!(
+        c.cmd(&["HGETEX", "hx", "FIELDS", "1", "f1", "PERSIST"])
+            .arr()[0]
+            .s(),
+        "w"
+    );
+    assert_eq!(c.cmd(&["HTTL", "hx", "FIELDS", "1", "f1"]).arr()[0].i(), -1);
+}
+
+/// XIDMPRECORD (Redis 8.10): an entry already in the stream recorded as what
+/// a producer's idempotent ID produced, so `XADD … IDMP` with that ID returns
+/// it instead of adding another.
+#[test]
+fn xidmprecord_records_an_entry_for_idempotent_production() {
+    let mut c = conn();
+    let id = c.cmd(&["XADD", "xi", "*", "f", "v"]).s().to_string();
+    for (args, error) in [
+        (
+            &["xi", "p1", "i1"][..],
+            "ERR wrong number of arguments for 'xidmprecord' command",
+        ),
+        (&["nosuch", "p1", "i1", "1-1"], "ERR no such key"),
+        (
+            &["xi", "p1", "i1", "bad"],
+            "ERR Invalid stream ID specified as stream command argument",
+        ),
+        (
+            &["xi", "", "i1", "1-1"],
+            "ERR producer ID must be non-empty",
+        ),
+        (
+            &["xi", "p1", "", "1-1"],
+            "ERR idempotent ID must be non-empty",
+        ),
+        (
+            &["xi", "p1", "i1", "999-999"],
+            "ERR No such message in stream",
+        ),
+    ] {
+        let mut cmd = vec!["XIDMPRECORD"];
+        cmd.extend_from_slice(args);
+        assert_eq!(c.cmd(&cmd), V::Err(error.into()), "{args:?}");
+    }
+    assert!(c.cmd(&["XIDMPRECORD", "xi", "p1", "req-1", &id]).ok());
+    assert!(
+        c.cmd(&["XIDMPRECORD", "xi", "p1", "req-1", &id]).ok(),
+        "the same record again"
+    );
+    // A retry of the request returns the recorded entry; nothing is added.
+    assert_eq!(
+        c.cmd(&["XADD", "xi", "IDMP", "p1", "req-1", "*", "f", "again"])
+            .s(),
+        id
+    );
+    assert_eq!(c.cmd(&["XLEN", "xi"]).i(), 1);
+    let other = c.cmd(&["XADD", "xi", "*", "f", "w"]).s().to_string();
+    assert_eq!(
+        c.cmd(&["XIDMPRECORD", "xi", "p1", "req-1", &other]),
+        V::Err("ERR IID already exists for this producer with a different stream ID".into())
+    );
+}
+
+/// CLIENT INFO's per-client counters (Redis 8.10): bytes in and out,
+/// commands, reads, and commands per read.
+#[test]
+fn client_info_counts_a_connections_traffic() {
+    let mut c = conn();
+    let field = |info: &str, name: &str| -> i64 {
+        info.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name} in {info}"))
+            .parse()
+            .unwrap()
+    };
+    let before = c.cmd(&["CLIENT", "INFO"]).s().to_string();
+    assert!(
+        before.contains(" omem-shared=0 omem-unshared=0 "),
+        "{before}"
+    );
+    for _ in 0..3 {
+        c.cmd(&["PING"]);
+    }
+    let after = c.cmd(&["CLIENT", "INFO"]).s().to_string();
+    assert_eq!(field(&after, "tot-cmds") - field(&before, "tot-cmds"), 4);
+    assert!(field(&after, "read-events") - field(&before, "read-events") >= 4);
+    let sum = field(&after, "avg-pipeline-len-sum") - field(&before, "avg-pipeline-len-sum");
+    let cnt = field(&after, "avg-pipeline-len-cnt") - field(&before, "avg-pipeline-len-cnt");
+    assert!(sum > 0 && sum == cnt, "one command a read: {sum} / {cnt}");
+    // Three PINGs (14 bytes each) and this CLIENT INFO (26).
+    assert_eq!(
+        field(&after, "tot-net-in") - field(&before, "tot-net-in"),
+        3 * 14 + 26
+    );
+    assert!(field(&after, "tot-net-out") - field(&before, "tot-net-out") > 300);
 }
