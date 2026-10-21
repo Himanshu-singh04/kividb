@@ -1011,8 +1011,50 @@ impl Config {
             out.push_str(&format!("replicaof {} {}\n", parts[0], parts[1]));
         }
 
+        // The new file keeps the old one's mode, and its owner where the
+        // process may set it: a config kept private because it holds
+        // `requirepass` must not become readable by every user (#51). With
+        // no old file it is 0600. KiviDB differs from Redis on purpose here:
+        // Redis 7.4 to 8.10 set every rewritten file to 0644 less the umask.
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &out).map_err(RewriteError::Io)?;
+        // Whatever is at the temporary path already, a file left by a
+        // rewrite that failed or a symlink another user put there, is
+        // removed, not written through. Created anew (O_EXCL), the file
+        // cannot be one that is already there: if another appears in
+        // between, the rewrite fails rather than write into it.
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(RewriteError::Io(e));
+            }
+            _ => {}
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Private from the start, so the contents are never readable by
+        // others while they are written.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp).map_err(RewriteError::Io)?;
+        // Set, not just created with: the umask narrows the mode a file is
+        // created with.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            match std::fs::metadata(path) {
+                Ok(old) => {
+                    file.set_permissions(old.permissions())
+                        .map_err(RewriteError::Io)?;
+                    // Only root may give a file away; for anyone else this
+                    // fails, and the file stays the process's.
+                    let _ = std::os::unix::fs::fchown(&file, Some(old.uid()), Some(old.gid()));
+                }
+                Err(_) => file
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(RewriteError::Io)?,
+            }
+        }
+        std::io::Write::write_all(&mut file, out.as_bytes()).map_err(RewriteError::Io)?;
+        drop(file);
         std::fs::rename(&tmp, path).map_err(RewriteError::Io)?;
 
         Ok(())
