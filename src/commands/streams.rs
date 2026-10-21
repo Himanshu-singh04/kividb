@@ -8,7 +8,7 @@ use crate::commands::stream_extra::{
     trim_stream_approx,
 };
 use crate::keyspace_events::{KS_STREAM, notify};
-use crate::replication::script_feed::{effect, effects_begin};
+use crate::replication::script_feed::{effect, effect_of_metadata, effects_begin};
 use crate::resp::write::*;
 use crate::store;
 use crate::store::Key;
@@ -112,6 +112,7 @@ fn run(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         "XDEL" => Some(xdel(ctx)),
         "XTRIM" => Some(xtrim(ctx)),
         "XSETID" => Some(xsetid(ctx)),
+        "XIDMPRECORD" => Some(xidmprecord(ctx)),
         "XGROUP" => Some(xgroup(ctx)),
         "XREADGROUP" => Some(xreadgroup(ctx)),
         "XACK" => Some(xack(ctx)),
@@ -128,6 +129,63 @@ fn run(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// `XIDMPRECORD key pid iid id` (Redis 8.10): remember that producer `pid`'s
+/// idempotent ID `iid` produced the entry `id` already in the stream, as an
+/// `XADD … IDMP` would have. The same record again is OK; the iid recorded
+/// for another entry is an error.
+fn xidmprecord(ctx: &mut Ctx) -> Vec<u8> {
+    let cmd = &ctx.cmd;
+    if cmd.len() != 5 {
+        return resp_error("ERR wrong number of arguments for 'xidmprecord' command");
+    }
+    let Some(id) = parse_utf8(cmd[4]).and_then(StreamId::parse) else {
+        return resp_error("ERR Invalid stream ID specified as stream command argument");
+    };
+    if cmd[2].is_empty() {
+        return resp_error("ERR producer ID must be non-empty");
+    }
+    if cmd[3].is_empty() {
+        return resp_error("ERR idempotent ID must be non-empty");
+    }
+    let Some(key) = parse_utf8(cmd[1]) else {
+        return resp_error("ERR key must be valid UTF-8");
+    };
+    let (producer, iid) = (cmd[2], cmd[3]);
+    let defaults = (
+        ctx.config.stream_idmp_duration,
+        ctx.config.stream_idmp_maxsize,
+    );
+    let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
+    let stream = match read_lock!(shard).get(key) {
+        Some(KiviDBValue::Stream(s)) => Arc::clone(s),
+        Some(_) => {
+            return resp_error("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        None => return resp_error("ERR no such key"),
+    };
+    let mut inner = stream.write();
+    if !inner.entries.contains_key(&id) {
+        return resp_error("ERR No such message in stream");
+    }
+    let recorded = inner
+        .idmp
+        .producers
+        .get(producer)
+        .and_then(|p| p.by_iid.get(iid))
+        .cloned();
+    match recorded {
+        Some(same) if same == id => return resp_simple("OK"),
+        Some(_) => {
+            return resp_error(
+                "ERR IID already exists for this producer with a different stream ID",
+            );
+        }
+        None => {}
+    }
+    stream_extra::idmp_record(&mut inner, producer, Arc::from(iid), id, now_ms(), defaults);
+    resp_simple("OK")
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -1576,16 +1634,22 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
     let mut i = 4usize;
     let mut block_ms: Option<u64> = None;
 
+    // Each option takes its argument, as in Redis; one that is not an option
+    // is a syntax error (it used to be skipped).
+    let mut saw_streams = false;
     while i < cmd.len() {
         let tok = std::str::from_utf8(cmd[i])
             .unwrap_or("")
             .to_ascii_uppercase();
+        let has_arg = i + 1 < cmd.len();
         match tok.as_str() {
-            "COUNT" => {
-                count = cmd
-                    .get(i + 1)
-                    .and_then(|b| std::str::from_utf8(b).ok())
-                    .and_then(|s| s.parse().ok());
+            "COUNT" if has_arg => {
+                // 0, or less, is no limit, as in Redis.
+                count = match parse_utf8(cmd[i + 1]).and_then(|s| s.parse::<i64>().ok()) {
+                    Some(n) if n > 0 => Some(n as usize),
+                    Some(_) => None,
+                    None => return resp_error("ERR value is not an integer or out of range"),
+                };
                 i += 2;
             }
             "MAXCOUNT" => {
@@ -1602,11 +1666,12 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
                 }
                 i += 2;
             }
-            "BLOCK" => {
-                block_ms = cmd
-                    .get(i + 1)
-                    .and_then(|b| std::str::from_utf8(b).ok())
-                    .and_then(|s| s.parse().ok());
+            "BLOCK" if has_arg => {
+                block_ms = match parse_utf8(cmd[i + 1]).and_then(|s| s.parse::<i64>().ok()) {
+                    Some(ms) if ms < 0 => return resp_error("ERR timeout is negative"),
+                    Some(ms) => Some(ms as u64),
+                    None => return resp_error("ERR timeout is not an integer or out of range"),
+                };
                 i += 2;
             }
             "CLAIM" => {
@@ -1628,12 +1693,14 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
             }
             "STREAMS" => {
                 i += 1;
+                saw_streams = true;
                 break;
             }
-            _ => {
-                i += 1;
-            }
+            _ => return resp_error("ERR syntax error"),
         }
+    }
+    if !saw_streams {
+        return resp_error("ERR syntax error");
     }
     if let Err(e) = caps.check_against_count(count) {
         return resp_error(&e);
@@ -1644,6 +1711,18 @@ pub fn xreadgroup(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error(
             "ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.",
         );
+    }
+    // Every ID is `>` or one, checked before anything is read.
+    for id in &cmd[i + remaining / 2..] {
+        if *id == b">" {
+            continue;
+        }
+        if *id == b"$" {
+            return resp_error("ERR The $ ID is meaningless in the context of XREADGROUP");
+        }
+        if parse_utf8(id).and_then(StreamId::parse).is_none() {
+            return resp_error("ERR Invalid stream ID specified as stream command argument");
+        }
     }
     let half = remaining / 2;
     let keys: Vec<String> = cmd[i..i + half]
@@ -2029,7 +2108,8 @@ fn run_xreadgroup_delivery(
                 if let Some(pending) = g.pel.get_mut(&id) {
                     pending.delivered_at = now;
                     pending.delivery_count = pending.delivery_count.saturating_add(1);
-                    effect(claim_effect(
+                    // Not a change of the dataset, to Redis (#27).
+                    effect_of_metadata(claim_effect(
                         key,
                         spec.group,
                         spec.consumer,
@@ -2862,7 +2942,7 @@ fn xinfo_stream_full(
                             resp_integer(g.active.get(name).map_or(-1, |at| *at as i64)),
                             resp_bulk_str("pel-count"),
                             resp_integer(own().count() as i64),
-                            resp_bulk_str("pel"),
+                            resp_bulk_str("pending"),
                             resp_array(pel),
                         ],
                     )
@@ -2881,7 +2961,12 @@ fn xinfo_stream_full(
                     lag,
                     resp_bulk_str("pel-count"),
                     resp_integer(g.pel.len() as i64),
-                    resp_bulk_str("pel"),
+                    // Entries `XNACK` released: pending, and no one's.
+                    resp_bulk_str("nacked-count"),
+                    resp_integer(g.pel.values().filter(|p| p.consumer.is_empty()).count() as i64),
+                    // Redis 8.10's name for the pending entries, here and
+                    // for each consumer (it was `pel`).
+                    resp_bulk_str("pending"),
                     resp_array(pel),
                     resp_bulk_str("consumers"),
                     resp_array(consumers),

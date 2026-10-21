@@ -111,6 +111,10 @@ fn replication_and_cluster_config(ctx: &Ctx) -> Vec<(&'static str, String)> {
             yes_no(ctx.config.cluster_bus_port_protected_mode),
         ),
         ("protected-mode", yes_no(crate::protected_mode::is_on())),
+        (
+            "key-access-tracking",
+            yes_no(crate::eviction::key_access_tracking()),
+        ),
         ("tls-cluster", yes_no(ctx.config.tls_cluster)),
         ("tls-replication", yes_no(ctx.config.tls_replication)),
         (
@@ -340,6 +344,17 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 }
                 _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
             },
+            "key-access-tracking" => match value.to_ascii_lowercase().as_str() {
+                "yes" => {
+                    crate::eviction::set_key_access_tracking(true);
+                    Some(resp_simple("OK"))
+                }
+                "no" => {
+                    crate::eviction::set_key_access_tracking(false);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+            },
             "protected-mode" => match value.to_ascii_lowercase().as_str() {
                 "yes" => {
                     crate::protected_mode::set(true);
@@ -511,19 +526,31 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                 ctx.repl_state.set_master_user(value);
                 Some(resp_simple("OK"))
             }
-            "slowlog-entry-max-argc" => match value.parse::<usize>() {
-                Ok(v) => {
-                    ctx.slowlog.set_entry_max_argc(v);
+            // Redis's ranges: an entry keeps at least the command and one
+            // argument, and at least one byte of each.
+            "slowlog-entry-max-argc" => match value.parse::<i64>() {
+                Ok(v) if (2..=i32::MAX as i64).contains(&v) => {
+                    ctx.slowlog.set_entry_max_argc(v as usize);
                     Some(resp_simple("OK"))
                 }
-                Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
+                Ok(_) => Some(resp_error(
+                    "ERR argument must be between 2 and 2147483647 inclusive",
+                )),
+                Err(_) => Some(resp_error(
+                    "ERR argument couldn't be parsed into an integer",
+                )),
             },
-            "slowlog-entry-max-string-len" => match value.parse::<usize>() {
-                Ok(v) => {
-                    ctx.slowlog.set_entry_max_string_len(v);
+            "slowlog-entry-max-string-len" => match value.parse::<i64>() {
+                Ok(v) if v >= 1 => {
+                    ctx.slowlog.set_entry_max_string_len(v as usize);
                     Some(resp_simple("OK"))
                 }
-                Err(_) => Some(resp_error("ERR value is not an integer or out of range")),
+                Ok(_) => Some(resp_error(
+                    "ERR argument must be between 1 and 9223372036854775807 inclusive",
+                )),
+                Err(_) => Some(resp_error(
+                    "ERR argument couldn't be parsed into an integer",
+                )),
             },
             // Fixed at startup: changing them under a running
             // cluster would desynchronise this node from what its
@@ -654,6 +681,11 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
         );
     }
     reply
+}
+
+/// What a remembered setting is now (see [`REMEMBERED_CONFIG`]).
+pub(crate) fn remembered_config(name: &str) -> Option<String> {
+    REMEMBERED_CONFIG.lock().get(name).cloned()
 }
 
 /// Settings of Redis's that have no meaning here, with Redis's defaults and
@@ -1400,6 +1432,7 @@ const ALL_COMMANDS: &[&str] = &[
     "TS.READ",
     "XACKDEL",
     "XCFGSET",
+    "XIDMPRECORD",
     "FT.ALIASLIST",
     "FT.HYBRID",
     "FT.TAGVALS",
@@ -1952,6 +1985,7 @@ fn acl_cat_commands(category: &str) -> Option<Vec<&'static str>> {
             "XTRIM",
             "XACKDEL",
             "XCFGSET",
+            "XIDMPRECORD",
         ],
         "generic" => vec![
             "COPY",
@@ -2850,19 +2884,24 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::EXPIRED_SUBKEYS.load(Ordering::Relaxed)
                 ));
                 out.push_str(&format!(
+                    "expired_keys_active:{}\r\n",
+                    crate::stats::EXPIRED_KEYS_ACTIVE.load(Ordering::Relaxed)
+                ));
+                out.push_str(&format!(
                     "evicted_keys:{}\r\n",
                     crate::stats::EVICTED_KEYS.load(Ordering::Relaxed)
                 ));
-                // Slowlog totals (Redis 8.8). Milliseconds, like Redis.
+                // Slowlog totals (Redis 8.8). Milliseconds to two places,
+                // as Redis writes them (`0.00`).
                 let (slow_count, slow_us_sum, slow_us_max) = ctx.slowlog.totals();
                 out.push_str(&format!("slowlog_commands_count:{slow_count}\r\n"));
                 out.push_str(&format!(
-                    "slowlog_commands_time_ms_sum:{}\r\n",
-                    slow_us_sum / 1000
+                    "slowlog_commands_time_ms_sum:{:.2}\r\n",
+                    slow_us_sum as f64 / 1000.0
                 ));
                 out.push_str(&format!(
-                    "slowlog_commands_time_ms_max:{}\r\n",
-                    slow_us_max / 1000
+                    "slowlog_commands_time_ms_max:{:.2}\r\n",
+                    slow_us_max as f64 / 1000.0
                 ));
                 out.push_str(&format!(
                     "total_error_replies:{}\r\n",
@@ -3425,6 +3464,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::stats::TOTAL_NET_OUTPUT_BYTES.store(0, Ordering::Relaxed);
                     crate::stats::EXPIRED_KEYS.store(0, Ordering::Relaxed);
                     crate::stats::EXPIRED_SUBKEYS.store(0, Ordering::Relaxed);
+                    crate::stats::EXPIRED_KEYS_ACTIVE.store(0, Ordering::Relaxed);
                     crate::lazyfree::reset_freed();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
                     crate::stats::reset_rdb_changes();

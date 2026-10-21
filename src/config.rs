@@ -106,6 +106,12 @@ pub struct Config {
     #[arg(long, default_value_t = 10)]
     pub lfu_log_factor: u32,
 
+    /// Record every key's use whatever the eviction policy, so that `OBJECT
+    /// IDLETIME` and `OBJECT FREQ` report it under `noeviction` too. Costs
+    /// every command and every key: see `eviction::key_access_tracking`.
+    #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args = 1)]
+    pub key_access_tracking: bool,
+
     /// Minutes for a key's use count to fall by one, for the LFU policies
     /// (Redis `lfu-decay-time`). 0 = it never falls.
     #[arg(long, default_value_t = 1)]
@@ -439,6 +445,7 @@ impl Default for Config {
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,
+            key_access_tracking: false,
             lfu_decay_time: 1,
             dir: String::new(),
             loglevel: "info".into(),
@@ -548,6 +555,7 @@ impl Config {
             maxmemory_policy: "noeviction".into(),
             maxmemory_samples: 5,
             lfu_log_factor: 10,
+            key_access_tracking: false,
             lfu_decay_time: 1,
             dir: String::new(),
             loglevel: "warn".into(),
@@ -837,6 +845,14 @@ impl Config {
         out.push_str(&format!("maxmemory-samples {}\n", self.maxmemory_samples));
         out.push_str(&format!("lfu-log-factor {}\n", self.lfu_log_factor));
         out.push_str(&format!("lfu-decay-time {}\n", self.lfu_decay_time));
+        out.push_str(&format!(
+            "key-access-tracking {}\n",
+            if self.key_access_tracking {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
         out.push_str(&format!("loglevel {}\n", self.loglevel));
         if !self.logfile.is_empty() {
             out.push_str(&format!("logfile {}\n", quote(&self.logfile)));
@@ -995,8 +1011,50 @@ impl Config {
             out.push_str(&format!("replicaof {} {}\n", parts[0], parts[1]));
         }
 
+        // The new file keeps the old one's mode, and its owner where the
+        // process may set it: a config kept private because it holds
+        // `requirepass` must not become readable by every user (#51). With
+        // no old file it is 0600. KiviDB differs from Redis on purpose here:
+        // Redis 7.4 to 8.10 set every rewritten file to 0644 less the umask.
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &out).map_err(RewriteError::Io)?;
+        // Whatever is at the temporary path already, a file left by a
+        // rewrite that failed or a symlink another user put there, is
+        // removed, not written through. Created anew (O_EXCL), the file
+        // cannot be one that is already there: if another appears in
+        // between, the rewrite fails rather than write into it.
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(RewriteError::Io(e));
+            }
+            _ => {}
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Private from the start, so the contents are never readable by
+        // others while they are written.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp).map_err(RewriteError::Io)?;
+        // Set, not just created with: the umask narrows the mode a file is
+        // created with.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            match std::fs::metadata(path) {
+                Ok(old) => {
+                    file.set_permissions(old.permissions())
+                        .map_err(RewriteError::Io)?;
+                    // Only root may give a file away; for anyone else this
+                    // fails, and the file stays the process's.
+                    let _ = std::os::unix::fs::fchown(&file, Some(old.uid()), Some(old.gid()));
+                }
+                Err(_) => file
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(RewriteError::Io)?,
+            }
+        }
+        std::io::Write::write_all(&mut file, out.as_bytes()).map_err(RewriteError::Io)?;
+        drop(file);
         std::fs::rename(&tmp, path).map_err(RewriteError::Io)?;
 
         Ok(())
@@ -1393,6 +1451,7 @@ impl Config {
             }
             "lfu-log-factor" => set!(lfu_log_factor, number(key, one()?)?),
             "lfu-decay-time" => set!(lfu_decay_time, number(key, one()?)?),
+            "key-access-tracking" => set!(key_access_tracking, yes_no(key, one()?)?),
             // Tuning knobs for machinery KiviDB does not have, or does not
             // expose. They change nothing a client could observe.
             "activerehashing"

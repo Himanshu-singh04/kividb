@@ -1001,6 +1001,67 @@ fn test_client_info() {
     assert!(text.contains("qbuf-free="));
 }
 
+/// `CLIENT LIST` reports the seconds a client has been idle, growing while it
+/// stays quiet, restarting when it runs a command, and left alone by the
+/// inspection itself.
+#[test]
+fn test_client_list_reports_and_preserves_idle_time() {
+    let idle_field = |line: &str| -> u64 {
+        client_list_field(line, "idle=")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("no idle= in {line:?}"))
+    };
+
+    let port = free_port();
+    start_server(port);
+    // An observer that does the `CLIENT LIST`; a separate connection that
+    // goes idle and is watched.
+    let mut observer = Conn::connect(port);
+    let mut watched = Conn::connect(port);
+    watched.cmds(&["CLIENT", "SETNAME", "idle-watched"]);
+
+    let read_idle = |observer: &mut Conn| -> u64 {
+        let listing = observer.cmds(&["CLIENT", "LIST"]);
+        let line = listing
+            .as_str()
+            .lines()
+            .find(|line| line.contains("name=idle-watched"))
+            .unwrap_or_else(|| panic!("watched client missing from {listing:?}"))
+            .to_string();
+        idle_field(&line)
+    };
+
+    // Freshly idle: seconds at most, and never negative.
+    let fresh = read_idle(&mut observer);
+    assert!(fresh <= 1, "a just-created client reported idle={fresh}");
+
+    // The clock runs: after ~2 s of quiet the client shows at least that.
+    thread::sleep(Duration::from_millis(2200));
+    let after_wait = read_idle(&mut observer);
+    assert!(
+        after_wait >= 2,
+        "idle time did not grow with the clock: {after_wait}"
+    );
+
+    // Three more inspections in quick succession: reading the listing must
+    // not count as the watched client's interaction, so idle cannot fall.
+    for _ in 0..3 {
+        let again = read_idle(&mut observer);
+        assert!(
+            again >= after_wait,
+            "inspection reset the watched client's idle timer: {again} after {after_wait}"
+        );
+    }
+
+    // A command from the watched client is an interaction: idle restarts.
+    watched.cmds(&["PING"]);
+    let reset = read_idle(&mut observer);
+    assert!(
+        reset <= 1,
+        "a command should reset the idle timer, but it read {reset}"
+    );
+}
+
 fn client_list_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     line.split_whitespace()
         .find_map(|field| field.strip_prefix(name))

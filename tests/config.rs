@@ -307,6 +307,110 @@ fn test_config_rewrite_with_configfile() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// CONFIG REWRITE keeps the config file's mode. It used to write a new file
+/// with the default mode (0644), as Redis does, so a file kept private
+/// because it holds `requirepass` became readable by every user (#51). With
+/// no file to keep the mode of, the new one is 0600. Whatever is already at
+/// the temporary path, a file left by an earlier rewrite or a symlink put
+/// there by another user, is never written through.
+#[cfg(unix)]
+#[test]
+fn test_config_rewrite_keeps_the_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    enum Stale {
+        Nothing,
+        File,
+        Symlink,
+    }
+    let rewrite = |original: Option<u32>, stale: Stale| -> u32 {
+        let port = free_port();
+        let mut path = std::env::temp_dir();
+        path.push(format!("kividb_rewrite_mode_test_{port}.conf"));
+        let _ = std::fs::remove_file(&path);
+        if let Some(mode) = original {
+            std::fs::write(&path, format!("port {port}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let tmp = path.with_extension("tmp");
+        let victim = path.with_extension("victim");
+        let _ = std::fs::remove_file(&tmp);
+        match stale {
+            Stale::Nothing => {}
+            Stale::File => {
+                std::fs::write(&tmp, "left over\n").unwrap();
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+            }
+            Stale::Symlink => {
+                std::fs::write(&victim, "not the config\n").unwrap();
+                std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+            }
+        }
+        let mut server = std::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
+        )
+        .args([
+            "--port",
+            &port.to_string(),
+            "--configfile",
+            path.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("failed to start kividb");
+        let mut c = {
+            let mut conn = None;
+            for _ in 0..50 {
+                if let Ok(s) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
+                    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    conn = Some(Conn(s));
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            conn.expect("server did not come up")
+        };
+        let result = c.cmds(&["CONFIG", "REWRITE"]);
+        server.kill().unwrap();
+        let _ = server.wait();
+        assert!(result.is_ok(), "CONFIG REWRITE failed: {result:?}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        if let Ok(kept) = std::fs::read_to_string(&victim) {
+            assert_eq!(kept, "not the config\n", "the symlink's target was written");
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&victim);
+        mode
+    };
+
+    assert_eq!(
+        rewrite(Some(0o600), Stale::Nothing),
+        0o600,
+        "a 0600 file must stay 0600"
+    );
+    assert_eq!(
+        rewrite(Some(0o640), Stale::Nothing),
+        0o640,
+        "a 0640 file must stay 0640"
+    );
+    assert_eq!(
+        rewrite(None, Stale::Nothing),
+        0o600,
+        "a new file must be 0600"
+    );
+    assert_eq!(
+        rewrite(Some(0o600), Stale::File),
+        0o600,
+        "a stale 0666 .tmp must not pass its mode on"
+    );
+    assert_eq!(
+        rewrite(Some(0o600), Stale::Symlink),
+        0o600,
+        "a symlink at .tmp must not be followed"
+    );
+}
+
 /// `maxmemory` and the remembered settings are the process's, not a
 /// server's: the tests that set them take turns.
 fn maxmemory_turn() -> std::sync::MutexGuard<'static, ()> {

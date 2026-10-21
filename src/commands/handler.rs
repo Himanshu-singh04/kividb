@@ -855,9 +855,62 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         Vec::new()
     };
 
+    // `notify-keyspace-events o` / `c`: the values the command may replace
+    // whole, to see afterwards which it did (Redis's `setKey`).
+    let replaced_watch =
+        crate::keyspace_events::KS_OVERWRITTEN | crate::keyspace_events::KS_TYPE_CHANGED;
+    let before_replace: Vec<(usize, usize, crate::types::KiviDBValue)> = if writes_operation
+        && crate::keyspace_events::KS_FLAGS.load(std::sync::atomic::Ordering::Relaxed)
+            & replaced_watch
+            != 0
+    {
+        crate::keyspace_events::whole_value_targets(name, &ctx.cmd)
+            .into_iter()
+            .filter_map(|(db, pos)| {
+                let db = db.unwrap_or(*ctx.selected_db);
+                let key = std::str::from_utf8(ctx.cmd[pos]).ok()?;
+                let value = crate::read_lock!(crate::store::get_shard(ctx.store.get(db)?, key))
+                    .get(key)?
+                    .clone();
+                Some((db, pos, value))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let result = dispatch_command_handlers(ctx, name)
         .or_else(|| lua::handle(ctx, name))
         .unwrap_or_else(|| unknown_command(&ctx.cmd));
+
+    for (db, pos, old) in before_replace {
+        let Ok(key) = std::str::from_utf8(ctx.cmd[pos]) else {
+            continue;
+        };
+        let now = crate::read_lock!(crate::store::get_shard(&ctx.store[db], key))
+            .get(key)
+            .cloned();
+        if let Some(now) = now
+            && !now.same_value(&old)
+        {
+            crate::keyspace_events::notify(
+                ctx.pubsub,
+                db,
+                crate::keyspace_events::KS_OVERWRITTEN,
+                "overwritten",
+                key,
+            );
+            if now.type_name() != old.type_name() {
+                crate::keyspace_events::notify(
+                    ctx.pubsub,
+                    db,
+                    crate::keyspace_events::KS_TYPE_CHANGED,
+                    "type_changed",
+                    key,
+                );
+            }
+        }
+    }
 
     for pos in absent {
         if let Ok(key) = std::str::from_utf8(ctx.cmd[pos])
@@ -891,6 +944,8 @@ fn run_command(ctx: &mut Ctx, name: &str) -> Vec<u8> {
         && !matches!(
             name,
             "OBJECT" | "TYPE" | "TTL" | "PTTL" | "EXPIRETIME" | "PEXPIRETIME" | "EXISTS" | "DEBUG"
+            // Records its own use, with what IDLETIME or FREQ said.
+            | "RESTORE"
         )
     {
         let wrote = writes_operation && !result.starts_with(b"-");
@@ -1189,7 +1244,11 @@ fn side_effects(ctx: &Ctx, name: &str, result: &[u8], writes_operation: bool) {
 
         notify_watchers(ctx, name);
 
-        crate::stats::record_rdb_change();
+        // An XREADGROUP that only re-read pending entries, or found nothing
+        // new, changed nothing Redis counts (#27).
+        if name != "XREADGROUP" || replication::script_feed::effects_changed_data() {
+            crate::stats::record_rdb_change();
+        }
     }
 
     // ── PUBLISH reaches replicas' subscribers too ───────────────────────────

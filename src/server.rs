@@ -139,6 +139,9 @@ where
                     Ok(n) if n > 0 => {
                         crate::stats::TOTAL_NET_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                         waiter.carried.extend_from_slice(&temp[..n]);
+                        // The client sent something while it was parked, so it
+                        // is not idle: restart its idle clock.
+                        waiter.activity.touch();
                     }
                     _ => {
                         waiter.interrupted.gone = true;
@@ -178,6 +181,9 @@ struct Waiter<'a, R> {
     client_registry: &'a crate::client_registry::ClientRegistry,
     client_id: u64,
     interrupted: &'a mut crate::commands::blocking::Interrupted,
+    /// The waiting connection's activity, so bytes that arrive while it waits
+    /// restart its idle clock just as the main loop's reads do.
+    activity: &'a crate::client_registry::Activity,
 }
 
 /// A connection's buffer that has grown past this is given back once it is
@@ -572,11 +578,17 @@ where
                     }
                 }
             };
+            // Bytes arrived from the socket: the client is active, so its idle
+            // clock restarts. Once per read, not once per command — a pipeline
+            // that arrives together is one interaction. The timer arm above
+            // `continue`s, so it never reaches here.
+            activity.touch();
             if was_private_at_read {
                 last_query_buffer_activity = Instant::now();
             }
             crate::stats::TOTAL_NET_INPUT_BYTES
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            activity.note_read(n);
             buffer.extend_from_slice(&temp[..n]);
         } else {
             buffer.append(&mut carried);
@@ -589,6 +601,7 @@ where
         );
 
         let mut parse_offset = read_start;
+        let commands_before = activity.commands_run();
         let mut connection_handoff: Option<ConnectionHandoff> = None;
         let mut quit_requested = false;
         // Outside the parse loop: a park in one turn hands its delivery to the
@@ -827,6 +840,7 @@ where
                                 client_registry: &client_registry,
                                 client_id,
                                 interrupted: &mut interrupted,
+                                activity: &activity,
                             },
                         )
                         .await
@@ -903,6 +917,7 @@ where
                             client_registry: &client_registry,
                             client_id,
                             interrupted: &mut interrupted,
+                            activity: &activity,
                         },
                     )
                     .await
@@ -2225,6 +2240,7 @@ where
         );
 
         // One TCP write per read syscall batch (pipelining).
+        activity.note_flush(combined.len(), commands_before);
         if write_tcp_batch(&writer, &mut combined).await.is_err() {
             break;
         }

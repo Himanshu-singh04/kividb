@@ -25,6 +25,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (#45). It previously refused them with `ERR DUMP payload version or checksum
   are wrong`; Redis function-library payloads now restore atomically while
   KiviDB's own format continues to work.
+- **A HyperLogLog keeps its cached count where Redis keeps it** (#28). The
+  count was never cached: every `PFCOUNT` counted all 16,384 registers again,
+  and bytes 8-15 of the value did not say what Redis's say. Now `PFCOUNT`
+  writes the count into bytes 8-15 (little-endian) and the next `PFCOUNT`
+  reads it from there; a `PFADD` that changes a register, a `PFMERGE` and
+  `PFDEBUG RESET` mark it stale with the top bit of byte 15, as Redis does.
+  A HyperLogLog saved by an earlier release is counted again the first time,
+  then cached. The registers themselves are still not Redis's (another hash,
+  no sparse encoding), so HyperLogLogs do not move between Redis and KiviDB.
+- **An `XREADGROUP` that changes nothing is not counted as a change** (#27).
+  Reading a consumer's own pending entries again (an ID other than `>`),
+  and a `>` read that found nothing new, added one to
+  `rdb_changes_since_last_save`, which Redis does not: only new entries
+  delivered and a consumer created count. The delivery count and time of a
+  re-read entry are still sent to replicas and the AOF.
+- **`RESTORE` applies `IDLETIME` and `FREQ`, and `key-access-tracking yes`
+  keeps `OBJECT IDLETIME` and `FREQ` under every policy** (#21). `RESTORE
+  ... IDLETIME n` and `FREQ n` were read and ignored; now the restored key
+  has that idle time (under an LRU policy) or that frequency (under LFU), as
+  in Redis, and invalid values get Redis's errors. The idle time may be
+  longer than the server has been up. A key's use is still recorded only
+  while an LRU or LFU policy is selected, so under the default `noeviction`
+  `OBJECT IDLETIME` is 0: recording it on every command costs about 500
+  instructions a command (11-13% of a GET or SET) and 53 bytes a key. The
+  new setting `key-access-tracking` (default `no`; config file, command line
+  and `CONFIG SET`) records it whatever the policy, at that cost. `TTL`,
+  `PTTL`, `TYPE`, `EXISTS` and `OBJECT` do not count as a use either way.
+
 - **`CONFIG SET port` moves the listener, and `CONFIG SET` with several
   settings is refused whole for a bad value** (#24). `CONFIG SET port`
   replied `OK` and changed nothing: the server kept listening where it was.
@@ -140,6 +168,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   critical or high CVE that has a fix stops the release. The published images
   and `Cargo.lock` are scanned again every week, and the results go to the
   repository's code scanning alerts. Dependabot proposes new base images.
+- **`CONFIG REWRITE` keeps the config file's mode** (#51). It wrote a new
+  file with the default mode, so a config kept at `0600` or `0640` because
+  it holds `requirepass` or ACL passwords became readable by every user. The
+  rewritten file now has the old one's mode, and its owner when the server
+  runs as root; a config written for the first time is `0600`. A file or
+  symlink already at the temporary path is replaced, not written through.
+  Redis resets the mode to `0644` less the umask on every rewrite, so this
+  differs from it on purpose.
 
 ## [1.1.0]
 
