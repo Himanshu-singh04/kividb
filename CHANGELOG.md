@@ -21,6 +21,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **An `XREADGROUP` that changes nothing is not counted as a change** (#27).
+  Reading a consumer's own pending entries again (an ID other than `>`),
+  and a `>` read that found nothing new, added one to
+  `rdb_changes_since_last_save`, which Redis does not: only new entries
+  delivered and a consumer created count. The delivery count and time of a
+  re-read entry are still sent to replicas and the AOF.
 - **`RESTORE` applies `IDLETIME` and `FREQ`, and `key-access-tracking yes`
   keeps `OBJECT IDLETIME` and `FREQ` under every policy** (#21). `RESTORE
   ... IDLETIME n` and `FREQ n` were read and ignored; now the restored key
