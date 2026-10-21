@@ -164,6 +164,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   critical or high CVE that has a fix stops the release. The published images
   and `Cargo.lock` are scanned again every week, and the results go to the
   repository's code scanning alerts. Dependabot proposes new base images.
+- **`CONFIG REWRITE` keeps the config file's mode** (#51). It wrote a new
+  file with the default mode, so a config kept at `0600` or `0640` because
+  it holds `requirepass` or ACL passwords became readable by every user. The
+  rewritten file now has the old one's mode, and its owner when the server
+  runs as root; a config written for the first time is `0600`. A file or
+  symlink already at the temporary path is replaced, not written through.
+  Redis resets the mode to `0644` less the umask on every rewrite, so this
+  differs from it on purpose.
 
 ## [1.1.0]
 
