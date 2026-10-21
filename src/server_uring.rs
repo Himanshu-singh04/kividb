@@ -775,6 +775,11 @@ pub async fn handle_client(
                 break;
             }
         };
+        // Bytes arrived from the socket: the client is active, so its idle
+        // clock restarts. Once per read, not once per command — a pipeline
+        // that arrives together is one interaction. EOF and read errors
+        // `break` above, so they never reach here.
+        activity.touch();
         // Between batches, before the activity timestamp is refreshed: if this
         // client was idle for long enough, reclaim an oversized private buffer
         // now. No read is in flight, so rebuilding `parse_buf` is safe.
